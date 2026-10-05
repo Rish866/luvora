@@ -3,6 +3,7 @@ import { z } from "zod";
 import { asyncHandler } from "../http/asyncHandler";
 import { ok } from "../http/respond";
 import { requireAuth } from "../http/authMiddleware";
+import { abuseLimit, AbuseRules } from "../http/abuseGuardMiddleware";
 import { Errors } from "../http/errors";
 import { query } from "../db/pool";
 import * as repo from "./sessionRepository";
@@ -28,9 +29,17 @@ interface MatchRow {
   state: string;
 }
 
+// Per-user throttle on invite creation (spam-invite defence; process-local).
+const inviteLimit = abuseLimit({
+  scope: "fantasy-invite",
+  rule: AbuseRules.sessionInvite,
+  by: ["user"],
+});
+
 /** Create a fantasy invitation within an ACTIVE match the caller belongs to. */
 sessionRouter.post(
   "/invite",
+  inviteLimit,
   asyncHandler(async (req, res) => {
     const input = inviteSchema.parse(req.body);
     const userId = req.userId!;

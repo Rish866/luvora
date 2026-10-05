@@ -15,7 +15,8 @@ import { config } from "../config";
 import { Errors } from "../http/errors";
 import * as mediaRepo from "./mediaRepository";
 import { getMediaProviders } from "./mediaProviders";
-import { processImage } from "./imageProcessor";
+import { processImage, probeDimensions } from "./imageProcessor";
+import { metrics } from "../observability/metrics";
 import { loadAsset, authorizeView, authorizeOwner, authorizeReport } from "./mediaAuthorization";
 
 /**
@@ -124,6 +125,25 @@ export async function uploadContent(input: {
 
   const { scanner, moderation, storage } = getMediaProviders();
 
+  // Decompression-bomb / oversized-dimension guard: reject with a PRECISE error
+  // when the declared pixel count exceeds policy, before the full decode. This
+  // complements sharp's own limitInputPixels guard inside processImage.
+  const dims = await probeDimensions(input.data);
+  if (dims && dims.pixels > config.media.maxPixels) {
+    try {
+      metrics.incr("media_rejected_total", { reason: "dimensions" });
+    } catch {
+      /* telemetry best-effort */
+    }
+    await mediaRepo.setStatus(
+      asset.id,
+      MediaStatus.REJECTED,
+      MediaModerationStatus.REJECTED,
+      "dimensions-too-large",
+    );
+    throw Errors.mediaDimensionsTooLarge();
+  }
+
   // Image inspection + normalization (also enforces dimension/bomb limits and
   // strips metadata). Returns null if the content isn't a valid allowed image.
   const processed = await processImage({
@@ -133,6 +153,11 @@ export async function uploadContent(input: {
     thumbnailSize: config.media.thumbnailSize,
   });
   if (!processed) {
+    try {
+      metrics.incr("media_rejected_total", { reason: "invalid_image" });
+    } catch {
+      /* telemetry best-effort */
+    }
     await mediaRepo.setStatus(asset.id, MediaStatus.REJECTED, MediaModerationStatus.REJECTED, "invalid-image");
     throw Errors.mediaInvalidContent();
   }

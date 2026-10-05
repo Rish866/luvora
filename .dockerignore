@@ -1,0 +1,13 @@
+node_modules
+**/node_modules
+**/dist
+.git
+.gitignore
+*.log
+docker
+docs
+scripts/*.js
+.env
+**/.env
+**/*.env
+coverage

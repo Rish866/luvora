@@ -1,11 +1,12 @@
 import type { Express } from "express";
 import request from "supertest";
 import { pool } from "../src/db/pool";
+import { abuseGuard } from "../src/http/abuseGuard";
 
 /** Truncate all data tables between tests for isolation. */
 export async function resetDb(): Promise<void> {
   await pool.query(`
-    TRUNCATE operational_events, background_jobs,
+    TRUNCATE security_events, operational_events, background_jobs,
              notification_deliveries, notification_devices,
              notifications, notification_preferences,
              safety_reports, moderation_actions, audit_logs,
@@ -15,6 +16,8 @@ export async function resetDb(): Promise<void> {
              devices, auth_sessions, users
     RESTART IDENTITY CASCADE;
   `);
+  // Clear process-local abuse/brute-force counters so each test starts clean.
+  abuseGuard.clear();
 }
 
 export interface RegisteredUser {

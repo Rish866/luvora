@@ -101,6 +101,20 @@ function main(): void {
       JWT_ACCESS_SECRET: "test-access-secret-at-least-16-chars",
       JWT_REFRESH_SECRET: "test-refresh-secret-at-least-16-chars",
       BCRYPT_ROUNDS: "4", // fast hashing for tests
+      // Known CORS allowlist so the CORS hardening tests are deterministic.
+      CORS_ALLOWED_ORIGINS: "https://app.luvora.test,https://admin.luvora.test",
+      // Request-limit knobs. JSON body stays at the 1MB default (so existing
+      // chat/media tests are unaffected); the security test uses a >1MB body.
+      MAX_URL_LENGTH: "2048",
+      // Low WS caps so connection/frame tests don't need many sockets.
+      WS_MAX_CONNECTIONS_PER_USER: "3",
+      WS_MAX_FRAME_BYTES: "4096",
+      // Media pixel cap set ABOVE the largest image existing tests upload
+      // (400x300 = 120000) but below the security test's 400x400 (160000).
+      MEDIA_MAX_PIXELS: "150000",
+      // Low brute-force threshold so the lockout test is fast & deterministic.
+      LOGIN_MAX_FAILURES: "5",
+      LOGIN_THROTTLE_SECONDS: "300",
     };
 
     // Resolve paths relative to the backend package dir so this works no matter

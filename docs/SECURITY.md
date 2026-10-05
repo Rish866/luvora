@@ -366,3 +366,69 @@
 - **Fantasy-session user media** remains deferred (no gameplay attachment point).
 - No MFA for admin accounts yet (would layer on the existing auth system).
 - Full load testing.
+
+---
+
+## Production security hardening (Increment 11)
+
+### Abuse control & brute force
+- A single process-local primitive, `AbuseGuard`, backs all abuse-sensitive
+  surfaces: sliding-window counting keyed by an opaque `scope:key`, **bounded
+  memory** (LRU eviction + periodic sweep — no unbounded Map), penalty blocks,
+  and an injectable clock for deterministic tests. It has its own
+  `ABUSE_GUARD_ENABLED` switch so throttling is exercised even under test.
+- **Login** is protected by a dual-dimension (client IP + target account)
+  TEMPORARY throttle — deliberately NOT a permanent lockout, which could be
+  weaponised for DoS against a victim account. The gate runs BEFORE the bcrypt
+  comparison, removing hashing as an amplification vector; a successful login
+  clears both dimensions.
+- Applied to write/action endpoints too (discovery like/pass, block, chat send,
+  fantasy invite), keyed by user so it is effective regardless of the legacy
+  limiter's test behaviour.
+- **Honest limitation:** this is **process-local**. With multiple API instances,
+  each enforces its own limits — it is NOT global/distributed throttling. The
+  `AbuseBackend` interface marks where a shared backend (e.g. Redis) would plug
+  in; only the in-memory backend is implemented.
+
+### CORS, headers, request limits
+- Strict CORS allowlist (`CORS_ALLOWED_ORIGINS`): normalized, credentials
+  allowed, never a wildcard. Disallowed origins receive no CORS headers.
+- Centralized security headers: `X-Content-Type-Options: nosniff`,
+  `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, a minimal
+  `Permissions-Policy`, an API CSP (`default-src 'none'`), no `X-Powered-By`,
+  and opt-in HSTS.
+- Request input limits: configurable JSON body size and URL length (both →
+  `413 PAYLOAD_TOO_LARGE`); `trust proxy` bounded by `TRUST_PROXY_HOPS` so
+  `X-Forwarded-For` cannot be forged.
+
+### WebSocket & media
+- WS: per-user concurrent-connection cap (close code `4429`), inbound
+  frame-size limit (`maxPayload`), and a config-driven per-connection event
+  throttle, all with rejection metrics.
+- Media: explicit decompression-bomb / oversized-dimension reject
+  (`MEDIA_MAX_PIXELS`) with a precise error + metric, layered on the existing
+  byte / per-dimension / dual-MIME-detection checks and EXIF stripping.
+
+### Config fail-fast
+- In `NODE_ENV=production` the app refuses to boot with weak/dev JWT secrets
+  (< 32 chars or dev-looking), equal access/refresh secrets, `BCRYPT_ROUNDS < 10`,
+  an empty or wildcard CORS allowlist, or `DEVELOPER_MODE=true`. It logs the
+  offending variable NAMES and a safe reason — never a secret value.
+
+### Durable security events
+- `security_events` records LOW-VOLUME, significant events only (brute-force
+  lockout, login throttle, refresh-token reuse). High-frequency counters stay
+  in-process (AbuseGuard) to avoid self-DoS on the database.
+- The client source is stored ONLY as a **salted, truncated 16-char
+  fingerprint** (salt derived from an existing secret, never logged) — the raw
+  IP is never persisted or returned. Metadata is sanitized (sensitive keys
+  dropped, values bounded). Recording is best-effort and never breaks a request.
+- Pruned by the existing `BACKGROUND_JOB_CLEANUP` job
+  (`SECURITY_EVENT_RETENTION_DAYS`); audit logs remain append-only. Readable via
+  admin-only `GET /api/admin/security-events`.
+
+### Deployment
+- Production multi-stage, non-root `Dockerfile`; `scripts/backup-db.sh` /
+  `scripts/restore-db.sh` (credentials only via `DATABASE_URL`); and the
+  `THREAT_MODEL`, `DEPLOYMENT`, `DISASTER_RECOVERY`, and
+  `PRODUCTION_SECURITY_CHECKLIST` docs.

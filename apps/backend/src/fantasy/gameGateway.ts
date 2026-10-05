@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { WebSocketServer, WebSocket } from "ws";
-import { type ServerGameEvent } from "@luvora/shared";
+import { ChatCloseCodes, type ServerGameEvent } from "@luvora/shared";
 import { logger } from "../logger";
 import { config } from "../config";
 import { AppError, Errors } from "../http/errors";
@@ -14,6 +14,8 @@ import {
   recordWsDisconnect,
   recordWsMessage,
   recordWsError,
+  recordWsConnectionRejected,
+  recordWsEventRejected,
 } from "../observability/websocketMetrics";
 import type { WsChannel, WsDispatcher } from "../ws/wsDispatcher";
 
@@ -38,9 +40,6 @@ const HEARTBEAT_INTERVAL_MS = Math.max(
   5_000,
   Math.floor((config.presence.heartbeatSeconds * 1000) / 2),
 );
-const WS_RATE_WINDOW_MS = 10_000;
-const WS_RATE_MAX = 50;
-
 const stateBySocket = new WeakMap<WebSocket, SocketState>();
 
 function send(socket: WebSocket, event: ServerGameEvent): void {
@@ -68,8 +67,9 @@ function sendError(
 function allowEvent(state: SocketState): boolean {
   if (!config.rateLimitEnabled) return true;
   const now = Date.now();
-  state.recent = state.recent.filter((t) => now - t < WS_RATE_WINDOW_MS);
-  if (state.recent.length >= WS_RATE_MAX) return false;
+  const windowMs = config.security.ws.eventWindowMs;
+  state.recent = state.recent.filter((t) => now - t < windowMs);
+  if (state.recent.length >= config.security.ws.eventMax) return false;
   state.recent.push(now);
   return true;
 }
@@ -144,9 +144,23 @@ export interface GameGateway {
 
 /** Register the gameplay channel ("/ws/game") on the shared WS dispatcher. */
 export function attachGameGateway(dispatcher: WsDispatcher): GameGateway {
-  const wss = new WebSocketServer({ noServer: true });
+  const wss = new WebSocketServer({
+    noServer: true,
+    maxPayload: config.security.ws.maxFrameBytes,
+  });
 
   const onConnection: WsChannel["onConnection"] = (socket, _req, userId) => {
+    // Per-user concurrent-connection cap (resource-exhaustion defence).
+    if (gameHub.socketsFor(userId).length >= config.security.ws.maxConnectionsPerUser) {
+      recordWsConnectionRejected("game", "too_many_connections");
+      try {
+        socket.close(ChatCloseCodes.TOO_MANY_CONNECTIONS, "too many connections");
+      } catch {
+        /* ignore */
+      }
+      return;
+    }
+
     const connectionId = `game:${randomUUID()}`;
     const state: SocketState = { userId, connectionId, isAlive: true, recent: [] };
     stateBySocket.set(socket, state);
@@ -166,6 +180,7 @@ export function attachGameGateway(dispatcher: WsDispatcher): GameGateway {
       presenceRegistry.heartbeat(userId, connectionId);
       recordWsMessage("game");
       if (!allowEvent(state)) {
+        recordWsEventRejected("game");
         sendError(socket, "RATE_LIMITED", "Too many actions. Slow down.");
         return;
       }

@@ -53,6 +53,18 @@ export METRICS_REQUIRE_AUTH="true"
 export JOB_QUEUE_WARNING_DEPTH="2"
 export JOB_QUEUE_CRITICAL_DEPTH="50"
 export JOB_QUEUE_MAX_AGE_SECONDS="300"
+# Increment 11: security hardening. A known CORS allowlist, low brute-force
+# threshold + short throttle (so the live lockout check is fast), small request
+# limits, and a small media pixel cap so the dimension-reject check uses a tiny
+# image. The abuse guard is always on; the login limiter is NOT the same as the
+# generous RATE_LIMIT_MAX above.
+export CORS_ALLOWED_ORIGINS="https://app.luvora.test,https://admin.luvora.test"
+export LOGIN_MAX_FAILURES="4"
+export LOGIN_FAILURE_WINDOW_SECONDS="900"
+export LOGIN_THROTTLE_SECONDS="2"
+export JSON_BODY_LIMIT_BYTES="65536"
+export MAX_URL_LENGTH="2048"
+export MEDIA_MAX_PIXELS="150000"
 
 node -r ts-node/register src/db/migrate.ts up >/dev/null 2>&1
 # Seed the published scenario library so the gameplay smoke flow has content.
@@ -787,6 +799,83 @@ for i in $(seq 1 50); do if ! kill -0 "$WORKER_PID" >/dev/null 2>&1; then WSHUT=
 check "worker graceful shutdown" 'ok' "$WSHUT"
 # Worker shutdown recorded an operational event.
 check "worker stop recorded operational event" '1' "$(pgpoll 1 "SELECT CASE WHEN count(*)>=1 THEN 1 ELSE 0 END FROM operational_events WHERE event_type='WORKER_STOPPED'")"
+
+# ======================= Increment 11: security hardening =======================
+# Run with NODE_ENV=development (abuse guard + limiters ENABLED). Covers security
+# headers, strict CORS allowlist, request input limits, and the login
+# brute-force throttle end-to-end over real HTTP.
+
+# ---- Security headers (present on normal AND error responses) ----
+SEC_HDRS=$(curl -s -D - -o /dev/null "$B/health")
+check "header: X-Content-Type-Options nosniff" 'X-Content-Type-Options: nosniff' "$SEC_HDRS"
+check "header: X-Frame-Options DENY" 'X-Frame-Options: DENY' "$SEC_HDRS"
+check "header: Referrer-Policy no-referrer" 'Referrer-Policy: no-referrer' "$SEC_HDRS"
+check "header: Permissions-Policy present" 'Permissions-Policy:' "$SEC_HDRS"
+check "header: CSP default-src none" "default-src 'none'" "$SEC_HDRS"
+if echo "$SEC_HDRS" | grep -qi 'X-Powered-By'; then echo "FAIL: X-Powered-By exposed"; FAIL=$((FAIL+1)); else echo "PASS: no X-Powered-By header"; PASS=$((PASS+1)); fi
+if echo "$SEC_HDRS" | grep -qi 'Strict-Transport-Security'; then echo "FAIL: HSTS emitted while disabled"; FAIL=$((FAIL+1)); else echo "PASS: HSTS not emitted (disabled)"; PASS=$((PASS+1)); fi
+# Headers present on an error (404) response too.
+SEC_ERR_HDRS=$(curl -s -D - -o /dev/null "$B/api/does-not-exist")
+check "header on 404: X-Content-Type-Options" 'X-Content-Type-Options: nosniff' "$SEC_ERR_HDRS"
+
+# ---- CORS strict allowlist ----
+CORS_ALLOWED=$(curl -s -D - -o /dev/null -H 'Origin: https://app.luvora.test' "$B/health")
+check "CORS: allowed origin reflected" 'Access-Control-Allow-Origin: https://app.luvora.test' "$CORS_ALLOWED"
+check "CORS: credentials allowed" 'Access-Control-Allow-Credentials: true' "$CORS_ALLOWED"
+CORS_DENIED=$(curl -s -D - -o /dev/null -H 'Origin: https://evil.example.com' "$B/health")
+if echo "$CORS_DENIED" | grep -qi 'Access-Control-Allow-Origin'; then echo "FAIL: disallowed origin got CORS headers"; FAIL=$((FAIL+1)); else echo "PASS: disallowed origin blocked (no ACAO)"; PASS=$((PASS+1)); fi
+if echo "$CORS_ALLOWED" | grep -qi 'Access-Control-Allow-Origin: \*'; then echo "FAIL: wildcard CORS with credentials"; FAIL=$((FAIL+1)); else echo "PASS: no wildcard CORS origin"; PASS=$((PASS+1)); fi
+# Preflight (OPTIONS) for an allowed origin.
+CORS_PRE=$(curl -s -D - -o /dev/null -X OPTIONS -H 'Origin: https://app.luvora.test' -H 'Access-Control-Request-Method: POST' "$B/api/auth/login")
+check "CORS: preflight reflects allowed origin" 'Access-Control-Allow-Origin: https://app.luvora.test' "$CORS_PRE"
+
+# ---- Request input limits ----
+# Oversized JSON body (> JSON_BODY_LIMIT_BYTES=65536) -> 413 PAYLOAD_TOO_LARGE.
+# Build the body in a FILE to avoid shell argument/variable truncation.
+BIGBODY="$DIR/bigbody.json"
+printf '{"blob":"' > "$BIGBODY"; head -c 100000 /dev/zero | tr '\0' 'x' >> "$BIGBODY"; printf '"}' >> "$BIGBODY"
+BIGCODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$B/api/auth/register" -H 'Content-Type: application/json' --data-binary @"$BIGBODY")
+check "oversized JSON body 413" '413' "$BIGCODE"
+BIGRESP=$(curl -s -X POST "$B/api/auth/register" -H 'Content-Type: application/json' --data-binary @"$BIGBODY")
+check "oversized body PAYLOAD_TOO_LARGE" 'PAYLOAD_TOO_LARGE' "$BIGRESP"
+# Over-long URL (> MAX_URL_LENGTH=2048) -> 413.
+LONGQ=$(printf 'a%.0s' $(seq 1 3000))
+check "over-long URL 413" '413' "$(code "$B/health?q=$LONGQ")"
+# A normal body is accepted (not 413).
+NORMCODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$B/api/auth/login" -H 'Content-Type: application/json' -d '{"email":"nobody.smoke@example.com","password":"whatever"}')
+if [ "$NORMCODE" = "413" ]; then echo "FAIL: normal body rejected as too large"; FAIL=$((FAIL+1)); else echo "PASS: normal-sized body accepted ($NORMCODE)"; PASS=$((PASS+1)); fi
+
+# ---- Login brute-force throttle (temporary, not lockout) ----
+# Register a dedicated victim; LOGIN_MAX_FAILURES=4, LOGIN_THROTTLE_SECONDS=2.
+BF=$(reg "bruteforce.smoke@example.com" "BruteTarget")
+for i in 1 2 3 4; do
+  curl -s -o /dev/null -X POST "$B/api/auth/login" -H 'Content-Type: application/json' \
+    -d '{"email":"bruteforce.smoke@example.com","password":"wrong-pass!"}'
+done
+# The next attempt is throttled: 429 + Retry-After + RATE_LIMITED.
+BF_CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$B/api/auth/login" -H 'Content-Type: application/json' -d '{"email":"bruteforce.smoke@example.com","password":"wrong-pass!"}')
+check "brute-force throttle 429" '429' "$BF_CODE"
+BF_HDRS=$(curl -s -D - -o /dev/null -X POST "$B/api/auth/login" -H 'Content-Type: application/json' -d '{"email":"bruteforce.smoke@example.com","password":"wrong-pass!"}')
+check "brute-force Retry-After header" 'Retry-After:' "$BF_HDRS"
+BF_BODY=$(curl -s -X POST "$B/api/auth/login" -H 'Content-Type: application/json' -d '{"email":"bruteforce.smoke@example.com","password":"wrong-pass!"}')
+check "brute-force RATE_LIMITED code" 'RATE_LIMITED' "$BF_BODY"
+# Even the CORRECT password is refused while throttled (gate runs first).
+BF_GOOD=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$B/api/auth/login" -H 'Content-Type: application/json' -d '{"email":"bruteforce.smoke@example.com","password":"Passw0rd!x"}')
+check "throttle precedes credential check 429" '429' "$BF_GOOD"
+# A durable security event was recorded (fingerprint only, no raw IP).
+check "brute-force security event recorded" '1' "$(pgpoll 1 "SELECT CASE WHEN count(*)>=1 THEN 1 ELSE 0 END FROM security_events WHERE event_type='BRUTE_FORCE_LOCKOUT'")"
+if pgscalar "SELECT COALESCE(string_agg(source_fingerprint, ','), '') FROM security_events" | grep -qE '([0-9]{1,3}\.){3}[0-9]{1,3}'; then echo "FAIL: raw IP stored in security_events"; FAIL=$((FAIL+1)); else echo "PASS: security_events store no raw IP"; PASS=$((PASS+1)); fi
+# After the short throttle expires, login works again (temporary, not a lockout).
+sleep 3
+BF_RECOVER=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$B/api/auth/login" -H 'Content-Type: application/json' -d '{"email":"bruteforce.smoke@example.com","password":"Passw0rd!x"}')
+check "throttle is temporary (recovers)" '200' "$BF_RECOVER"
+
+# ---- Admin security-events endpoint (admin only) ----
+check "security-events requires auth 401" '401' "$(code $B/api/admin/security-events)"
+check "security-events forbids normal user 403" '403' "$(code $B/api/admin/security-events -H "Authorization: Bearer $TJA")"
+SEC_EVENTS=$(json $B/api/admin/security-events -H "Authorization: Bearer $TJADM")
+check "admin lists security events" '"events"' "$SEC_EVENTS"
+if echo "$SEC_EVENTS" | grep -qE '([0-9]{1,3}\.){3}[0-9]{1,3}'; then echo "FAIL: admin security-events leaks raw IP"; FAIL=$((FAIL+1)); else echo "PASS: admin security-events exposes no raw IP"; PASS=$((PASS+1)); fi
 
 echo "----"
 echo "LIVE SMOKE: $PASS passed, $FAIL failed"

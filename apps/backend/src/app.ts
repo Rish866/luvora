@@ -1,6 +1,4 @@
 import express, { type Express } from "express";
-import helmet from "helmet";
-import cors from "cors";
 import { config } from "./config";
 import { authRouter } from "./auth/authRoutes";
 import { sessionRouter } from "./fantasy/sessionRoutes";
@@ -21,6 +19,8 @@ import { errorHandler } from "./http/errorHandler";
 import { ok } from "./http/respond";
 import { Errors } from "./http/errors";
 import { makeRateLimiter } from "./http/rateLimiter";
+import { securityHeaders, urlLengthGuard } from "./http/securityMiddleware";
+import { corsMiddleware } from "./http/corsConfig";
 import { correlationAndMetrics } from "./observability/httpMetrics";
 import { buildReadiness, uptimeSeconds } from "./observability/health";
 import { metricsRouter } from "./observability/metricsRoutes";
@@ -35,15 +35,19 @@ export function createApp(): Express {
 
   const app = express();
 
-  app.set("trust proxy", 1);
-  app.use(helmet());
-  app.use(
-    cors({
-      origin: config.corsOrigins.length ? config.corsOrigins : false,
-      credentials: true,
-    }),
-  );
-  app.use(express.json({ limit: "1mb" }));
+  // Trust exactly the configured number of proxy hops so req.ip reflects the
+  // real client without letting a client forge X-Forwarded-For. Default 0 means
+  // "trust nothing" (direct connection); operators set TRUST_PROXY_HOPS to the
+  // number of trusted reverse proxies in front of the app.
+  app.set("trust proxy", config.security.trustProxyHops);
+  // Centralised, API-appropriate security headers (helmet + explicit tuning).
+  app.use(securityHeaders());
+  // Strict CORS allowlist (credentials allowed, never a wildcard).
+  app.use(corsMiddleware());
+  // Reject absurdly long URLs before routing.
+  app.use(urlLengthGuard());
+  // JSON body limit (configurable; oversized bodies -> 413 via errorHandler).
+  app.use(express.json({ limit: config.security.jsonBodyLimitBytes }));
 
   // Correlation id + request context + HTTP metrics (Increment 10). Runs early
   // so every downstream log/metric/error carries the correlation id, and so the

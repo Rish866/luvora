@@ -32,11 +32,51 @@ const schema = z.object({
 
   BCRYPT_ROUNDS: z.coerce.number().int().min(4).max(15).default(12),
 
+  // Comma-separated explicit CORS allowlist. `CORS_ALLOWED_ORIGINS` is the
+  // Increment-11 name; `CORS_ORIGINS` is accepted as a legacy alias.
   CORS_ORIGINS: z.string().default(""),
+  CORS_ALLOWED_ORIGINS: z.string().default(""),
 
   RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(60_000),
   RATE_LIMIT_MAX: z.coerce.number().int().positive().default(120),
   AUTH_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(10),
+
+  // ---- Security hardening (Increment 11) ----
+  // Number of proxy hops to trust for client-IP derivation. 0 = trust none
+  // (use the socket address; headers like X-Forwarded-For are NOT trusted).
+  // Set to the real hop count ONLY when behind a trusted proxy/LB.
+  TRUST_PROXY_HOPS: z.coerce.number().int().min(0).max(10).default(0),
+  // Master switch for abuse-control throttling (login/report/device/etc.).
+  // Independent of the legacy express-rate-limit `rateLimitEnabled`, so the
+  // test suite CAN exercise throttling deterministically.
+  ABUSE_GUARD_ENABLED: z
+    .string()
+    .default("true")
+    .transform((v) => v === "true"),
+  // Failed-login throttle: after this many failures (per IP and per account)
+  // within the window, further attempts are throttled.
+  LOGIN_MAX_FAILURES: z.coerce.number().int().min(1).max(1000).default(10),
+  LOGIN_FAILURE_WINDOW_SECONDS: z.coerce.number().int().min(10).max(86_400).default(900),
+  LOGIN_THROTTLE_SECONDS: z.coerce.number().int().min(1).max(86_400).default(300),
+  // Max distinct abuse-guard keys held in memory (bounded; LRU-evicted).
+  ABUSE_GUARD_MAX_KEYS: z.coerce.number().int().min(1000).max(5_000_000).default(100_000),
+  // Request-input hard limits.
+  JSON_BODY_LIMIT_BYTES: z.coerce.number().int().min(1024).max(10 * 1024 * 1024).default(1024 * 1024),
+  MAX_URL_LENGTH: z.coerce.number().int().min(256).max(16_384).default(2048),
+  // HTTP security headers.
+  HSTS_ENABLED: z
+    .string()
+    .default("false")
+    .transform((v) => v === "true"),
+  HSTS_MAX_AGE_SECONDS: z.coerce.number().int().min(0).max(63_072_000).default(15_552_000),
+  // WebSocket limits.
+  WS_MAX_CONNECTIONS_PER_USER: z.coerce.number().int().min(1).max(1000).default(10),
+  WS_MAX_FRAME_BYTES: z.coerce.number().int().min(1024).max(10 * 1024 * 1024).default(65_536),
+  WS_EVENT_WINDOW_MS: z.coerce.number().int().min(100).max(600_000).default(10_000),
+  WS_EVENT_MAX: z.coerce.number().int().min(1).max(100_000).default(50),
+  // Media pixel-count cap (width*height) — decompression-bomb defence, in
+  // addition to byte + per-dimension bounds.
+  MEDIA_MAX_PIXELS: z.coerce.number().int().min(1_000).max(500_000_000).default(50_000_000),
 
   DEVELOPER_MODE: z
     .string()
@@ -158,6 +198,9 @@ const schema = z.object({
   // Retention for operational events (days). Audit logs are a SEPARATE policy
   // and are never deleted by this.
   OPERATIONAL_EVENT_RETENTION_DAYS: z.coerce.number().int().min(1).max(3650).default(90),
+  // Retention for security events (days). Audit logs are a SEPARATE policy and
+  // are never deleted by this.
+  SECURITY_EVENT_RETENTION_DAYS: z.coerce.number().int().min(1).max(3650).default(90),
 });
 
 const parsed = schema.safeParse(process.env);
@@ -173,6 +216,57 @@ if (!parsed.success) {
 
 const env = parsed.data;
 
+// Resolve the explicit CORS allowlist (Increment 11 name wins; legacy alias as
+// fallback), normalized (lowercased, trailing-slash-trimmed, deduped).
+function normalizeOrigin(o: string): string {
+  const t = o.trim();
+  if (!t) return "";
+  return t.replace(/\/+$/, "").toLowerCase();
+}
+const corsRaw = env.CORS_ALLOWED_ORIGINS || env.CORS_ORIGINS;
+const corsOriginsList = Array.from(
+  new Set(corsRaw.split(",").map(normalizeOrigin).filter(Boolean)),
+);
+
+/**
+ * Production fail-fast (fail CLOSED on insecure config). Beyond the zod schema,
+ * production MUST NOT run with development-grade or missing security-critical
+ * values. We never print secret VALUES — only names + a safe reason.
+ */
+if (env.NODE_ENV === "production") {
+  const problems: string[] = [];
+  const weakSecret = (name: string, v: string): void => {
+    if (v.length < 32) problems.push(`${name} must be at least 32 chars in production`);
+    if (/change-me|changeme|secret|test|dev|example|placeholder/i.test(v)) {
+      problems.push(`${name} looks like a development/example value`);
+    }
+  };
+  weakSecret("JWT_ACCESS_SECRET", env.JWT_ACCESS_SECRET);
+  weakSecret("JWT_REFRESH_SECRET", env.JWT_REFRESH_SECRET);
+  if (env.JWT_ACCESS_SECRET === env.JWT_REFRESH_SECRET) {
+    problems.push("JWT_ACCESS_SECRET and JWT_REFRESH_SECRET must differ");
+  }
+  if (env.BCRYPT_ROUNDS < 10) {
+    problems.push("BCRYPT_ROUNDS must be >= 10 in production");
+  }
+  if (corsOriginsList.length === 0) {
+    problems.push("CORS_ALLOWED_ORIGINS must be an explicit allowlist in production");
+  }
+  if (corsOriginsList.includes("*")) {
+    problems.push("CORS_ALLOWED_ORIGINS must not contain a wildcard when credentials are allowed");
+  }
+  if (env.DEVELOPER_MODE) {
+    problems.push("DEVELOPER_MODE must be false in production");
+  }
+  if (problems.length > 0) {
+    // eslint-disable-next-line no-console
+    console.error(
+      "Insecure production configuration (fail-fast):\n - " + problems.join("\n - "),
+    );
+    throw new Error("Insecure production configuration");
+  }
+}
+
 export const config = {
   nodeEnv: env.NODE_ENV,
   isProduction: env.NODE_ENV === "production",
@@ -186,11 +280,33 @@ export const config = {
     refreshTtlSeconds: env.JWT_REFRESH_TTL_SECONDS,
   },
   bcryptRounds: env.BCRYPT_ROUNDS,
-  corsOrigins: env.CORS_ORIGINS.split(",").map((s) => s.trim()).filter(Boolean),
+  // Explicit, normalized CORS allowlist (never a wildcard with credentials).
+  corsOrigins: corsOriginsList,
   rateLimit: {
     windowMs: env.RATE_LIMIT_WINDOW_MS,
     max: env.RATE_LIMIT_MAX,
     authMax: env.AUTH_RATE_LIMIT_MAX,
+  },
+  // ---- Security hardening (Increment 11) ----
+  security: {
+    trustProxyHops: env.TRUST_PROXY_HOPS,
+    abuseGuardEnabled: env.ABUSE_GUARD_ENABLED,
+    abuseGuardMaxKeys: env.ABUSE_GUARD_MAX_KEYS,
+    login: {
+      maxFailures: env.LOGIN_MAX_FAILURES,
+      failureWindowSeconds: env.LOGIN_FAILURE_WINDOW_SECONDS,
+      throttleSeconds: env.LOGIN_THROTTLE_SECONDS,
+    },
+    jsonBodyLimitBytes: env.JSON_BODY_LIMIT_BYTES,
+    maxUrlLength: env.MAX_URL_LENGTH,
+    hstsEnabled: env.HSTS_ENABLED,
+    hstsMaxAgeSeconds: env.HSTS_MAX_AGE_SECONDS,
+    ws: {
+      maxConnectionsPerUser: env.WS_MAX_CONNECTIONS_PER_USER,
+      maxFrameBytes: env.WS_MAX_FRAME_BYTES,
+      eventWindowMs: env.WS_EVENT_WINDOW_MS,
+      eventMax: env.WS_EVENT_MAX,
+    },
   },
   developerMode: env.DEVELOPER_MODE && env.NODE_ENV !== "production",
   // Rate limiting is disabled under test so the suite can register many users
@@ -200,6 +316,7 @@ export const config = {
     maxBytes: env.MEDIA_MAX_BYTES,
     maxWidth: env.MEDIA_MAX_WIDTH,
     maxHeight: env.MEDIA_MAX_HEIGHT,
+    maxPixels: env.MEDIA_MAX_PIXELS,
     maxAttachmentsPerMessage: env.MEDIA_MAX_ATTACHMENTS_PER_MESSAGE,
     maxTotalMessageBytes: env.MEDIA_MAX_TOTAL_MESSAGE_BYTES,
     thumbnailSize: env.MEDIA_THUMBNAIL_SIZE,
@@ -268,6 +385,7 @@ export const config = {
     healthDbTimeoutMs: env.HEALTH_DB_TIMEOUT_MS,
     readinessDbTimeoutMs: env.READINESS_DB_TIMEOUT_MS,
     operationalEventRetentionDays: env.OPERATIONAL_EVENT_RETENTION_DAYS,
+    securityEventRetentionDays: env.SECURITY_EVENT_RETENTION_DAYS,
   },
 } as const;
 

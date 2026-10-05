@@ -1027,7 +1027,15 @@ GET  /api/admin/jobs/dead                 # dead-letter diagnostics (redacted)
 POST /api/admin/jobs/:id/retry   { reason? }   # requeue a DEAD job
 POST /api/admin/jobs/:id/cancel  { reason? }   # cancel a queued job
 GET  /api/admin/operational-events?eventType=&severity=&limit=&cursor=
+GET  /api/admin/security-events?eventType=&category=&severity=&limit=&cursor=
 ```
+
+- **Security events** (Increment 11, admin only) are the durable record of
+  low-volume, significant security events: brute-force lockouts, login
+  throttles, and refresh-token reuse. Keyset-paginated and filterable by
+  `eventType`/`category`/`severity`. The client source is exposed ONLY as a
+  salted fingerprint — the raw IP is never stored or returned — so this endpoint
+  cannot be used to deanonymise or track users. Non-admins get `403`.
 
 - **Retry** requeues a **DEAD** job back to `PENDING` (attempts reset, lease/
   error cleared, immediately available). SUCCEEDED/RUNNING jobs are refused

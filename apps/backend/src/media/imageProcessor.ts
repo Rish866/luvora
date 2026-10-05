@@ -2,6 +2,7 @@ import sharp from "sharp";
 import crypto from "node:crypto";
 import FileType from "file-type";
 import { ALLOWED_IMAGE_MIME_TYPES, type AllowedImageMimeType } from "@luvora/shared";
+import { config } from "../config";
 
 /**
  * Server-side image inspection, validation, normalization, and thumbnailing.
@@ -12,8 +13,13 @@ import { ALLOWED_IMAGE_MIME_TYPES, type AllowedImageMimeType } from "@luvora/sha
  * limit and sharp's input constraints.
  */
 
-/** sharp input guards: cap total pixels to defuse decompression bombs. */
-const PIXEL_LIMIT = 100_000_000; // 100 MP
+/** sharp input guard: cap total decoded pixels to defuse decompression bombs.
+ *  Configurable via MEDIA_MAX_PIXELS (config.media.maxPixels). sharp refuses to
+ *  decode inputs whose pixel count exceeds this, so a crafted tiny-but-huge
+ *  image is rejected before it can allocate memory. */
+function pixelLimit(): number {
+  return config.media.maxPixels;
+}
 
 export interface InspectedImage {
   detectedMime: AllowedImageMimeType;
@@ -60,7 +66,7 @@ async function detectImageMime(data: Buffer): Promise<AllowedImageMimeType | nul
   // 2) sharp must independently decode it to the same family.
   let meta: sharp.Metadata;
   try {
-    meta = await sharp(data, { limitInputPixels: PIXEL_LIMIT, failOn: "error" }).metadata();
+    meta = await sharp(data, { limitInputPixels: pixelLimit(), failOn: "error" }).metadata();
   } catch {
     return null;
   }
@@ -79,7 +85,7 @@ export async function inspectImage(data: Buffer): Promise<InspectedImage | null>
 
   let meta: sharp.Metadata;
   try {
-    meta = await sharp(data, { limitInputPixels: PIXEL_LIMIT, failOn: "error" }).metadata();
+    meta = await sharp(data, { limitInputPixels: pixelLimit(), failOn: "error" }).metadata();
   } catch {
     return null;
   }
@@ -110,7 +116,7 @@ export async function processImage(input: {
   if (!inspected) return null;
 
   const base = () =>
-    sharp(input.data, { limitInputPixels: PIXEL_LIMIT, failOn: "error" })
+    sharp(input.data, { limitInputPixels: pixelLimit(), failOn: "error" })
       .rotate() // auto-orient using EXIF, THEN we drop metadata on encode
       .resize({
         width: input.maxWidth,
@@ -135,7 +141,7 @@ export async function processImage(input: {
   try {
     normalized = await encode(base()).toBuffer();
     thumbnail = await encode(
-      sharp(input.data, { limitInputPixels: PIXEL_LIMIT, failOn: "error" })
+      sharp(input.data, { limitInputPixels: pixelLimit(), failOn: "error" })
         .rotate()
         .resize({
           width: input.thumbnailSize,
@@ -159,6 +165,32 @@ export async function processImage(input: {
     height: normMeta.height ?? inspected.height,
     sha256: inspected.sha256, // hash of the ORIGINAL uploaded bytes
   };
+}
+
+export interface ProbedDimensions {
+  width: number;
+  height: number;
+  pixels: number;
+}
+
+/**
+ * Probe only the declared dimensions from an image header WITHOUT fully
+ * decoding it (sharp reads metadata lazily). Used to reject oversized images
+ * with a precise error BEFORE the full-decode pixel guard kicks in. We still
+ * pass a hard ceiling well above the policy limit so a maliciously huge header
+ * can't itself cause unbounded work. Returns null if dimensions are unreadable.
+ */
+export async function probeDimensions(data: Buffer): Promise<ProbedDimensions | null> {
+  try {
+    // A generous absolute ceiling (10x the policy cap) just to read the header;
+    // the real policy decision is made by the caller against config.
+    const absoluteCeiling = Math.min(config.media.maxPixels * 10, Number.MAX_SAFE_INTEGER);
+    const meta = await sharp(data, { limitInputPixels: absoluteCeiling }).metadata();
+    if (!meta.width || !meta.height) return null;
+    return { width: meta.width, height: meta.height, pixels: meta.width * meta.height };
+  } catch {
+    return null;
+  }
 }
 
 /** Read EXIF presence from a buffer (used by privacy tests to assert the
