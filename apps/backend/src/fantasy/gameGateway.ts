@@ -6,6 +6,7 @@ import { AppError, Errors } from "../http/errors";
 import { gameHub } from "./gameConnectionRegistry";
 import { clientGameEventSchema } from "./gameEventSchemas";
 import * as gameplay from "./gameplayService";
+import { isAccountActive } from "../auth/accountState";
 import type { WsChannel, WsDispatcher } from "../ws/wsDispatcher";
 
 /**
@@ -72,6 +73,17 @@ async function handleEvent(
   }
   const event = parsed.data;
   const userId = state.userId;
+
+  // Enforce LIVE account state on every inbound action (Increment 6).
+  if (!(await isAccountActive(userId))) {
+    sendError(socket, "ACCOUNT_SUSPENDED", "Your account is not active.");
+    try {
+      socket.close(4403, "account not active");
+    } catch {
+      /* ignore */
+    }
+    return;
+  }
 
   try {
     switch (event.type) {

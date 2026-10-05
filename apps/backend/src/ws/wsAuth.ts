@@ -1,6 +1,7 @@
 import type { IncomingMessage } from "node:http";
 import { verifyAccessToken } from "../auth/tokens";
 import * as users from "../users/userRepository";
+import { isAccountActive } from "../auth/accountState";
 
 /**
  * Shared WebSocket handshake authentication, used by every WS channel.
@@ -32,6 +33,8 @@ export async function authenticateUpgrade(
     const claims = verifyAccessToken(token);
     const user = await users.findById(claims.sub);
     if (!user || user.is_disabled) return null;
+    // Reject suspended / deactivated accounts at the WS handshake (Increment 6).
+    if (!(await isAccountActive(claims.sub))) return null;
     return claims.sub;
   } catch {
     return null;

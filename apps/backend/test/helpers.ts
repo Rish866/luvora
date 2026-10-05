@@ -134,6 +134,26 @@ export async function makeWebp(width = 20, height = 20): Promise<Buffer> {
  * Full upload helper: create intent + PUT bytes via the real API. Returns the
  * media id and the final asset view.
  */
+// ---- Admin / safety test fixtures (Increment 6) ----
+// TEST-ONLY: seed a role directly in the test database. This is a test fixture,
+// NOT an application endpoint — the running app contains no admin-bootstrap
+// backdoor. Production admins are provisioned out-of-band (see docs/SECURITY.md).
+export async function setUserRole(userId: string, role: string): Promise<void> {
+  await pool.query(`UPDATE users SET role = $2 WHERE id = $1`, [userId, role]);
+}
+
+/** Read a user's current account/role state directly (for assertions). */
+export async function getUserState(
+  userId: string,
+): Promise<{ role: string; account_status: string; suspended_until: string | null }> {
+  const { rows } = await pool.query<{
+    role: string;
+    account_status: string;
+    suspended_until: string | null;
+  }>(`SELECT role, account_status, suspended_until FROM users WHERE id = $1`, [userId]);
+  return rows[0];
+}
+
 export async function uploadImage(
   app: Express,
   u: RegisteredUser,

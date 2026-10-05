@@ -1,21 +1,27 @@
 import type { NextFunction, Request, Response } from "express";
 import { verifyAccessToken } from "../auth/tokens";
 import { Errors } from "./errors";
-import * as users from "../users/userRepository";
+import { assertAccountActive } from "../auth/accountState";
 
 declare global {
   // eslint-disable-next-line @typescript-eslint/no-namespace
   namespace Express {
     interface Request {
       userId?: string;
+      /** The authenticated user's server-side role (never from client input). */
+      userRole?: string;
     }
   }
 }
 
 /**
- * Require a valid access token. Attaches `req.userId`. We also confirm the user
- * still exists and is not disabled/deleted, so revoked accounts can't act with
- * a still-valid short-lived access token for long.
+ * Require a valid access token. Attaches `req.userId` and `req.userRole`.
+ *
+ * Beyond token validity, this enforces LIVE account state on every request
+ * (Increment 6): a suspended or deactivated account is rejected even if it
+ * still holds a non-expired access token, so safety actions take effect
+ * immediately rather than waiting for token expiry. Expired suspensions
+ * auto-lapse (see assertAccountActive).
  */
 export async function requireAuth(
   req: Request,
@@ -34,11 +40,14 @@ export async function requireAuth(
     } catch {
       throw Errors.unauthenticated("Invalid or expired token.");
     }
-    const user = await users.findById(claims.sub);
-    if (!user || user.is_disabled) {
+    // assertAccountActive throws ACCOUNT_SUSPENDED/ACCOUNT_DEACTIVATED for
+    // blocked accounts and returns null for missing/disabled users.
+    const user = await assertAccountActive(claims.sub);
+    if (!user) {
       throw Errors.unauthenticated();
     }
-    req.userId = claims.sub;
+    req.userId = user.id;
+    req.userRole = user.role;
     next();
   } catch (err) {
     next(err);

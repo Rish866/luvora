@@ -142,19 +142,54 @@
   bytes are bounded by the raw-body limit (no unbounded buffering); attachments
   per message and total bytes are capped. All media SQL is parameterized.
 
+## Admin / safety / moderation security (Increment 6)
+- **Server-authoritative RBAC:** `role` and `account_status` live only in the DB.
+  `requireAuth` loads them fresh on every request and populates `req.userRole`;
+  `requireRole`/`requireModerator`/`requireAdmin` gate privileged routes. The role
+  is NEVER read from the body, query, headers, or client-supplied JWT claims — a
+  forged role field is ignored (tested).
+- **Account-state enforcement everywhere:** a suspended/deactivated account is
+  rejected at login, refresh, every authenticated HTTP request, the WebSocket
+  handshake, AND on every inbound WS event — so a safety action takes effect
+  immediately rather than waiting for token expiry. Expired suspensions
+  auto-lapse to ACTIVE.
+- **Session revocation on suspend/deactivate:** all `auth_sessions` are revoked
+  (refresh tokens stop working) and all live `/ws/chat` + `/ws/game` sockets are
+  force-closed (code 4403). Role changes also revoke sessions.
+- **Admin safeguards:** cannot suspend/deactivate self; the last admin cannot be
+  deactivated or demoted; moderators cannot change roles or run admin-only
+  actions; invalid target ids never escalate privilege; safety actions are
+  idempotent-friendly and recorded.
+- **Report privacy:** reporter identity is never surfaced to the reported user;
+  report targets are validated against the reporter's own visibility so reporting
+  can't probe for the existence of private content; duplicate open reports are
+  constrained.
+- **Moderation transactions:** media moderation locks the row (`FOR UPDATE`),
+  validates the transition, updates moderation+upload status consistently, and
+  records a moderation action + audit entry atomically; concurrent decisions are
+  serialized with no corruption (tested).
+- **Append-only audit:** audit + moderation-action tables have no update/delete
+  path in the application; audit metadata is sanitized (forbidden keys like
+  password/token/authorization/body/storage_key are stripped; values bounded).
+- **Block integrity preserved:** moderation/safety actions do not restore
+  blocked user-to-user access; the Increment 5 media authorization (block-aware)
+  is unchanged (tested).
+- **Parameterized SQL** throughout; dynamic admin filters build only `$N`
+  placeholders and fixed, allow-listed column/identifier names.
+- **No admin backdoor:** the application contains no bootstrap endpoint, secret
+  header, or magic account. The first admin is provisioned by an operator via a
+  direct DB update (see docs/API.md "Production admin provisioning").
+
 ## Known gaps (planned for later increments)
 - Email/phone verification flow (fields exist; sending not wired).
 - Multi-instance WebSocket presence/delivery (process-local today; needs shared
   pub/sub such as Redis — deferred to the hardening increment).
-- Scenario authoring/admin tooling (the data model + versioning support it; the
-  admin API/RBAC arrives in a later increment).
+- A moderation/admin UI (this increment is backend/API only).
 - **Production media providers:** real S3/R2 storage adapters, a real malware
   scanner (ClamAV/cloud), and a real content-safety moderation provider — the
   interfaces exist; only local/test implementations ship today. Signed-URL
   issuance is stubbed in the local provider (the app serves bytes through its own
   authenticated endpoint).
-- **Fantasy-session user media** was intentionally deferred: the infrastructure
-  is context-aware (`context='session'`), but the Increment 4 gameplay model has
-  no user-generated media attachment point yet, so none was forced in.
-- Admin RBAC + audit logging.
-- Full automated security test matrix and load testing.
+- **Fantasy-session user media** remains deferred (no gameplay attachment point).
+- No MFA for admin accounts yet (would layer on the existing auth system).
+- Full load testing.

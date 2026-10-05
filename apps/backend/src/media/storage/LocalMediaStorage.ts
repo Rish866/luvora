@@ -1,6 +1,5 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import crypto from "node:crypto";
 import os from "node:os";
 import type { MediaStorage } from "./MediaStorage";
 
@@ -14,14 +13,18 @@ import type { MediaStorage } from "./MediaStorage";
  *    rejected. Keys are opaque/random and server-generated, so this is defense
  *    in depth, not the primary control.
  */
+/**
+ * A process-stable default base dir. Computed once so that rebuilding the
+ * provider (e.g. resetMediaProviders in tests, or config reloads) does NOT
+ * orphan bytes written by a previous instance.
+ */
+const DEFAULT_BASE_DIR = path.join(os.tmpdir(), `luvora-media-${process.pid}`);
+
 export class LocalMediaStorage implements MediaStorage {
   private readonly baseDir: string;
 
   constructor(baseDir?: string) {
-    this.baseDir =
-      baseDir && baseDir.length > 0
-        ? baseDir
-        : path.join(os.tmpdir(), `luvora-media-${process.pid}-${crypto.randomUUID()}`);
+    this.baseDir = baseDir && baseDir.length > 0 ? baseDir : DEFAULT_BASE_DIR;
   }
 
   /** Resolve a key to an absolute path, refusing anything outside baseDir. */

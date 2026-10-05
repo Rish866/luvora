@@ -10,6 +10,7 @@ import { AppError, Errors } from "../http/errors";
 import { hub } from "./connectionRegistry";
 import { clientChatEventSchema } from "./chatEventSchemas";
 import * as chat from "./chatService";
+import { isAccountActive } from "../auth/accountState";
 import type { WsChannel, WsDispatcher } from "../ws/wsDispatcher";
 
 /**
@@ -79,6 +80,18 @@ async function handleEvent(
   }
   const event = parsed.data;
   const userId = state.userId;
+
+  // Enforce LIVE account state on every inbound action: a socket authenticated
+  // before suspension/deactivation must not keep acting (Increment 6).
+  if (!(await isAccountActive(userId))) {
+    sendError(socket, "ACCOUNT_SUSPENDED", "Your account is not active.");
+    try {
+      socket.close(4403, "account not active");
+    } catch {
+      /* ignore */
+    }
+    return;
+  }
 
   try {
     switch (event.type) {

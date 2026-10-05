@@ -144,6 +144,31 @@ under it; media deletion is a soft delete (`status=DELETED`). Orphaned
 `UPLOADING` assets are removed by `cleanupAbandonedUploads()` (a plain function a
 scheduler can call; no cron required).
 
+## Migration 0006 — admin + safety + moderation (Increment 6)
+
+`0006_safety_admin.sql` adds a server-controlled role + account-state model to
+`users`, a unified report system, and append-only moderation/audit ledgers.
+
+**`users` additive columns** (safe defaults; existing rows become `USER`/`ACTIVE`):
+
+| Column | Notes |
+|--------|-------|
+| `role` | `USER` \| `MODERATOR` \| `ADMIN` (CHECK), default `USER`. |
+| `account_status` | `ACTIVE` \| `SUSPENDED` \| `DEACTIVATED` (CHECK), default `ACTIVE`. |
+| `suspended_until` | optional suspension expiry (auto-lapses to ACTIVE). |
+| `suspension_reason` | reason text. |
+
+Indexes: `users_role`, `users_account_status` (both partial on non-deleted).
+
+| Table | Purpose / notable constraints |
+|-------|-------------------------------|
+| `safety_reports` | Unified reports. `target_type` CHECK + 4 FK-backed typed target columns, with a CHECK that exactly one target matches the type (no fragile polymorphic FK). Partial `UNIQUE` on `(reporter, type, coalesced target)` where status in OPEN/IN_REVIEW throttles duplicate reports. Status machine `OPEN→IN_REVIEW→RESOLVED\|DISMISSED`. |
+| `moderation_actions` | Append-only decision ledger (actor, action, target, reason, optional report). FK actor `ON DELETE RESTRICT`. |
+| `audit_logs` | Append-only. `metadata jsonb` (sanitized by the app). Indexed by actor/action/target/created. No update/delete path anywhere in the application. |
+
+The Increment 5 `media_reports` table is preserved for compatibility; new
+reports flow through `safety_reports`.
+
 ## Resetting a dev/test database
 
 Migrations are forward-only; to reset, drop and recreate the database, then

@@ -120,6 +120,34 @@ export const Errors = {
   attachmentsTooLarge: (message = "Total attachment size exceeds the limit.") =>
     new AppError(ErrorCodes.ATTACHMENTS_TOO_LARGE, 413, message),
 
+  // ---- Admin / safety (Increment 6) ----
+  forbiddenRole: (message = "You do not have permission to perform this action.") =>
+    new AppError(ErrorCodes.FORBIDDEN_ROLE, 403, message),
+  accountSuspended: (message = "Your account is suspended.") =>
+    new AppError(ErrorCodes.ACCOUNT_SUSPENDED, 403, message),
+  accountDeactivated: (message = "Your account is deactivated.") =>
+    new AppError(ErrorCodes.ACCOUNT_DEACTIVATED, 403, message),
+  reportNotFound: (message = "Report not found.") =>
+    new AppError(ErrorCodes.REPORT_NOT_FOUND, 404, message),
+  reportInvalidTransition: (message = "Invalid report state transition.") =>
+    new AppError(ErrorCodes.REPORT_INVALID_TRANSITION, 409, message),
+  duplicateReport: (message = "You have already reported this.") =>
+    new AppError(ErrorCodes.DUPLICATE_REPORT, 409, message),
+  invalidReportTarget: (message = "The report target is invalid.") =>
+    new AppError(ErrorCodes.INVALID_REPORT_TARGET, 404, message),
+  cannotTargetSelf: (message = "You cannot report yourself.") =>
+    new AppError(ErrorCodes.CANNOT_TARGET_SELF, 400, message),
+  invalidModerationTransition: (message = "Invalid moderation state transition.") =>
+    new AppError(ErrorCodes.INVALID_MODERATION_TRANSITION, 409, message),
+  adminUserNotFound: (message = "User not found.") =>
+    new AppError(ErrorCodes.USER_NOT_FOUND_ADMIN, 404, message),
+  cannotSuspendSelf: (message = "You cannot apply this safety action to yourself.") =>
+    new AppError(ErrorCodes.CANNOT_SUSPEND_SELF, 400, message),
+  lastAdmin: (message = "This action would remove the last administrator.") =>
+    new AppError(ErrorCodes.LAST_ADMIN, 409, message),
+  invalidRole: (message = "Invalid role.") =>
+    new AppError(ErrorCodes.INVALID_ROLE, 400, message),
+
   internal: (message = "An unexpected error occurred.") =>
     new AppError(ErrorCodes.INTERNAL, 500, message),
 };

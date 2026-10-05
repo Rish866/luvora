@@ -10,6 +10,8 @@ import { userBlockRouter } from "./discovery/blockRoutes";
 import { chatRouter } from "./chat/chatRoutes";
 import { scenarioRouter } from "./scenario/scenarioRoutes";
 import { mediaRouter } from "./media/mediaRoutes";
+import { adminRouter } from "./admin/adminRoutes";
+import { reportRouter } from "./admin/reportRoutes";
 import { errorHandler } from "./http/errorHandler";
 import { ok } from "./http/respond";
 import { Errors } from "./http/errors";
@@ -54,6 +56,8 @@ export function createApp(): Express {
   app.use("/api/users", userBlockRouter);
   app.use("/api/scenarios", scenarioRouter);
   app.use("/api/media", mediaRouter);
+  app.use("/api/reports", reportRouter);
+  app.use("/api/admin", adminRouter);
 
   // 404 for unknown routes.
   app.use((_req, _res, next) => next(Errors.notFound("Route not found.")));

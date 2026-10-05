@@ -16,8 +16,9 @@ non-graphic and non-explicit.
 
 This repository contains **Increment 1 (backend foundation)**,
 **Increment 2 (discovery & matching)**, **Increment 3 (private chat +
-WebSockets)**, **Increment 4 (data-driven fantasy engine)**, and
-**Increment 5 (secure media, attachments & moderation)**. All are working,
+WebSockets)**, **Increment 4 (data-driven fantasy engine)**,
+**Increment 5 (secure media, attachments & moderation)**, and
+**Increment 6 (admin + safety + moderation operations)**. All are working,
 tested slices (not mocked screens).
 
 **Increment 1 — foundation:**
@@ -85,9 +86,24 @@ tested slices (not mocked screens).
       revokes recipient media access (no bypass); private delivery headers
 - ✅ Report (controlled reasons, reporter never exposed), owner soft-delete, orphan cleanup
 
-- ✅ **188 passing tests** (140 prior + 48 new) against a real PostgreSQL, including
-      MIME-spoof/malware/moderation/IDOR/block/transaction tests and real
-      `/ws/chat` + `/ws/game` WebSocket flows.
+**Increment 6 — admin + safety + moderation operations:**
+- ✅ **Server-authoritative RBAC** (`USER`/`MODERATOR`/`ADMIN`); role read live from
+      the DB, never from client input (forged role fields ignored)
+- ✅ Account state (`ACTIVE`/`SUSPENDED`/`DEACTIVATED`) enforced at login, refresh,
+      every request, WS handshake + every WS event; suspend **revokes sessions +
+      force-closes live sockets**; suspensions auto-lapse
+- ✅ Unified safety **reports** (`/api/reports/...`) — target-validated, self-report
+      blocked, duplicate-constrained, reporter identity private
+- ✅ **Moderation queue** + report assign/resolve; **media moderation**
+      (approve/reject/quarantine) with transactional state transitions + review endpoint
+- ✅ Admin **user safety** (suspend/unsuspend/deactivate/reactivate) + **role
+      management** with safeguards (no self-suspend; last-admin protected)
+- ✅ **Append-only audit log** (admin read-only, sanitized metadata, no edit/delete API)
+- ✅ No admin backdoor — first admin provisioned via a DB update (documented)
+
+- ✅ **225 passing tests** (188 prior + 37 new) against a real PostgreSQL, including
+      RBAC, report privacy, concurrent moderation, suspension/session-revocation,
+      WebSocket safety, admin safeguards, audit immutability, and block integration.
 
 See [`docs/INCREMENTS.md`](docs/INCREMENTS.md) for the roadmap and what is
 **intentionally deferred** to later increments.
@@ -235,15 +251,17 @@ See [`docs/SECURITY.md`](docs/SECURITY.md) for details and known gaps.
 
 ## What is implemented vs. deferred
 
-**Implemented (Increments 1–5, backend):** auth + 18+ age gate; consent + session
+**Implemented (Increments 1–6, backend):** auth + 18+ age gate; consent + session
 state machine; discovery/matching/blocking; private chat (REST + `/ws/chat`);
-the data-driven fantasy engine + scenario library + gameplay (`/ws/game`); and
-secure media uploads, chat attachments, and the moderation/safety pipeline.
+the data-driven fantasy engine + scenario library + gameplay (`/ws/game`); secure
+media uploads, chat attachments, and the moderation/safety pipeline; and the
+admin control plane — RBAC, safety reports, moderation queue + media moderation,
+user suspension/role management with session revocation, and audit logging.
 
 **Intentionally deferred** (later increments): production media providers
 (S3/R2 storage, real malware scanner, real content-safety moderation — the
 interfaces exist, only local/test adapters ship); fantasy-session user media;
-multi-instance WebSocket scaling (process-local today); push notifications; the
-admin dashboard + RBAC + audit logging; recommendations; payments; production
+multi-instance WebSocket scaling (process-local today); a moderation/admin UI;
+admin MFA; push notifications; recommendations; payments; production
 infrastructure; and all frontend/Android UI. See
 [`docs/INCREMENTS.md`](docs/INCREMENTS.md).

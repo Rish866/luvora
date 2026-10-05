@@ -16,3 +16,4 @@ export * from "./discovery";
 export * from "./media";
 export * from "./chat";
 export * from "./scenario";
+export * from "./admin";

@@ -143,10 +143,34 @@ before the next is added. Below is the plan and current status.
 **Deferred:** production S3/R2 + ClamAV + content-safety adapters (interfaces
 exist); fantasy-session user media (no gameplay attachment point yet).
 
-## ⏳ Increment 6 — Admin & safety
+## ✅ Increment 6 — Admin + safety + moderation operations (DONE)
 
-RBAC admin API, reports, moderation actions, audit log, account deletion,
-anti-abuse hooks.
+- **Server-authoritative RBAC** (`USER`/`MODERATOR`/`ADMIN`) via migration
+  `0006`; role read live from the DB on every request, never from client input.
+  `requireRole`/`requireModerator`/`requireAdmin` gate `/api/admin/*`.
+- **Account state** (`ACTIVE`/`SUSPENDED`/`DEACTIVATED`, optional expiry)
+  enforced at login, refresh, every authenticated request, the WS handshake, and
+  every inbound WS event. Suspend/deactivate **revoke sessions + force-close live
+  sockets**; expired suspensions auto-lapse.
+- **Unified safety reports** (`/api/reports/{user,media,message,session}/:id`):
+  target-visibility-validated, self-report blocked, duplicate-constrained,
+  rate-limited, reporter identity private. Moderator review queue + assign +
+  resolve with a state machine.
+- **Media moderation** (`/api/admin/media/:id` + approve/reject/quarantine):
+  transactional transitions against the Increment 5 state machine, privileged
+  byte-review endpoint, rejected/quarantined media never user-servable.
+- **User safety** (admin): suspend/unsuspend/deactivate/reactivate with
+  safeguards (no self-suspend, last-admin protection) and **role management**.
+- **Append-only audit + moderation-action ledgers**; audit read API (admin
+  only), sanitized metadata, no update/delete path.
+- Block integrity and all Increment 1–5 behavior preserved.
+- 37 new tests (RBAC, reports, moderation queue, media moderation incl.
+  concurrency, suspension/session-revocation, WS safety, admin safeguards,
+  audit, block integration). **Total: 225 passing** against real PostgreSQL.
+  Live smoke: 102/102.
+
+**Deferred:** a moderation/admin UI; admin MFA; production media provider
+adapters (interfaces exist); fantasy-session user media.
 
 ## ⏳ Increment 7 — Android client (React Native)
 

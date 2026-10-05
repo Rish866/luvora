@@ -9,6 +9,7 @@ import {
 } from "./tokens";
 import * as users from "../users/userRepository";
 import * as sessions from "./authSessionRepository";
+import { assertAccountActive } from "./accountState";
 import { config } from "../config";
 
 /** ---- Validation schemas ---- */
@@ -122,6 +123,10 @@ export async function login(
   if (user.is_disabled) {
     throw Errors.unauthorized("This account has been disabled.");
   }
+  // Enforce account state (Increment 6). assertAccountActive auto-lapses an
+  // expired suspension, and throws ACCOUNT_SUSPENDED / ACCOUNT_DEACTIVATED
+  // otherwise — a suspended/deactivated user cannot obtain new tokens.
+  await assertAccountActive(user.id);
 
   const t = issueTokens(user.id);
   await sessions.createAuthSession({
@@ -167,6 +172,10 @@ export async function refresh(
   if (new Date(session.expires_at).getTime() < Date.now()) {
     throw Errors.unauthenticated("Refresh token expired.");
   }
+  // Enforce account state on refresh too, so a suspended/deactivated user
+  // cannot keep rotating tokens. (Sessions are also revoked on suspend; this is
+  // defense in depth and handles any race.)
+  await assertAccountActive(session.user_id);
 
   const t = issueTokens(session.user_id);
   await sessions.rotateSession(session, t.refreshHash, t.refreshExpiresAt);

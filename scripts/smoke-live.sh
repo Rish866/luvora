@@ -331,6 +331,67 @@ for key in MD_INTENT MD_UPLOAD_READY MD_DETECT_PNG MD_ATTACH MD_WS_RECV MD_DTO_S
   else echo "FAIL: media $key"; FAIL=$((FAIL+1)); fi
 done
 
+# ---- Increment 6: admin + safety + moderation ----
+# Promote a user's role directly in the DB (test/ops provisioning — the app has
+# NO admin-bootstrap endpoint). Uses a tiny node pg snippet (DATABASE_URL set).
+promote_role() { # args: userId role
+  node -e '
+    const { Client } = require("pg");
+    (async () => {
+      const c = new Client({ connectionString: process.env.DATABASE_URL });
+      await c.connect();
+      await c.query("UPDATE users SET role = $2 WHERE id = $1", [process.argv[1], process.argv[2]]);
+      await c.end();
+    })().catch(e => { console.error(e.message); process.exit(1); });
+  ' "$1" "$2"
+}
+
+ADM=$(reg "admin.smoke@example.com" "Admin"); UADM=$(uid "$ADM")
+promote_role "$UADM" "ADMIN"
+# Re-login so the token reflects the ADMIN role context (role is read live anyway).
+ADMLOGIN=$(json -X POST $B/api/auth/login -H 'Content-Type: application/json' -d '{"email":"admin.smoke@example.com","password":"Passw0rd!x"}')
+TADM=$(tok "$ADMLOGIN")
+RU1=$(reg "ru1.smoke@example.com" "ReportUser1"); TRU1=$(tok "$RU1"); URU1=$(uid "$RU1")
+RU2=$(reg "ru2.smoke@example.com" "ReportUser2"); URU2=$(uid "$RU2")
+
+# RBAC: normal user denied admin queue.
+check "normal user denied admin queue" '403' "$(code $B/api/admin/moderation/queue -H "Authorization: Bearer $TRU1")"
+# Admin can read the queue.
+check "admin reads moderation queue" '"success":true' "$(json $B/api/admin/moderation/queue -H "Authorization: Bearer $TADM")"
+
+# User files a report; reporter identity not leaked in the response.
+REP=$(json -X POST $B/api/reports/user/$URU2 -H "Authorization: Bearer $TRU1" -H 'Content-Type: application/json' -d '{"reason":"HARASSMENT","description":"test"}')
+check "report created" '"reported":true' "$REP"
+REPID=$(echo "$REP" | sed -n 's/.*"reportId":"\([^"]*\)".*/\1/p')
+check "report id returned" 'UUID_OK' "$(echo "$REPID" | grep -Eq '^[0-9a-f-]{36}$' && echo UUID_OK || echo none)"
+
+# Admin inspects + resolves the report.
+check "admin inspects report" "\"id\":\"$REPID\"" "$(json $B/api/admin/reports/$REPID -H "Authorization: Bearer $TADM")"
+RESOLVED=$(json -X POST $B/api/admin/reports/$REPID/resolve -H "Authorization: Bearer $TADM" -H 'Content-Type: application/json' -d '{"status":"RESOLVED","resolution":"warned"}')
+check "admin resolves report" '"status":"RESOLVED"' "$RESOLVED"
+
+# Suspend RU1, verify revocation across endpoints, then unsuspend.
+SUS=$(json -X POST $B/api/admin/users/$URU1/suspend -H "Authorization: Bearer $TADM" -H 'Content-Type: application/json' -d '{"reason":"harassment","durationHours":24}')
+check "admin suspends user" '"status":"SUSPENDED"' "$SUS"
+check "suspended token rejected on /me" 'ACCOUNT_SUSPENDED' "$(json $B/api/auth/me -H "Authorization: Bearer $TRU1")"
+check "suspended discovery blocked 403" '403' "$(code $B/api/discovery -H "Authorization: Bearer $TRU1")"
+check "suspended cannot re-login 403" '403' "$(code -X POST $B/api/auth/login -H 'Content-Type: application/json' -d '{"email":"ru1.smoke@example.com","password":"Passw0rd!x"}')"
+json -X POST $B/api/admin/users/$URU1/unsuspend -H "Authorization: Bearer $TADM" >/dev/null
+check "unsuspend restores login" '"success":true' "$(json -X POST $B/api/auth/login -H 'Content-Type: application/json' -d '{"email":"ru1.smoke@example.com","password":"Passw0rd!x"}')"
+
+# Admin safeguards: cannot suspend self; last admin cannot be demoted.
+check "admin cannot self-suspend" 'CANNOT_SUSPEND_SELF' "$(json -X POST $B/api/admin/users/$UADM/suspend -H "Authorization: Bearer $TADM" -H 'Content-Type: application/json' -d '{"reason":"x"}')"
+check "cannot demote last admin" 'LAST_ADMIN' "$(json -X POST $B/api/admin/users/$UADM/role -H "Authorization: Bearer $TADM" -H 'Content-Type: application/json' -d '{"role":"USER"}')"
+
+# Audit log contains the suspend action with the admin as actor; no secrets.
+AUDIT=$(json "$B/api/admin/audit-logs?action=user.suspended" -H "Authorization: Bearer $TADM")
+check "audit has suspend action" '"action":"user.suspended"' "$AUDIT"
+if echo "$AUDIT" | grep -qiE 'password|refresh_token|"token"'; then echo "FAIL: audit leaks secrets"; FAIL=$((FAIL+1)); else echo "PASS: audit has no secrets"; PASS=$((PASS+1)); fi
+# Normal user cannot read audit logs.
+check "normal user denied audit logs" '403' "$(code $B/api/admin/audit-logs -H "Authorization: Bearer $TRU1")"
+# Privilege escalation attempt via body is ignored.
+check "self-promote via body fails" '403' "$(code -X POST $B/api/admin/users/$URU2/role -H "Authorization: Bearer $TRU1" -H 'Content-Type: application/json' -d '{"role":"ADMIN"}')"
+
 echo "----"
 echo "LIVE SMOKE: $PASS passed, $FAIL failed"
 

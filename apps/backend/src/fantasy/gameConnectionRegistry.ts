@@ -52,6 +52,24 @@ export class GameConnectionHub {
     return n;
   }
 
+  /** Close and drop all sockets for a single user (used on suspend/deactivate).
+   *  Returns the number of sockets closed. */
+  closeUser(userId: string, code = 4403, reason = "account suspended"): number {
+    const set = this.userSockets.get(userId);
+    if (!set) return 0;
+    let n = 0;
+    for (const socket of [...set]) {
+      try {
+        socket.close(code, reason);
+      } catch {
+        /* ignore */
+      }
+      n += 1;
+    }
+    this.userSockets.delete(userId);
+    return n;
+  }
+
   closeAll(code = 1001, reason = "server shutting down"): void {
     for (const set of this.userSockets.values()) {
       for (const socket of set) {

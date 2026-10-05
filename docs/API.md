@@ -548,3 +548,111 @@ and history include safe `attachments` DTOs:
 `message.send` accepts an optional `attachmentIds` array; the server validates
 them (same rules) and includes safe `attachments` DTOs in the broadcast
 `message.created` event. `/ws/chat` and `/ws/game` are unchanged otherwise.
+
+---
+
+## Admin, safety & moderation (Increment 6)
+
+The moderator/admin control plane is **server-authoritative**: roles and account
+state live only in the database and are never read from client input (body,
+query, headers, or JWT claims). All `/api/admin/*` routes require authentication
+AND a sufficient server-side role.
+
+### Roles & permissions
+- `USER` — normal app access only. No admin/moderator endpoints.
+- `MODERATOR` — moderation queue, report review/assign/resolve, media review +
+  approve/reject/quarantine.
+- `ADMIN` — everything a moderator can do, plus user suspend/unsuspend/
+  deactivate/reactivate, role management, and audit-log read.
+
+New error codes: `FORBIDDEN_ROLE` (403), `ACCOUNT_SUSPENDED` (403),
+`ACCOUNT_DEACTIVATED` (403), `REPORT_NOT_FOUND` (404),
+`REPORT_INVALID_TRANSITION` (409), `DUPLICATE_REPORT` (409),
+`INVALID_REPORT_TARGET` (404), `CANNOT_TARGET_SELF` (400),
+`INVALID_MODERATION_TRANSITION` (409), `CANNOT_SUSPEND_SELF` (400),
+`LAST_ADMIN` (409), `INVALID_ROLE` (400).
+
+### Reporting — *auth required*
+```
+POST /api/reports/user/:userId
+POST /api/reports/media/:mediaId
+POST /api/reports/message/:messageId
+POST /api/reports/session/:sessionId
+```
+Body: `{ "reason": "CSAM|NONCONSENSUAL|VIOLENCE|HARASSMENT|SPAM|HATE|SELF_HARM|OTHER", "description": "optional" }`.
+The server validates the target exists AND the reporter is authorized to see it
+(so reporting cannot probe for the existence of private content). Self-reporting
+a user is rejected. Duplicate open reports against the same target are rejected
+(`DUPLICATE_REPORT`). Rate-limited. **The reporter's identity is never exposed to
+the reported user** — reports are private safety records.
+
+### Moderation queue & reports — *moderator+*
+```
+GET  /api/admin/moderation/queue?limit=&cursor=&priority=&targetType=   # OPEN reports
+GET  /api/admin/reports?status=&priority=&targetType=&assignedTo=&limit=&cursor=
+GET  /api/admin/reports/:id
+POST /api/admin/reports/:id/assign          # OPEN -> IN_REVIEW (records moderator)
+POST /api/admin/reports/:id/resolve         # body { status: RESOLVED|DISMISSED, resolution? }
+```
+Keyset pagination with opaque cursors. Report states: `OPEN → IN_REVIEW →
+RESOLVED|DISMISSED` (terminal); invalid transitions are rejected. Reports are
+never deleted.
+
+### Media moderation — *moderator+*
+```
+GET  /api/admin/media/:id                   # review metadata + moderation-action history
+GET  /api/admin/media/:id/content           # privileged byte review (even if quarantined/rejected)
+GET  /api/admin/media/:id/thumbnail
+POST /api/admin/media/:id/approve           # -> APPROVED / READY
+POST /api/admin/media/:id/reject            # body { reason } -> REJECTED / REJECTED
+POST /api/admin/media/:id/quarantine        # body { reason } -> NEEDS_REVIEW / QUARANTINED
+```
+Transitions are validated against the moderation state machine and run in a
+transaction (lock row → validate → update moderation+upload status → record
+moderation action + audit → commit). Deleted media cannot be approved. Rejected/
+quarantined media is never served through the normal `GET /api/media/:id/content`
+path. The admin review byte endpoint still enforces the moderator role.
+
+### User safety — *admin only*
+```
+POST /api/admin/users/:id/suspend     # body { reason, durationHours? }  (server computes expiry)
+POST /api/admin/users/:id/unsuspend
+POST /api/admin/users/:id/deactivate  # body { reason }
+POST /api/admin/users/:id/reactivate
+```
+Suspend/deactivate revoke all auth sessions and close the user's live WebSocket
+connections. Safeguards: an admin cannot suspend/deactivate themselves; the last
+remaining admin cannot be deactivated or demoted. Suspensions with a duration
+auto-lapse to ACTIVE after expiry (no scheduler needed).
+
+### Role management — *admin only*
+```
+GET  /api/admin/users/:id/role
+POST /api/admin/users/:id/role        # body { role: USER|MODERATOR|ADMIN }
+```
+Moderators cannot change roles. Demoting the last admin is rejected (`LAST_ADMIN`).
+Role changes are audited and revoke the target's sessions.
+
+### Audit logs — *admin only, read-only*
+```
+GET /api/admin/audit-logs?action=&actorUserId=&targetType=&targetId=&limit=&cursor=
+```
+Keyset-paginated. Entries are append-only — there is deliberately **no** update/
+delete API. Metadata is sanitized (no tokens, passwords, auth headers, message
+bodies, storage keys, or raw bytes).
+
+### WebSocket safety
+`/ws/chat` and `/ws/game` continue to work unchanged for active users. The
+handshake rejects suspended/deactivated accounts; every inbound event
+re-checks live account state; and suspending/deactivating a user force-closes
+their open sockets (close code 4403). An already-authenticated socket cannot
+outlive a suspension.
+
+### Production admin provisioning
+There is **no** admin-bootstrap endpoint, secret header, or magic account in the
+application. The first administrator is provisioned out-of-band by an operator
+with database access, e.g.:
+```sql
+UPDATE users SET role = 'ADMIN' WHERE email = 'ops@yourdomain' AND deleted_at IS NULL;
+```
+Thereafter admins manage roles through the audited `POST /api/admin/users/:id/role`.

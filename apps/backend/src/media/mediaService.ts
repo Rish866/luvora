@@ -233,7 +233,14 @@ export async function getBytes(input: {
     input.variant === "thumbnail" && asset.thumbnail_storage_key
       ? asset.thumbnail_storage_key
       : asset.storage_key;
-  const data = await storage.get(key);
+  let data: Buffer;
+  try {
+    data = await storage.get(key);
+  } catch {
+    // Bytes missing from storage (e.g. cleaned up) — treat as not found rather
+    // than leaking a storage/filesystem error.
+    throw Errors.mediaNotFound();
+  }
   return { data, mimeType: asset.detected_mime_type ?? "application/octet-stream" };
 }
 
