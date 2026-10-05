@@ -5,12 +5,17 @@
   "description": "Luvora — a private, consent-first interactive fantasy platform for adults (18+). Server-authoritative multiplayer, non-graphic romance scenarios.",
   "workspaces": [
     "packages/shared",
-    "apps/backend"
+    "apps/backend",
+    "apps/web"
   ],
   "scripts": {
-    "build": "npm run -w @luvora/shared build && npm run -w @luvora/backend build",
-    "typecheck": "npm run -w @luvora/shared typecheck && npm run -w @luvora/backend typecheck",
-    "test": "npm run -w @luvora/backend test",
+    "build": "npm run -w @luvora/shared build && npm run -w @luvora/backend build && npm run -w @luvora/web build",
+    "typecheck": "npm run -w @luvora/shared typecheck && npm run -w @luvora/backend typecheck && npm run -w @luvora/web typecheck",
+    "test": "npm run -w @luvora/backend test && npm run -w @luvora/web test",
+    "build:web": "npm run -w @luvora/web build",
+    "typecheck:web": "npm run -w @luvora/web typecheck",
+    "test:web": "npm run -w @luvora/web test",
+    "dev:web": "npm run -w @luvora/web dev",
     "verify": "npm run -w @luvora/backend verify",
     "verify:redis": "npm run -w @luvora/backend verify:redis",
     "worker": "npm run -w @luvora/backend worker"
