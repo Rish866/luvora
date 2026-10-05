@@ -27,11 +27,18 @@ export interface DiscoveryCandidate {
   photo: DiscoveryPhoto | null;
 }
 
+/** Frontend-consumable reference to another user's primary profile photo.
+ *  Never exposes a raw storage key — only the media id + authenticated
+ *  application URLs the client fetches through the media endpoint (Increment
+ *  14). `url`/`thumbnailUrl` require the caller's own auth and are authorized
+ *  per-request (owner OR entitled discovery/match viewer). */
 export interface DiscoveryPhoto {
-  id: string;
-  /** Opaque storage key. A signed-URL pipeline is a later increment; we never
-   *  expose a permanent public URL. */
-  storageKey: string;
+  /** The media asset id (stable; also addressable via /api/media/:id). */
+  mediaId: string;
+  /** Authenticated URL to fetch the normalized image bytes. */
+  url: string;
+  /** Authenticated URL to fetch the thumbnail, if one exists. */
+  thumbnailUrl: string | null;
 }
 
 /** Result of a LIKE/PASS action. Never reveals the other user's own activity

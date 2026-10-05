@@ -43,12 +43,22 @@ photos via the existing `media_assets` pipeline).
 
 ## 2. Product Readiness Classification
 
-**PARTIALLY-FRONTEND-READY.**
+**PARTIALLY-FRONTEND-READY** (at the time of the Increment 13 audit).
+
+> **Increment 14 update:** both P0 blockers are now **RESOLVED** — a self-profile
+> API (`GET`/`PATCH /api/profile`) and a profile-photo contract (upload via the
+> `media_assets` pipeline with `context='profile'`, associate/list/primary/
+> reorder/delete via `/api/profile/photos`, and avatar bytes served through the
+> authenticated `/api/media/:id/content` with a discovery/match visibility
+> rule) ship in Increment 14. Discovery/match responses now return a consumable
+> photo reference (`mediaId` + authenticated `url`/`thumbnailUrl`), never a raw
+> storage key. See `docs/PROFILE_API.md`. The backend is now
+> **MVP-FRONTEND-READY** for the core consumer journeys; remaining items are P1/P2.
 
 The platform/safety/messaging/consent machinery is production-grade and
-consumable. The consumer frontend cannot start today because a user cannot
-see/edit their profile or render any avatar. After a small Increment 14
-(self-profile + profile photos), the backend becomes MVP-frontend-ready.
+consumable. At the time of the audit the consumer frontend could not start
+because a user could not see/edit their profile or render any avatar — resolved
+by Increment 14 (self-profile + profile photos).
 
 ---
 

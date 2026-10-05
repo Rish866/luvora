@@ -146,6 +146,62 @@ reg() { json -X POST $B/api/auth/register -H 'Content-Type: application/json' \
 tok() { echo "$1" | sed -n 's/.*"accessToken":"\([^"]*\)".*/\1/p'; }
 uid() { echo "$1" | sed -n 's/.*"userId":"\([^"]*\)".*/\1/p'; }
 
+# ---- Increment 14: self-profile API + profile photos (HTTP) ----
+# A self-contained section using fresh users. Verifies the two P0 blockers:
+# self-profile read/update, and profile-photo upload -> associate -> view, plus
+# the discovery photo reference being a consumable URL (no raw storageKey).
+PF1=$(reg "profile.owner@example.com" "ProfOwner"); TPF1=$(tok "$PF1"); UPF1=$(uid "$PF1")
+PF2=$(reg "profile.viewer@example.com" "ProfViewer"); TPF2=$(tok "$PF2")
+
+# GET own profile: requires auth; returns editable fields + empty gallery.
+check "profile GET requires auth 401" '401' "$(code $B/api/profile)"
+PROF=$(json $B/api/profile -H "Authorization: Bearer $TPF1")
+check "profile GET returns displayName" '"displayName":"ProfOwner"' "$PROF"
+check "profile GET returns discoverable" '"discoverable":true' "$PROF"
+check "profile GET returns empty photos" '"primaryPhoto":null' "$PROF"
+if echo "$PROF" | grep -qiE 'password|storage_key|storageKey|account_status'; then echo "FAIL: profile leaks internal field"; FAIL=$((FAIL+1)); else echo "PASS: profile exposes no internal fields"; PASS=$((PASS+1)); fi
+
+# PATCH own profile: update editable fields.
+PATCHED=$(json -X PATCH $B/api/profile -H "Authorization: Bearer $TPF1" -H 'Content-Type: application/json' \
+  -d '{"bio":"smoke bio","interests":["hiking"],"discoverable":true}')
+check "profile PATCH updates bio" '"bio":"smoke bio"' "$PATCHED"
+check "profile PATCH empty body rejected 400" '400' "$(code -X PATCH $B/api/profile -H "Authorization: Bearer $TPF1" -H 'Content-Type: application/json' -d '{}')"
+
+# Generate a tiny real JPEG (sharp is available under apps/backend at runtime).
+PFIMG="$DIR/profile.jpg"
+node -e "require('sharp')({create:{width:48,height:48,channels:3,background:{r:10,g:120,b:200}}}).jpeg().toBuffer().then(b=>require('fs').writeFileSync('$PFIMG',b))" >/dev/null 2>&1
+PFSIZE=$(wc -c < "$PFIMG" | tr -d ' ')
+
+# Upload a PROFILE-context media asset, then associate it as a profile photo.
+PFINTENT=$(json -X POST $B/api/media -H "Authorization: Bearer $TPF1" -H 'Content-Type: application/json' \
+  -d "{\"filename\":\"p.jpg\",\"mimeType\":\"image/jpeg\",\"sizeBytes\":$PFSIZE,\"context\":\"profile\"}")
+PFMID=$(echo "$PFINTENT" | sed -n 's/.*"mediaId":"\([^"]*\)".*/\1/p')
+check "profile media intent created" 'UUID_OK' "$(echo "$PFMID" | grep -Eq '^[0-9a-f-]{36}$' && echo UUID_OK || echo none)"
+PFPUT=$(curl -s -X PUT "$B/api/media/$PFMID/content" -H "Authorization: Bearer $TPF1" -H 'Content-Type: application/octet-stream' --data-binary @"$PFIMG")
+check "profile media uploaded READY" '"status":"READY"' "$PFPUT"
+PFASSOC=$(json -X POST $B/api/profile/photos -H "Authorization: Bearer $TPF1" -H 'Content-Type: application/json' -d "{\"mediaId\":\"$PFMID\"}")
+check "profile photo associated (primary)" '"isPrimary":true' "$PFASSOC"
+check "profile photo exposes url not storageKey" "/api/media/$PFMID/content" "$PFASSOC"
+if echo "$PFASSOC" | grep -qi 'storageKey'; then echo "FAIL: profile photo leaks storageKey"; FAIL=$((FAIL+1)); else echo "PASS: profile photo has no storageKey"; PASS=$((PASS+1)); fi
+
+# Owner can fetch their own profile photo bytes.
+check "owner views own profile photo 200" '200' "$(code "$B/api/media/$PFMID/content" -H "Authorization: Bearer $TPF1")"
+# A discovery-eligible viewer can fetch the discoverable owner's photo.
+check "discoverable photo viewable by stranger 200" '200' "$(code "$B/api/media/$PFMID/content" -H "Authorization: Bearer $TPF2")"
+# Unauthenticated cannot.
+check "profile photo requires auth 401" '401' "$(code "$B/api/media/$PFMID/content")"
+
+# Discovery returns a consumable photo reference (url, no storageKey).
+PFFEED=$(json "$B/api/discovery" -H "Authorization: Bearer $TPF2")
+check "discovery exposes consumable photo url" "/api/media/$PFMID/content" "$PFFEED"
+if echo "$PFFEED" | grep -qi 'storageKey'; then echo "FAIL: discovery leaks storageKey"; FAIL=$((FAIL+1)); else echo "PASS: discovery photo has no storageKey"; PASS=$((PASS+1)); fi
+
+# After the owner hides (discoverable=false), the stranger can no longer view it.
+json -X PATCH $B/api/profile -H "Authorization: Bearer $TPF1" -H 'Content-Type: application/json' -d '{"discoverable":false}' >/dev/null
+check "non-discoverable photo blocked for stranger 403" '403' "$(code "$B/api/media/$PFMID/content" -H "Authorization: Bearer $TPF2")"
+# Delete the photo (owner).
+check "owner deletes profile photo" '"primaryPhoto":null' "$(json -X DELETE "$B/api/profile/photos/$(echo "$PFASSOC" | sed -n 's/.*"photos":\[{"id":"\([^"]*\)".*/\1/p')" -H "Authorization: Bearer $TPF1")"
+
 # ---- Increment 2: discovery, like/pass, mutual match, block, match list ----
 PA=$(reg "pa.smoke@example.com" "PlayerA"); TA=$(tok "$PA"); UA=$(uid "$PA")
 PB=$(reg "pb.smoke@example.com" "PlayerB"); TB=$(tok "$PB"); UB=$(uid "$PB")

@@ -19,8 +19,10 @@ export interface CandidateRow {
   /** Lossless text form of created_at (microsecond precision preserved) used
    *  for keyset pagination; the Date-based `created_at` round-trips lossily. */
   cursor_created_at: string;
-  photo_id: string | null;
-  photo_storage_key: string | null;
+  /** Primary (else first) READY+APPROVED profile photo media id, or null. */
+  photo_media_id: string | null;
+  /** Whether that media has a thumbnail variant. */
+  photo_has_thumbnail: boolean | null;
 }
 
 export interface FeedCursor {
@@ -69,17 +71,22 @@ export async function queryFeed(input: {
       u.date_of_birth,
       u.created_at,
       u.created_at::text AS cursor_created_at,
-      ph.id          AS photo_id,
-      ph.storage_key AS photo_storage_key
+      ph.media_id      AS photo_media_id,
+      ph.has_thumbnail AS photo_has_thumbnail
     FROM users u
     JOIN profiles p ON p.user_id = u.id
+    -- Primary (else lowest-position) profile photo that is a READY+APPROVED
+    -- media asset. Standardized on media_assets via profile_photos (0012).
     LEFT JOIN LATERAL (
-      SELECT id, storage_key
-      FROM photos
-      WHERE photos.user_id = u.id
-        AND photos.deleted_at IS NULL
-        AND photos.moderation_state = 'APPROVED'
-      ORDER BY position ASC, created_at ASC
+      SELECT pp.media_id,
+             (m.thumbnail_storage_key IS NOT NULL) AS has_thumbnail
+      FROM profile_photos pp
+      JOIN media_assets m ON m.id = pp.media_id
+      WHERE pp.user_id = u.id
+        AND m.deleted_at IS NULL
+        AND m.status = 'READY'
+        AND m.moderation_status = 'APPROVED'
+      ORDER BY pp.is_primary DESC, pp.position ASC, pp.created_at ASC
       LIMIT 1
     ) ph ON true
     WHERE u.id <> $1

@@ -1,6 +1,7 @@
 import express, { type Express } from "express";
 import { config } from "./config";
 import { authRouter } from "./auth/authRoutes";
+import { profileRouter } from "./profile/profileRoutes";
 import { sessionRouter } from "./fantasy/sessionRoutes";
 import { discoveryRouter } from "./discovery/discoveryRoutes";
 import { matchRouter } from "./discovery/matchRoutes";
@@ -74,6 +75,7 @@ export function createApp(): Express {
   app.use("/metrics", metricsRouter);
 
   app.use("/api/auth", authRouter);
+  app.use("/api/profile", profileRouter);
   app.use("/api/sessions", sessionRouter);
   app.use("/api/discovery", discoveryRouter);
   // Chat history/send is nested under a match; mount it BEFORE the match router

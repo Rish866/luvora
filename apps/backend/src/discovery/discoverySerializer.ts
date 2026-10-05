@@ -24,10 +24,21 @@ export function toCandidate(row: CandidateRow): DiscoveryCandidate {
     bio: row.bio,
     interests: row.interests ?? [],
     age,
-    photo:
-      row.photo_id && row.photo_storage_key
-        ? { id: row.photo_id, storageKey: row.photo_storage_key }
-        : null,
+    photo: row.photo_media_id ? toDiscoveryPhoto(row.photo_media_id, row.photo_has_thumbnail) : null,
+  };
+}
+
+/** Build a frontend-consumable photo reference (authenticated media URLs; never
+ *  a raw storage key). The caller is authorized per-request at the media
+ *  endpoint via the profile-visibility rule. */
+export function toDiscoveryPhoto(
+  mediaId: string,
+  hasThumbnail: boolean | null,
+): { mediaId: string; url: string; thumbnailUrl: string | null } {
+  return {
+    mediaId,
+    url: `/api/media/${mediaId}/content`,
+    thumbnailUrl: hasThumbnail ? `/api/media/${mediaId}/thumbnail` : null,
   };
 }
 
@@ -37,8 +48,8 @@ export interface MatchListRow {
   created_at: string;
   other_id: string;
   other_display_name: string;
-  other_photo_id: string | null;
-  other_photo_storage_key: string | null;
+  other_photo_media_id: string | null;
+  other_photo_has_thumbnail: boolean | null;
 }
 
 export function toMatchSummary(row: MatchListRow): MatchSummary {
@@ -48,10 +59,9 @@ export function toMatchSummary(row: MatchListRow): MatchSummary {
     user: {
       id: row.other_id,
       displayName: row.other_display_name,
-      photo:
-        row.other_photo_id && row.other_photo_storage_key
-          ? { id: row.other_photo_id, storageKey: row.other_photo_storage_key }
-          : null,
+      photo: row.other_photo_media_id
+        ? toDiscoveryPhoto(row.other_photo_media_id, row.other_photo_has_thumbnail)
+        : null,
     },
   };
 }

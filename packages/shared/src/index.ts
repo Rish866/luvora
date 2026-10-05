@@ -12,6 +12,7 @@ export * from "./enums";
 export * from "./consent";
 export * from "./api";
 export * from "./stateMachine";
+export * from "./profile";
 export * from "./discovery";
 export * from "./media";
 export * from "./chat";

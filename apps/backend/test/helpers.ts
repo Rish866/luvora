@@ -10,7 +10,7 @@ export async function resetDb(): Promise<void> {
              notification_deliveries, notification_devices,
              notifications, notification_preferences,
              safety_reports, moderation_actions, audit_logs,
-             media_reports, message_attachments, media_assets,
+             media_reports, message_attachments, profile_photos, media_assets,
              consent_responses, fantasy_players, fantasy_sessions,
              blocks, matches, likes, photos, profiles,
              devices, auth_sessions, users
@@ -167,12 +167,13 @@ export async function uploadImage(
   u: RegisteredUser,
   data: Buffer,
   mimeType = "image/jpeg",
+  context: "chat" | "session" | "profile" = "chat",
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
 ): Promise<{ mediaId: string; body: any; status: number }> {
   const intent = await request(app)
     .post("/api/media")
     .set(...auth(u.accessToken))
-    .send({ filename: "x.jpg", mimeType, sizeBytes: data.length, context: "chat" });
+    .send({ filename: "x.jpg", mimeType, sizeBytes: data.length, context });
   if (intent.status !== 201) {
     throw new Error(`intent failed: ${intent.status} ${JSON.stringify(intent.body)}`);
   }

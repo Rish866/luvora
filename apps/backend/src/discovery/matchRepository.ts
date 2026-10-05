@@ -17,19 +17,22 @@ export async function listMatchesForUser(
       m.created_at AS created_at,
       other.id     AS other_id,
       op.display_name AS other_display_name,
-      ph.id          AS other_photo_id,
-      ph.storage_key AS other_photo_storage_key
+      ph.media_id      AS other_photo_media_id,
+      ph.has_thumbnail AS other_photo_has_thumbnail
     FROM matches m
     JOIN users other
       ON other.id = CASE WHEN m.user_a = $1 THEN m.user_b ELSE m.user_a END
     JOIN profiles op ON op.user_id = other.id
     LEFT JOIN LATERAL (
-      SELECT id, storage_key
-      FROM photos
-      WHERE photos.user_id = other.id
-        AND photos.deleted_at IS NULL
-        AND photos.moderation_state = 'APPROVED'
-      ORDER BY position ASC, created_at ASC
+      SELECT pp.media_id,
+             (m.thumbnail_storage_key IS NOT NULL) AS has_thumbnail
+      FROM profile_photos pp
+      JOIN media_assets m ON m.id = pp.media_id
+      WHERE pp.user_id = other.id
+        AND m.deleted_at IS NULL
+        AND m.status = 'READY'
+        AND m.moderation_status = 'APPROVED'
+      ORDER BY pp.is_primary DESC, pp.position ASC, pp.created_at ASC
       LIMIT 1
     ) ph ON true
     WHERE (m.user_a = $1 OR m.user_b = $1)
@@ -72,19 +75,22 @@ export async function getMatchDetailForUser(
       m.created_at AS created_at,
       other.id     AS other_id,
       op.display_name AS other_display_name,
-      ph.id          AS other_photo_id,
-      ph.storage_key AS other_photo_storage_key
+      ph.media_id      AS other_photo_media_id,
+      ph.has_thumbnail AS other_photo_has_thumbnail
     FROM matches m
     JOIN users other
       ON other.id = CASE WHEN m.user_a = $2 THEN m.user_b ELSE m.user_a END
     JOIN profiles op ON op.user_id = other.id
     LEFT JOIN LATERAL (
-      SELECT id, storage_key
-      FROM photos
-      WHERE photos.user_id = other.id
-        AND photos.deleted_at IS NULL
-        AND photos.moderation_state = 'APPROVED'
-      ORDER BY position ASC, created_at ASC
+      SELECT pp.media_id,
+             (m.thumbnail_storage_key IS NOT NULL) AS has_thumbnail
+      FROM profile_photos pp
+      JOIN media_assets m ON m.id = pp.media_id
+      WHERE pp.user_id = other.id
+        AND m.deleted_at IS NULL
+        AND m.status = 'READY'
+        AND m.moderation_status = 'APPROVED'
+      ORDER BY pp.is_primary DESC, pp.position ASC, pp.created_at ASC
       LIMIT 1
     ) ph ON true
     WHERE m.id = $1 AND (m.user_a = $2 OR m.user_b = $2) AND m.state = 'ACTIVE'
