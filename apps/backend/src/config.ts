@@ -122,6 +122,42 @@ const schema = z.object({
   JOB_DEAD_RETENTION_DAYS: z.coerce.number().int().min(1).max(3650).default(30),
   // Safety valve: refuse to enqueue if the queue is this deep (0 = unbounded).
   JOB_MAX_QUEUE_DEPTH: z.coerce.number().int().min(0).default(0),
+
+  // ---- Observability & operations (Increment 10) ----
+  // Minimum log level for the structured logger. Overridden to 'silent' under
+  // test so the suite stays quiet. Accepts any case (normalized to lowercase);
+  // an unrecognized value falls back to 'info' rather than failing startup.
+  LOG_LEVEL: z
+    .string()
+    .default("info")
+    .transform((v) => v.trim().toLowerCase())
+    .transform((v) =>
+      ["debug", "info", "warn", "error", "silent"].includes(v) ? v : "info",
+    ),
+  // Metrics endpoint controls. Disabled => /metrics returns 404. When auth is
+  // required, an ADMIN access token is needed (safe default: enabled + auth).
+  METRICS_ENABLED: z
+    .string()
+    .default("true")
+    .transform((v) => v === "true"),
+  METRICS_REQUIRE_AUTH: z
+    .string()
+    .default("true")
+    .transform((v) => v === "true"),
+  // Timeouts for the DB probe used by health/readiness (ms).
+  HEALTH_DB_TIMEOUT_MS: z.coerce.number().int().min(100).max(30_000).default(2000),
+  READINESS_DB_TIMEOUT_MS: z.coerce.number().int().min(100).max(30_000).default(2000),
+  // Queue-pressure thresholds (claimable depth / oldest pending age seconds).
+  JOB_QUEUE_WARNING_DEPTH: z.coerce.number().int().min(0).default(100),
+  JOB_QUEUE_CRITICAL_DEPTH: z.coerce.number().int().min(0).default(1000),
+  JOB_QUEUE_MAX_AGE_SECONDS: z.coerce.number().int().min(1).default(300),
+  // Worker is considered UNHEALTHY if it was enabled but hasn't polled within
+  // this window, or after this many consecutive claim-loop errors.
+  WORKER_UNHEALTHY_POLL_SECONDS: z.coerce.number().int().min(5).default(120),
+  WORKER_UNHEALTHY_ERROR_STREAK: z.coerce.number().int().min(1).default(10),
+  // Retention for operational events (days). Audit logs are a SEPARATE policy
+  // and are never deleted by this.
+  OPERATIONAL_EVENT_RETENTION_DAYS: z.coerce.number().int().min(1).max(3650).default(90),
 });
 
 const parsed = schema.safeParse(process.env);
@@ -217,6 +253,21 @@ export const config = {
     successRetentionDays: env.JOB_SUCCESS_RETENTION_DAYS,
     deadRetentionDays: env.JOB_DEAD_RETENTION_DAYS,
     maxQueueDepth: env.JOB_MAX_QUEUE_DEPTH,
+    queueWarningDepth: env.JOB_QUEUE_WARNING_DEPTH,
+    queueCriticalDepth: env.JOB_QUEUE_CRITICAL_DEPTH,
+    queueMaxAgeSeconds: env.JOB_QUEUE_MAX_AGE_SECONDS,
+    workerUnhealthyPollSeconds: env.WORKER_UNHEALTHY_POLL_SECONDS,
+    workerUnhealthyErrorStreak: env.WORKER_UNHEALTHY_ERROR_STREAK,
+  },
+  // ---- Observability & operations (Increment 10) ----
+  observability: {
+    // Under test the logger is silenced regardless of LOG_LEVEL.
+    logLevel: env.NODE_ENV === "test" ? "silent" : env.LOG_LEVEL,
+    metricsEnabled: env.METRICS_ENABLED,
+    metricsRequireAuth: env.METRICS_REQUIRE_AUTH,
+    healthDbTimeoutMs: env.HEALTH_DB_TIMEOUT_MS,
+    readinessDbTimeoutMs: env.READINESS_DB_TIMEOUT_MS,
+    operationalEventRetentionDays: env.OPERATIONAL_EVENT_RETENTION_DAYS,
   },
 } as const;
 

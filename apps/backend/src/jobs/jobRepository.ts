@@ -364,6 +364,68 @@ export async function claimableDepth(): Promise<number> {
   return rows[0]?.n ?? 0;
 }
 
+/**
+ * Queue pressure / starvation signals (Increment 10):
+ *  - depth: claimable (PENDING/RETRY_WAIT) jobs
+ *  - oldestPendingAgeSeconds: age of the oldest claimable job's available_at
+ *  - staleRunning: RUNNING jobs whose lease has already expired
+ *  - dead: DEAD jobs
+ */
+export async function queueStats(): Promise<{
+  depth: number;
+  oldestPendingAgeSeconds: number | null;
+  staleRunning: number;
+  dead: number;
+}> {
+  const rows = await query<{
+    depth: number;
+    oldest_age: number | null;
+    stale_running: number;
+    dead: number;
+  }>(
+    `SELECT
+       (SELECT count(*)::int FROM background_jobs WHERE status IN ('PENDING','RETRY_WAIT')) AS depth,
+       (SELECT EXTRACT(EPOCH FROM (now() - min(available_at)))::int
+          FROM background_jobs WHERE status IN ('PENDING','RETRY_WAIT') AND available_at <= now()) AS oldest_age,
+       (SELECT count(*)::int FROM background_jobs
+          WHERE status = 'RUNNING' AND leased_until IS NOT NULL AND leased_until <= now()) AS stale_running,
+       (SELECT count(*)::int FROM background_jobs WHERE status = 'DEAD') AS dead`,
+  );
+  const r = rows[0];
+  return {
+    depth: r?.depth ?? 0,
+    oldestPendingAgeSeconds: r?.oldest_age ?? null,
+    staleRunning: r?.stale_running ?? 0,
+    dead: r?.dead ?? 0,
+  };
+}
+
+/**
+ * Requeue a DEAD job back to PENDING for a fresh attempt (admin operation).
+ * Resets attempt_count to 0, clears lease/error/failed_at, and makes it
+ * immediately available. Scoped to DEAD status so SUCCEEDED/RUNNING/active jobs
+ * are never silently rerun. Returns the updated row, or null if the job was not
+ * DEAD (or did not exist).
+ */
+export async function requeueDead(jobId: string): Promise<JobRow | null> {
+  const rows = await query<JobRow>(
+    `UPDATE background_jobs
+        SET status = 'PENDING',
+            attempt_count = 0,
+            available_at = now(),
+            leased_until = NULL,
+            worker_id = NULL,
+            failed_at = NULL,
+            completed_at = NULL,
+            last_error_code = NULL,
+            last_error_message = NULL
+      WHERE id = $1 AND status = 'DEAD'
+      RETURNING *`,
+    [jobId],
+  );
+  return rows[0] ?? null;
+}
+
 /** Delete terminal jobs older than the given cutoffs (retention). Uses the
  *  stable terminal timestamp (completed_at / failed_at) rather than updated_at,
  *  which the set_updated_at trigger bumps on every UPDATE. */

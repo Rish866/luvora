@@ -301,8 +301,49 @@
   authoritative guard against duplicate database deliveries. Duplicate external
   push on a crash-after-send is possible and is not claimed to be exactly-once.
 
+## Observability & operational security (Increment 10)
+- **Correlation ids are untrusted + bounded.** An inbound `X-Correlation-Id` is
+  accepted only if it matches a strict charset (alphanumerics + `._:-`) and is
+  ≤ 128 chars; anything else (incl. newlines/control chars — log-injection
+  attempts) is rejected and a fresh random id is generated. The id is never used
+  for authorization.
+- **Telemetry is best-effort, never a reliability dependency.** A metrics,
+  logging, or operational-event failure never fails or alters a request —
+  recording is wrapped and swallowed. Observability can degrade without taking
+  the API down.
+- **No sensitive data in logs/metrics/events.** The structured logger drops
+  forbidden fields (tokens/passwords/authorization/bodies/consent/storage keys)
+  and serializes errors to a bounded name+message (never a raw Error object);
+  pino redaction is a second layer. Metrics labels are a bounded, server-
+  controlled set (route templates with `:id`, status class, channel, job type)
+  with a hard per-metric series cap, so an attacker cannot explode cardinality
+  or cause unbounded memory growth, and `/metrics` emits only registered metric
+  names — no PII, tokens, SQL, or payloads. Operational-event metadata is
+  sanitized (flat safe scalars; sensitive keys dropped; key/value bounded).
+- **`/metrics` is not public by default.** It is gated by `METRICS_ENABLED`
+  (disabled ⇒ 404) and `METRICS_REQUIRE_AUTH` (default true ⇒ requires an ADMIN
+  access token).
+- **Health/readiness never leak internals.** No connection strings, SQL,
+  filesystem paths, credentials, or stack traces appear in `/health` or
+  `/ready`; the DB-health snapshot exposes only pool counts + utilization.
+- **Admin job operations respect existing authorization.** Retry/cancel/dead-
+  letter/operational-event endpoints require ADMIN (moderators and users get
+  403; unauthenticated 401), are IDOR-opaque (`JOB_NOT_FOUND`), and never return
+  a raw job payload (redacted `payloadSummary` only). Every operational action
+  writes an append-only audit record AND a durable operational event.
+- **Safe, honest job mutation.** Retry only requeues a DEAD job (never reruns a
+  SUCCEEDED job or duplicates a RUNNING one), preserving idempotency; cancel
+  refuses a RUNNING job rather than claiming to have killed an in-flight
+  external call. Queue backpressure never silently drops SAFETY/critical jobs.
+- **Parameterized SQL.** The operational-event repository builds only `$N`
+  placeholders and fixed, allow-listed fragments; all values are bound.
+
 ## Known gaps (planned for later increments)
 - Email/phone verification flow (fields exist; sending not wired).
+- **Distributed metrics aggregation** is NOT implemented — metrics are
+  process-local; aggregating across multiple server/worker processes needs a
+  future scrape/aggregation layer (e.g. a Prometheus server scraping each
+  `/metrics`). No APM vendor (Datadog/New Relic) is integrated.
 - **Real push delivery** (FCM / APNs / Web Push) — the provider abstraction,
   device registry, delivery tracking, durable job-driven delivery, retry, and
   token revocation all ship, but the concrete FCM/APNs/Web-Push adapters are

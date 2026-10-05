@@ -1,8 +1,14 @@
 import { randomUUID } from "node:crypto";
-import { JobFailureKind, type WorkerHealth } from "@luvora/shared";
+import {
+  JobFailureKind,
+  WorkerState,
+  QueuePressureLevel,
+  type WorkerHealth,
+} from "@luvora/shared";
 import * as jobRepo from "./jobRepository";
 import type { JobRegistry } from "./jobRegistry";
 import { jobMetrics } from "./jobMetrics";
+import { metrics } from "../observability/metrics";
 import { computeBackoffMs, sanitizeErrorCode, sanitizeErrorMessage } from "./jobService";
 import type { JobResult } from "./JobHandler";
 import { config } from "../config";
@@ -56,6 +62,7 @@ export class Worker {
   private lastPollAt: number | null = null;
   private lastSuccessAt: number | null = null;
   private lastErrorCode: string | null = null;
+  private consecutiveErrors = 0;
 
   constructor(opts: WorkerOptions) {
     this.registry = opts.registry;
@@ -90,6 +97,7 @@ export class Worker {
       const { reclaimed, dead } = await jobRepo.reclaimExpired();
       if (reclaimed > 0 || dead > 0) {
         jobMetrics.inc("jobs_reclaimed", undefined, reclaimed);
+        if (reclaimed > 0) metrics.incr("jobs_reclaimed_total", {}, reclaimed);
         logger.info({ workerId: this.workerId, reclaimed, dead }, "job.reclaimed");
       }
     } catch (err) {
@@ -105,9 +113,10 @@ export class Worker {
         while (this.active.size < this.concurrency && !this.stopping) {
           const job = await jobRepo.claimNext(this.workerId, this.leaseSeconds);
           this.lastPollAt = Date.now();
+          this.consecutiveErrors = 0; // a successful poll clears the error streak
           if (!job) break;
           claimedAny = true;
-          jobMetrics.inc("jobs_claimed", job.job_type);
+          this.recordClaimMetrics(job);
           logger.info(
             { workerId: this.workerId, jobId: job.id, jobType: job.job_type, attempt: job.attempt_count },
             "job.claimed",
@@ -115,6 +124,7 @@ export class Worker {
           this.spawn(job);
         }
       } catch (err) {
+        this.consecutiveErrors += 1;
         this.lastErrorCode = sanitizeErrorCode((err as Error).message);
         logger.warn({ err: (err as Error).message }, "worker claim loop error");
       }
@@ -184,6 +194,22 @@ export class Worker {
     this.active.set(job.id, { jobId: job.id, jobType: job.job_type, heartbeat, promise });
   }
 
+  /** Record claim-time metrics: claim counter + queue-wait histogram. */
+  private recordClaimMetrics(job: jobRepo.JobRow): void {
+    jobMetrics.inc("jobs_claimed", job.job_type);
+    try {
+      metrics.incr("jobs_claimed_total", { job_type: job.job_type });
+      // Queue wait = time from creation to first claim (attempt 1 only, so a
+      // retried job's backoff wait doesn't skew the metric).
+      if (job.attempt_count <= 1 && job.created_at) {
+        const waitMs = Date.now() - new Date(job.created_at).getTime();
+        if (waitMs >= 0) metrics.observe("jobs_queue_wait_duration_ms", waitMs, { job_type: job.job_type });
+      }
+    } catch {
+      /* best-effort */
+    }
+  }
+
   /** Persist the handler outcome: success / retry (backoff) / dead-letter. */
   private async recordResult(
     job: jobRepo.JobRow,
@@ -192,11 +218,17 @@ export class Worker {
   ): Promise<void> {
     const durationMs = Date.now() - startedMs;
     jobMetrics.observeDuration(job.job_type, durationMs);
+    try {
+      metrics.observe("jobs_execution_duration_ms", durationMs, { job_type: job.job_type });
+    } catch {
+      /* best-effort */
+    }
 
     if (result.outcome === "success") {
       const ok = await jobRepo.markSucceeded(job.id, this.workerId);
       if (ok) {
         jobMetrics.inc("jobs_succeeded", job.job_type);
+        metrics.incr("jobs_succeeded_total", { job_type: job.job_type });
         this.lastSuccessAt = Date.now();
         logger.info(
           { workerId: this.workerId, jobId: job.id, jobType: job.job_type, durationMs },
@@ -216,6 +248,7 @@ export class Worker {
       const dead = await jobRepo.markDead(job.id, this.workerId, errorCode, errorMessage);
       if (dead) {
         jobMetrics.inc("jobs_dead", job.job_type);
+        metrics.incr("jobs_dead_total", { job_type: job.job_type });
         logger.warn(
           { workerId: this.workerId, jobId: job.id, jobType: job.job_type, errorCode, attempt: job.attempt_count },
           "job.dead",
@@ -235,6 +268,7 @@ export class Worker {
     );
     if (scheduled) {
       jobMetrics.inc("jobs_retried", job.job_type);
+      metrics.incr("jobs_retried_total", { job_type: job.job_type });
       logger.info(
         { workerId: this.workerId, jobId: job.id, jobType: job.job_type, errorCode, delayMs, attempt: job.attempt_count },
         "job.retry_scheduled",
@@ -248,7 +282,7 @@ export class Worker {
     const job = await jobRepo.claimNext(this.workerId, this.leaseSeconds);
     this.lastPollAt = Date.now();
     if (!job) return false;
-    jobMetrics.inc("jobs_claimed", job.job_type);
+    this.recordClaimMetrics(job);
     const started = Date.now();
     const handler = this.registry.get(job.job_type);
     let result: JobResult;
@@ -313,6 +347,23 @@ export class Worker {
     logger.info({ workerId: this.workerId }, "worker.stopped");
   }
 
+  /** Derive the operational WorkerState from in-memory signals. A DISABLED
+   *  worker (never started) is never UNHEALTHY. */
+  private deriveState(): WorkerState {
+    if (this.stopping) return WorkerState.STOPPING;
+    if (!this.running) return WorkerState.STOPPED;
+    // Running: unhealthy if it hasn't polled within the window, or the error
+    // streak is too high.
+    const pollWindowMs = config.jobs.workerUnhealthyPollSeconds * 1000;
+    const stalePoll =
+      this.lastPollAt !== null && Date.now() - this.lastPollAt > pollWindowMs;
+    if (stalePoll || this.consecutiveErrors >= config.jobs.workerUnhealthyErrorStreak) {
+      return WorkerState.UNHEALTHY;
+    }
+    return WorkerState.RUNNING;
+  }
+
+  /** In-memory health snapshot (no DB). */
   health(): WorkerHealth {
     return {
       workerId: this.workerId,
@@ -323,7 +374,36 @@ export class Worker {
       lastPollAt: this.lastPollAt ? new Date(this.lastPollAt).toISOString() : null,
       lastSuccessAt: this.lastSuccessAt ? new Date(this.lastSuccessAt).toISOString() : null,
       lastErrorCode: this.lastErrorCode,
+      state: this.deriveState(),
+      consecutiveErrors: this.consecutiveErrors,
     };
+  }
+
+  /** Full health incl. queue-pressure signals from the DB (admin diagnostics). */
+  async healthWithQueue(): Promise<WorkerHealth> {
+    const base = this.health();
+    try {
+      const stats = await jobRepo.queueStats();
+      let pressure = QueuePressureLevel.OK;
+      if (
+        stats.depth >= config.jobs.queueCriticalDepth ||
+        (stats.oldestPendingAgeSeconds ?? 0) >= config.jobs.queueMaxAgeSeconds
+      ) {
+        pressure = QueuePressureLevel.CRITICAL;
+      } else if (stats.depth >= config.jobs.queueWarningDepth) {
+        pressure = QueuePressureLevel.WARNING;
+      }
+      return {
+        ...base,
+        queueDepth: stats.depth,
+        oldestPendingAgeSeconds: stats.oldestPendingAgeSeconds,
+        staleRunningCount: stats.staleRunning,
+        deadJobCount: stats.dead,
+        queuePressure: pressure,
+      };
+    } catch {
+      return base;
+    }
   }
 
   private sleep(ms: number): Promise<void> {

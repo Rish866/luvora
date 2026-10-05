@@ -96,6 +96,20 @@ export interface JobMetricsSnapshot {
   counters: Record<string, number>;
 }
 
+/** Lifecycle/operational state of a worker (Increment 10). */
+export enum WorkerState {
+  /** Enabled and polling normally. */
+  RUNNING = "RUNNING",
+  /** Graceful shutdown in progress. */
+  STOPPING = "STOPPING",
+  /** Not running (never started / stopped). */
+  STOPPED = "STOPPED",
+  /** Not configured to run in this process (API-only). */
+  DISABLED = "DISABLED",
+  /** Enabled but failing a health condition (not polling / excessive errors). */
+  UNHEALTHY = "UNHEALTHY",
+}
+
 /** Worker health, exposed only to admins (never unauthenticated). */
 export interface WorkerHealth {
   workerId: string;
@@ -106,4 +120,19 @@ export interface WorkerHealth {
   lastPollAt: string | null;
   lastSuccessAt: string | null;
   lastErrorCode: string | null;
+  /** Increment 10: derived operational state + queue pressure signals. */
+  state?: WorkerState;
+  consecutiveErrors?: number;
+  queueDepth?: number;
+  oldestPendingAgeSeconds?: number | null;
+  staleRunningCount?: number;
+  deadJobCount?: number;
+  queuePressure?: QueuePressureLevel;
+}
+
+/** Queue pressure classification driven by configurable thresholds. */
+export enum QueuePressureLevel {
+  OK = "OK",
+  WARNING = "WARNING",
+  CRITICAL = "CRITICAL",
 }

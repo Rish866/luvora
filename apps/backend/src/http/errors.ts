@@ -176,6 +176,20 @@ export const Errors = {
   queueBackpressure: (message = "The job queue is at capacity; try again shortly.") =>
     new AppError(ErrorCodes.QUEUE_BACKPRESSURE, 503, message),
 
+  // ---- Observability & operations (Increment 10) ----
+  jobNotRetryable: (message = "This job cannot be retried in its current state.") =>
+    new AppError(ErrorCodes.JOB_NOT_RETRYABLE, 409, message),
+  jobNotCancellable: (message = "This job cannot be cancelled in its current state.") =>
+    new AppError(ErrorCodes.JOB_NOT_CANCELLABLE, 409, message),
+  metricsDisabled: (message = "Metrics are disabled.") =>
+    new AppError(ErrorCodes.METRICS_DISABLED, 404, message),
+  metricsUnauthorized: (message = "Metrics access is not authorized.") =>
+    new AppError(ErrorCodes.METRICS_UNAUTHORIZED, 401, message),
+  operationNotAllowed: (message = "This operation is not allowed.") =>
+    new AppError(ErrorCodes.OPERATION_NOT_ALLOWED, 403, message),
+  serviceNotReady: (message = "The service is not ready.") =>
+    new AppError(ErrorCodes.SERVICE_NOT_READY, 503, message),
+
   internal: (message = "An unexpected error occurred.") =>
     new AppError(ErrorCodes.INTERNAL, 500, message),
 };

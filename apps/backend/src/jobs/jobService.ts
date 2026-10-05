@@ -7,6 +7,7 @@ import {
 } from "@luvora/shared";
 import * as jobRepo from "./jobRepository";
 import { jobMetrics } from "./jobMetrics";
+import { metrics } from "../observability/metrics";
 import { config } from "../config";
 import { Errors } from "../http/errors";
 import { logger } from "../logger";
@@ -82,7 +83,13 @@ export async function enqueue(
     },
     client,
   );
-  if (created) jobMetrics.inc("jobs_enqueued", type);
+  if (created) {
+    jobMetrics.inc("jobs_enqueued", type);
+    metrics.incr("jobs_enqueued_total", { job_type: type });
+    if (type === JobType.NOTIFICATION_PUSH_DELIVERY) {
+      metrics.incr("notification_push_jobs_enqueued_total", {});
+    }
+  }
   return { id: row.id, created };
 }
 

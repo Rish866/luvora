@@ -956,3 +956,100 @@ duplicate request if a crash occurs after provider acceptance but before the DB
 records success — Luvora does not claim exactly-once external push delivery.
 Multiple workers scale only as far as PostgreSQL row-locking against the same
 database allows; there is no Redis/broker and no cross-datacentre coordination.
+
+## Observability & operational controls (Increment 10)
+
+A lightweight, PostgreSQL/Node-based observability layer: correlation ids,
+structured logging, in-process metrics, improved health/readiness, worker/queue
+health, and admin job operations. No Redis / Prometheus server / APM vendor.
+
+### Correlation ids
+
+Every HTTP response carries an `X-Correlation-Id` header. A safe inbound
+`X-Correlation-Id` (alphanumerics + `._:-`, ≤ 128 chars) is honoured; a missing,
+oversized, or malformed value is replaced by a fresh random id. The id flows
+through logs, operational events, and error handling. It is **never** a trusted
+security identifier — authorization always uses the authenticated user.
+
+### Health & readiness
+
+```
+GET /health   → 200 { status: "ok", uptimeSeconds }
+GET /ready    → 200 { status: "ready", checks: { database, migrations, worker } }
+              → 503 { status: "not_ready", checks: {...} } when a critical dep is down
+```
+
+`/health` is cheap liveness and does NOT fail because an optional component
+(worker/push/distributed backend) is unavailable. `/ready` verifies PostgreSQL
+reachability + schema; a disabled embedded worker reports `"worker":"disabled"`
+and does NOT make the API not-ready (the worker may run as a separate process).
+Neither endpoint leaks connection strings, SQL, filesystem paths, credentials,
+or stack traces.
+
+### Metrics — `GET /metrics`
+
+Prometheus text exposition format. Access is configurable:
+
+- `METRICS_ENABLED=false` → `404 METRICS_DISABLED`.
+- `METRICS_REQUIRE_AUTH=true` (default) → requires an **ADMIN** access token
+  (`401 METRICS_UNAUTHORIZED` otherwise).
+
+Exposed metric families (process-local; see limitation below): HTTP
+(`http_requests_total`, `http_errors_total`, `http_request_duration_ms`), DB
+(`db_queries_total`, `db_query_errors_total`, `db_query_duration_ms`), WebSocket
+(`websocket_connections_total`, `_disconnects_total`, `_messages_total`,
+`_errors_total`), notifications (`notifications_created_total`,
+`notifications_deduplicated_total`, `notification_push_jobs_enqueued_total`,
+`notification_push_sent_total`, `_failed_total`, `_revoked_total`), and jobs
+(`jobs_enqueued_total`, `_claimed_total`, `_succeeded_total`, `_retried_total`,
+`_dead_total`, `_reclaimed_total`, `jobs_execution_duration_ms`,
+`jobs_queue_wait_duration_ms`). **Labels are bounded**: routes use the Express
+template (UUIDs collapse to `:id`), status is a class (`2xx`..`5xx`), channels
+are `chat`/`game`, job labels come from fixed enums — and a hard per-metric
+series cap prevents unbounded cardinality. The output contains no PII, tokens,
+SQL, or payloads.
+
+### Worker health + queue pressure — `GET /api/admin/jobs/worker` *(admin)*
+
+Returns the embedded worker's health (or a `DISABLED` view that still carries
+queue stats when no worker runs in this process): `state`
+(`RUNNING`/`STOPPING`/`STOPPED`/`DISABLED`/`UNHEALTHY`), `activeJobs`,
+`concurrency`, `lastPollAt`, `lastSuccessAt`, `consecutiveErrors`, `queueDepth`,
+`oldestPendingAgeSeconds`, `staleRunningCount`, `deadJobCount`, and
+`queuePressure` (`OK`/`WARNING`/`CRITICAL`) derived from
+`JOB_QUEUE_WARNING_DEPTH` / `JOB_QUEUE_CRITICAL_DEPTH` / `JOB_QUEUE_MAX_AGE_SECONDS`.
+A disabled worker is never reported UNHEALTHY.
+
+### Admin job operations *(admin only, audited, IDOR-safe)*
+
+```
+GET  /api/admin/jobs/dead                 # dead-letter diagnostics (redacted)
+POST /api/admin/jobs/:id/retry   { reason? }   # requeue a DEAD job
+POST /api/admin/jobs/:id/cancel  { reason? }   # cancel a queued job
+GET  /api/admin/operational-events?eventType=&severity=&limit=&cursor=
+```
+
+- **Retry** requeues a **DEAD** job back to `PENDING` (attempts reset, lease/
+  error cleared, immediately available). SUCCEEDED/RUNNING jobs are refused
+  (`JOB_NOT_RETRYABLE`). Idempotency is preserved — the job's own idempotency key
+  still prevents a duplicate LIVE copy. Records an audit log + a
+  `JOB_MANUALLY_REQUEUED` operational event (no raw payload).
+- **Cancel** marks a `PENDING`/`RETRY_WAIT` job `CANCELLED`. A **RUNNING** job is
+  refused (`JOB_NOT_CANCELLABLE`): the handler may already be executing an
+  external call that cannot be aborted — the API does not pretend to kill it.
+  Records an audit log + a `JOB_CANCELLED` operational event.
+- **Dead-letter listing** returns `DEAD` jobs with the same redacted
+  `payloadSummary` as other job diagnostics — never the raw payload.
+- Non-admins get `403`; unauthenticated get `401`.
+
+New error codes: `JOB_NOT_RETRYABLE`, `JOB_NOT_CANCELLABLE`, `METRICS_DISABLED`,
+`METRICS_UNAUTHORIZED`, `OPERATION_NOT_ALLOWED`, `SERVICE_NOT_READY`.
+
+### Honest limitations
+
+Metrics are **process-local**: with multiple server/worker processes the values
+are per-process and are NOT aggregated across them — a future scrape/aggregation
+layer (e.g. a Prometheus server scraping each `/metrics`) would do that. Worker
+and job state is PostgreSQL-backed and shared; the operational-event table is
+durable. External push remains provider-dependent (TEST/DISABLED only). Job
+execution is at-least-once — exactly-once external side effects are not claimed.

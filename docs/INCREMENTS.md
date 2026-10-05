@@ -376,11 +376,81 @@ acceptance but before DB acknowledgement. No Redis / BullMQ / Kafka. Distributed
 workers are supported only to the extent PostgreSQL row-locking allows (same DB).
 Real FCM/APNs delivery remains a placeholder (TEST/DISABLED providers only).
 
-## ⏳ Increment 10 — Android client (React Native)
+## ✅ Increment 10 — Observability, reliability & operational controls (DONE)
+
+Backend-only. Makes the backend operationally understandable and safe to run:
+correlation IDs, structured logging, in-process metrics, improved health/
+readiness, worker/queue health, admin job operations, and durable operational
+events — all PostgreSQL/Node-based (no Redis/Prometheus-server/Datadog/etc.).
+
+- **Migration `0010_observability_operations.sql`** (additive): a low-volume
+  `operational_events` table (type, CHECK-constrained severity, actor,
+  correlation id, job id, entity ref, sanitized `metadata jsonb`, timestamps) +
+  retention indexes. High-frequency telemetry stays IN-PROCESS — no per-request
+  DB row.
+- **Correlation / request context** (`AsyncLocalStorage`): every request gets a
+  correlation id (safe inbound `X-Correlation-Id` honoured; oversized/malformed
+  → fresh random id; always echoed in the response header) propagated through
+  logs, operational events, and errors. Never a trusted security identifier.
+- **Structured logging** (`observability/logger.ts`): config-driven level
+  (`LOG_LEVEL`), auto-attached service/environment/correlation/user/job fields,
+  SAFE error serialization (name + bounded message, never a raw Error), and
+  defense-in-depth field redaction (tokens/passwords/bodies/consent/storage keys
+  dropped). Best-effort — a logging failure never breaks a request.
+- **In-process metrics** (`observability/metrics.ts`): counters + histograms
+  with BOUNDED labels and a hard per-metric series cap (cardinality guard).
+  HTTP (`http_requests_total` / `http_errors_total` / `http_request_duration_ms`
+  with normalized route templates — UUIDs collapse to `:id`), DB
+  (`db_queries_total` / `_errors_total` / `_duration_ms`), WebSocket (connections
+  / disconnects / messages / errors by bounded channel+close-code), notifications
+  (created / deduplicated / push sent / failed / revoked by category/provider),
+  and jobs (enqueued / claimed / succeeded / retried / dead / reclaimed +
+  execution & queue-wait histograms by type). Prometheus text at `GET /metrics`
+  (configurable: `METRICS_ENABLED`, `METRICS_REQUIRE_AUTH` → ADMIN token).
+- **Health / readiness**: `/health` is cheap liveness (+uptime; never fails
+  because the worker/push is disabled). `/ready` is a structured report
+  (`database` / `migrations` / `worker`) returning 503 when a critical
+  dependency is down — never leaking connection strings/SQL/paths/credentials. A
+  safe DB-health snapshot exposes pool total/idle/waiting/utilization only.
+- **Worker health + queue pressure**: `GET /api/admin/jobs/worker` reports
+  state (`RUNNING`/`STOPPING`/`STOPPED`/`DISABLED`/`UNHEALTHY`), active jobs,
+  last poll/success, consecutive errors, queue depth, oldest-pending age, stale-
+  running count, dead count, and a `queuePressure` level (OK/WARNING/CRITICAL)
+  from configurable thresholds. A disabled worker is never UNHEALTHY.
+- **Admin job operations** (ADMIN-only, audited, IDOR-safe): `POST
+  /api/admin/jobs/:id/retry` (requeue a DEAD job only — resets attempts; refuses
+  SUCCEEDED/RUNNING), `POST /api/admin/jobs/:id/cancel` (cancels PENDING/
+  RETRY_WAIT; honestly refuses a RUNNING job rather than claiming it was killed),
+  `GET /api/admin/jobs/dead` (dead-letter diagnostics, redacted payloads), and
+  `GET /api/admin/operational-events`. Each operational action writes an audit
+  record AND a durable operational event (no raw payload).
+- **Queue backpressure / starvation detection**: configurable warning/critical
+  depth + max-age thresholds surfaced via worker health + metrics. SAFETY/
+  critical jobs are never casually rejected (the Increment 9 backpressure guard
+  already bypasses idempotent/critical enqueues).
+- **Operational-event retention**: pruned by the existing
+  `BACKGROUND_JOB_CLEANUP` durable job (configurable
+  `OPERATIONAL_EVENT_RETENTION_DAYS`) — a SEPARATE policy from audit logs, which
+  are append-only and never deleted here.
+- 57 new tests (metrics/cardinality, correlation/logging/sanitization, health/
+  readiness/DB-health, operational events, admin retry/cancel/dead-letter +
+  RBAC, and failure injection: crash→reclaim→complete, worker-unavailable→
+  queued→processed, temp-fail→retry→recover). **Total: 415 passing** against
+  real PostgreSQL across 3 consecutive runs. Live smoke: **221** (182 prior +
+  39 new) across 3 consecutive runs, using a real separate worker process.
+
+**Honest limitations:** metrics are **process-local** — with multiple server/
+worker processes the values are per-process and are NOT aggregated across them
+(a future scrape/aggregation layer would do that). Worker/job state is
+PostgreSQL-backed; external push is still provider-dependent (TEST/DISABLED
+providers only); job execution remains at-least-once (exactly-once external side
+effects are not claimed). No Redis/Kafka/Prometheus-server/Datadog introduced.
+
+## ⏳ Increment 11 — Android client (React Native)
 
 Onboarding/age gate, the five sections, consent + gameplay UI, push, offline UX.
 
-## ⏳ Increment 11 — Hardening
+## ⏳ Increment 12 — Hardening
 
 Full security test matrix, load testing, OpenAPI/WS docs, deployment runbooks,
 Android release build.

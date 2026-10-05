@@ -1,7 +1,8 @@
-import { JobType } from "@luvora/shared";
+import { JobType, OperationalEventType, OperationalSeverity } from "@luvora/shared";
 import { Worker } from "./worker";
 import { buildDefaultRegistry } from "./defaultRegistry";
 import { enqueueMaintenance } from "./jobService";
+import { recordOperationalEvent } from "../observability/operationalEvents";
 import { config } from "../config";
 import { logger } from "../logger";
 import { closePool } from "../db/pool";
@@ -28,6 +29,11 @@ export function startWorkerProcess(): { worker: Worker; stop: () => Promise<void
   const registry = buildDefaultRegistry();
   const worker = new Worker({ registry });
   worker.start();
+  void recordOperationalEvent({
+    eventType: OperationalEventType.WORKER_STARTED,
+    severity: OperationalSeverity.INFO,
+    metadata: { workerId: worker.workerId, concurrency: config.jobs.concurrency },
+  });
 
   const scheduleMaintenance = async () => {
     for (const type of [
@@ -50,6 +56,12 @@ export function startWorkerProcess(): { worker: Worker; stop: () => Promise<void
   const stop = async (): Promise<void> => {
     clearInterval(maintenanceTimer);
     await worker.stop();
+    // Record stop BEFORE the pool closes (CLI shutdown closes the pool after).
+    await recordOperationalEvent({
+      eventType: OperationalEventType.WORKER_STOPPED,
+      severity: OperationalSeverity.INFO,
+      metadata: { workerId: worker.workerId },
+    }).catch(() => undefined);
   };
   return { worker, stop };
 }

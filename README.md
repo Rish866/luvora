@@ -21,8 +21,9 @@ WebSockets)**, **Increment 4 (data-driven fantasy engine)**,
 **Increment 6 (admin + safety + moderation operations)**,
 **Increment 7 (notifications + presence infrastructure)**,
 **Increment 8 (production notification delivery + distributed presence
-infrastructure)**, and **Increment 9 (reliable background jobs + worker
-infrastructure)**. All are working, tested slices (not mocked screens).
+infrastructure)**, **Increment 9 (reliable background jobs + worker
+infrastructure)**, and **Increment 10 (observability, reliability &
+operational controls)**. All are working, tested slices (not mocked screens).
 
 **Increment 1 — foundation:**
 - ✅ Auth: register / login / refresh / logout / logout-all / `me`
@@ -218,15 +219,49 @@ infrastructure)**. All are working, tested slices (not mocked screens).
       running server **plus a real separate worker process**, using the TEST push
       provider (no real credentials).
 
-> **Honesty note (Increments 7–9).** There is **no** real push delivery — FCM,
+**Increment 10 — observability, reliability & operational controls:**
+- ✅ **Correlation ids / request context** (`AsyncLocalStorage`) — every request
+      gets a safe, bounded `X-Correlation-Id` (honoured inbound or generated),
+      propagated through logs, operational events, and errors
+- ✅ **Structured logging** — config-driven level, auto-attached context, SAFE
+      error serialization, and redaction of tokens/passwords/bodies/consent/
+      storage keys (tested: secrets never appear in log output)
+- ✅ **In-process metrics** with BOUNDED labels + a per-metric series cap: HTTP
+      (route-template/method/status-class + duration), DB, WebSocket,
+      notification, and job metrics; Prometheus text at `GET /metrics`
+      (configurable: `METRICS_ENABLED` / `METRICS_REQUIRE_AUTH` → ADMIN)
+- ✅ **Health / readiness** — `/health` cheap liveness (never fails on a disabled
+      worker/push); `/ready` structured `{database, migrations, worker}` with a
+      503 when a critical dependency is down; no connection strings/SQL/paths leak
+- ✅ **Worker health + queue pressure** (`GET /api/admin/jobs/worker`) — derived
+      state (`RUNNING`/`STOPPING`/`STOPPED`/`DISABLED`/`UNHEALTHY`), queue depth,
+      oldest-pending age, stale/dead counts, and OK/WARNING/CRITICAL pressure
+- ✅ **Admin job operations** (ADMIN-only, audited, IDOR-safe): requeue a DEAD
+      job, cancel a queued job (honestly refuses a RUNNING one), dead-letter
+      diagnostics, and an operational-event log — each action writes an audit
+      record + a durable operational event (migration `0010`, `operational_events`)
+- ✅ Queue backpressure / starvation thresholds; operational-event retention via
+      the existing durable cleanup job (SEPARATE from append-only audit logs)
+
+- ✅ **415 passing tests** (358 prior + 57 new) against a real PostgreSQL, run 3×
+      consecutively — metrics/cardinality, correlation/logging/sanitization,
+      health/readiness/DB-health, operational events, admin retry/cancel/dead-
+      letter + RBAC, and failure injection (crash→reclaim→complete; worker-
+      unavailable→queued→processed; temp-fail→retry→recover). **221 live smoke
+      checks** (182 prior + 39 new) pass 3× consecutively against the running
+      server + a real separate worker.
+
+> **Honesty note (Increments 7–10).** There is **no** real push delivery — FCM,
 > APNs, and Web Push are interface placeholders only (no SDK, no credentials, no
 > network calls); the TEST/DISABLED providers are the only ones that run.
 > Presence and the realtime bus are still **process-local**: selecting a
 > `distributed` backend degrades to the in-process implementation and logs a
 > warning. Background-job execution is **at-least-once** (not exactly-once;
-> handlers are idempotent). **Redis is never a required dependency** and is not
-> used by any test. Wiring real Redis presence/pub-sub, a distributed broker, and
-> real push SDKs is deliberate future work.
+> handlers are idempotent). **Metrics are process-local** — not aggregated across
+> multiple processes (a future scrape layer would do that); no APM vendor is
+> integrated. **Redis is never a required dependency** and is not used by any
+> test. Wiring real Redis presence/pub-sub, a distributed broker/metrics
+> aggregation, and real push SDKs is deliberate future work.
 
 See [`docs/INCREMENTS.md`](docs/INCREMENTS.md) for the roadmap and what is
 **intentionally deferred** to later increments.
@@ -388,7 +423,10 @@ abstraction, push preferences, a heartbeat/TTL presence model, and
 presence/realtime-bus abstractions for future horizontal scale; and a **durable
 PostgreSQL job queue + worker** — leasing, crash recovery, bounded backoff
 retries, dead-lettering, a transactional outbox for notification delivery,
-maintenance/reconciliation jobs, graceful shutdown, and admin job diagnostics.
+maintenance/reconciliation jobs, graceful shutdown, and admin job diagnostics;
+and an **observability & operational layer** — correlation ids, structured
+logging, in-process metrics (`/metrics`), health/readiness, worker/queue health,
+admin job retry/cancel/dead-letter operations, and durable operational events.
 
 **Intentionally deferred** (later increments): production media providers
 (S3/R2 storage, real malware scanner, real content-safety moderation — the
@@ -400,7 +438,8 @@ SDK, no credentials, no network; only the TEST/DISABLED providers run);
 implementations are placeholders that degrade to in-process; Redis is never
 required); **exactly-once / brokered job processing** (the job queue is durable
 and at-least-once on PostgreSQL — no Redis/BullMQ/Kafka/RabbitMQ, and
-multi-worker scaling is bounded by PostgreSQL row-locking on one database); a
-moderation/admin UI; admin MFA; recommendations; payments; production
-infrastructure; and all frontend/Android UI. See
-[`docs/INCREMENTS.md`](docs/INCREMENTS.md).
+multi-worker scaling is bounded by PostgreSQL row-locking on one database);
+**distributed metrics aggregation / APM** (metrics are process-local — no
+Prometheus server, Datadog, or New Relic integrated); a moderation/admin UI;
+admin MFA; recommendations; payments; production infrastructure; and all
+frontend/Android UI. See [`docs/INCREMENTS.md`](docs/INCREMENTS.md).

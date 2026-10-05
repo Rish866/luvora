@@ -45,6 +45,14 @@ export JOB_RECLAIM_INTERVAL_SECONDS="2"
 export JOB_RETRY_BASE_DELAY_MS="200"
 export JOB_RETRY_MAX_DELAY_MS="2000"
 export JOB_MAX_ATTEMPTS="3"
+# Increment 10: observability. Metrics enabled + ADMIN-auth required (safe
+# defaults). Low queue-pressure thresholds so backlog is observable quickly.
+export LOG_LEVEL="info"
+export METRICS_ENABLED="true"
+export METRICS_REQUIRE_AUTH="true"
+export JOB_QUEUE_WARNING_DEPTH="2"
+export JOB_QUEUE_CRITICAL_DEPTH="50"
+export JOB_QUEUE_MAX_AGE_SECONDS="300"
 
 node -r ts-node/register src/db/migrate.ts up >/dev/null 2>&1
 # Seed the published scenario library so the gameplay smoke flow has content.
@@ -684,11 +692,101 @@ json -X POST $B/api/notifications/devices -H "Authorization: Bearer $TJB" -H 'Co
 MSGCODE=$(code -X POST $B/api/matches/$JMATCH/messages -H "Authorization: Bearer $TJA" -H 'Content-Type: application/json' -d '{"body":"api still ok"}')
 check "notification API ok during provider failure" '201' "$MSGCODE"
 
+# ---- Increment 10: observability & operational controls ----
+# (The worker from Increment 9 is still running here; it is shut down below.)
+
+# Correlation id: a request without one gets a generated id in the header; a
+# valid supplied id is preserved; an oversized id is replaced.
+CORR_HDRS=$(curl -s -D - -o /dev/null "$B/health")
+check "correlation id generated on response" 'X-Correlation-Id:' "$CORR_HDRS"
+SUPPLIED_HDRS=$(curl -s -D - -o /dev/null -H 'X-Correlation-Id: smoke-corr-123' "$B/health")
+check "supplied correlation id preserved" 'smoke-corr-123' "$SUPPLIED_HDRS"
+BIG=$(printf 'x%.0s' $(seq 1 400))
+OVERSIZED_HDRS=$(curl -s -D - -o /dev/null -H "X-Correlation-Id: $BIG" "$B/health")
+if echo "$OVERSIZED_HDRS" | grep -qi "X-Correlation-Id: $BIG"; then echo "FAIL: oversized correlation id echoed"; FAIL=$((FAIL+1)); else echo "PASS: oversized correlation id replaced"; PASS=$((PASS+1)); fi
+# Error responses still carry a correlation id.
+ERR_HDRS=$(curl -s -D - -o /dev/null "$B/api/notifications")
+check "correlation id on error response" 'X-Correlation-Id:' "$ERR_HDRS"
+
+# Health & readiness.
+check "health ok" '"status":"ok"' "$(json $B/health)"
+check "health reports uptime" '"uptimeSeconds"' "$(json $B/health)"
+READY=$(json $B/ready)
+check "readiness is ready" '"status":"ready"' "$READY"
+check "readiness db ok" '"database":"ok"' "$READY"
+check "readiness migrations ok" '"migrations":"ok"' "$READY"
+# Readiness must not leak connection strings / SQL.
+if echo "$READY" | grep -qiE 'postgres://|SELECT |password='; then echo "FAIL: readiness leaks internals"; FAIL=$((FAIL+1)); else echo "PASS: readiness leaks no internals"; PASS=$((PASS+1)); fi
+
+# Metrics endpoint: unauthorized rejected; admin gets Prometheus text; no secrets.
+# Fetch the metrics body ONCE to a file (robust for a large payload), then grep
+# the file per assertion (avoids shell-variable truncation of a big body).
+check "metrics requires auth 401" '401' "$(code $B/metrics)"
+check "metrics rejects normal user 401" '401' "$(code $B/metrics -H "Authorization: Bearer $TJA")"
+METRICS_FILE="$DIR/metrics.txt"
+curl -s "$B/metrics" -H "Authorization: Bearer $TJADM" -o "$METRICS_FILE"
+metric_has() { grep -q "$1" "$METRICS_FILE" && echo FOUND || echo missing; }
+check "metrics served to admin (http counter)" 'FOUND' "$(metric_has 'http_requests_total')"
+check "metrics include job counters" 'FOUND' "$(metric_has 'jobs_enqueued_total')"
+check "metrics include notification counters" 'FOUND' "$(metric_has 'notification_push_sent_total')"
+check "metrics include db counters" 'FOUND' "$(metric_has 'db_queries_total')"
+check "metrics include websocket counters" 'FOUND' "$(metric_has 'websocket_connections_total')"
+if grep -qiE 'password|authorization|postgres://|Bearer ' "$METRICS_FILE"; then echo "FAIL: metrics leak secrets"; FAIL=$((FAIL+1)); else echo "PASS: metrics expose no secrets"; PASS=$((PASS+1)); fi
+# Route labels are bounded: a UUID job-detail request must collapse to :id.
+json "$B/api/admin/jobs/00000000-0000-0000-0000-0000000000ff" -H "Authorization: Bearer $TJADM" >/dev/null
+curl -s "$B/metrics" -H "Authorization: Bearer $TJADM" -o "$METRICS_FILE"
+if grep -qE 'route="[^"]*00000000-0000-0000-0000-0000000000ff' "$METRICS_FILE"; then echo "FAIL: metrics route label contains a raw UUID"; FAIL=$((FAIL+1)); else echo "PASS: metrics route labels are bounded (:id)"; PASS=$((PASS+1)); fi
+
+# Worker health incl. queue-pressure signals (admin only).
+WH=$(json $B/api/admin/jobs/worker -H "Authorization: Bearer $TJADM")
+check "worker health has state" '"state"' "$WH"
+check "worker health has queueDepth" '"queueDepth"' "$WH"
+check "worker health has queuePressure" '"queuePressure"' "$WH"
+check "worker health unauthorized 403" '403' "$(code $B/api/admin/jobs/worker -H "Authorization: Bearer $TJA")"
+
+# Dead-letter listing (admin only) + redaction.
+check "admin lists dead-letter jobs" '"jobs"' "$(json "$B/api/admin/jobs/dead" -H "Authorization: Bearer $TJADM")"
+check "dead-letter listing unauthorized 403" '403' "$(code $B/api/admin/jobs/dead -H "Authorization: Bearer $TJA")"
+
+# Admin requeue of a DEAD job: seed a DEAD job directly, requeue, verify it is
+# PENDING again and an operational event + audit record exist.
+DEADID=$(pgscalar "INSERT INTO background_jobs (job_type,status,payload,attempt_count,failed_at) VALUES ('NOTIFICATION_CLEANUP','DEAD','{}',3, now()) RETURNING id")
+RETRY=$(json -X POST $B/api/admin/jobs/$DEADID/retry -H "Authorization: Bearer $TJADM" -H 'Content-Type: application/json' -d '{"reason":"smoke"}')
+check "admin requeues DEAD job -> PENDING" '"status":"PENDING"' "$RETRY"
+check "requeued job attempt reset" '"attemptCount":0' "$RETRY"
+check "requeue recorded operational event" '1' "$(pgscalar "SELECT CASE WHEN count(*)>=1 THEN 1 ELSE 0 END FROM operational_events WHERE event_type='JOB_MANUALLY_REQUEUED' AND job_id='$DEADID'")"
+check "requeue recorded audit log" '1' "$(pgscalar "SELECT CASE WHEN count(*)>=1 THEN 1 ELSE 0 END FROM audit_logs WHERE action='job.requeued' AND target_id='$DEADID'")"
+# The requeued cleanup job executes again safely once the worker drains it.
+check "requeued job eventually processed" '1' "$(pgpoll 1 "SELECT CASE WHEN status IN ('SUCCEEDED','RUNNING','RETRY_WAIT') THEN 1 ELSE 0 END FROM background_jobs WHERE id='$DEADID'")"
+# Requeuing a non-DEAD job is refused.
+check "requeue of SUCCEEDED job refused" 'JOB_NOT_RETRYABLE' "$(json -X POST $B/api/admin/jobs/$DEADID/retry -H "Authorization: Bearer $TJADM")"
+# Requeue by a normal user is forbidden.
+check "requeue by normal user 403" '403' "$(code -X POST $B/api/admin/jobs/$DEADID/retry -H "Authorization: Bearer $TJA")"
+
+# Admin cancel of a PENDING job. Insert it already scheduled far in the future
+# (in a SINGLE statement) so the fast-polling worker never claims it first.
+PCANCEL=$(pgscalar "INSERT INTO background_jobs (job_type,status,payload,available_at) VALUES ('NOTIFICATION_CLEANUP','PENDING','{}', now() + interval '1 hour') RETURNING id")
+check "admin cancels PENDING job" '"cancelled":true' "$(json -X POST $B/api/admin/jobs/$PCANCEL/cancel -H "Authorization: Bearer $TJADM")"
+check "cancelled job is CANCELLED" 'CANCELLED' "$(pgscalar "SELECT status FROM background_jobs WHERE id='$PCANCEL'")"
+
+# Operational events list (admin only) + authorization.
+check "admin lists operational events" '"events"' "$(json $B/api/admin/operational-events -H "Authorization: Bearer $TJADM")"
+check "operational events unauthorized 403" '403' "$(code $B/api/admin/operational-events -H "Authorization: Bearer $TJA")"
+
+# Queue backlog: seed a small backlog and confirm the depth metric reflects it,
+# then the running worker drains it.
+for i in 1 2 3 4; do pgscalar "INSERT INTO background_jobs (job_type,status,payload) VALUES ('NOTIFICATION_CLEANUP','PENDING', json_build_object('n', $i)::jsonb)" >/dev/null; done
+BACKLOG_WH=$(json $B/api/admin/jobs/worker -H "Authorization: Bearer $TJADM")
+check "backlog raises queue depth" '"queueDepth"' "$BACKLOG_WH"
+check "worker drains the backlog" '0' "$(pgpoll 0 "SELECT count(*)::int FROM background_jobs WHERE job_type='NOTIFICATION_CLEANUP' AND status IN ('PENDING','RETRY_WAIT') AND payload ? 'n'")"
+
 # 14: graceful worker shutdown — SIGTERM the worker and confirm it exits cleanly.
 kill -TERM "$WORKER_PID" >/dev/null 2>&1
 WSHUT=fail
 for i in $(seq 1 50); do if ! kill -0 "$WORKER_PID" >/dev/null 2>&1; then WSHUT=ok; break; fi; sleep 0.1; done
 check "worker graceful shutdown" 'ok' "$WSHUT"
+# Worker shutdown recorded an operational event.
+check "worker stop recorded operational event" '1' "$(pgpoll 1 "SELECT CASE WHEN count(*)>=1 THEN 1 ELSE 0 END FROM operational_events WHERE event_type='WORKER_STOPPED'")"
 
 echo "----"
 echo "LIVE SMOKE: $PASS passed, $FAIL failed"

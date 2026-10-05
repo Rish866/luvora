@@ -18,7 +18,17 @@ import * as deviceRepo from "../notifications/deviceRepository";
 import * as deliveryRepo from "../notifications/deliveryRepository";
 import * as jobRepo from "../jobs/jobRepository";
 import * as jobService from "../jobs/jobService";
-import { JobStatus, JobType } from "@luvora/shared";
+import { getWorkerHealthWithQueue } from "../jobs/workerRegistry";
+import {
+  recordOperationalEvent,
+  listOperationalEvents,
+} from "../observability/operationalEvents";
+import {
+  JobStatus,
+  JobType,
+  OperationalEventType,
+  OperationalSeverity,
+} from "@luvora/shared";
 import { encodeCursor, decodeCursor } from "./adminCursor";
 
 /**
@@ -378,14 +388,41 @@ adminRouter.get(
   }),
 );
 
-// Worker health for THIS process (null when no embedded worker runs here — the
-// API is still healthy without a worker). Never exposed unauthenticated.
+// Worker health + queue-pressure signals. When no embedded worker runs in this
+// process the state is DISABLED but queue stats (depth / oldest age / stale /
+// dead / pressure) are still surfaced from the shared DB. The API is healthy
+// without a worker. Never exposed unauthenticated.
 adminRouter.get(
   "/jobs/worker",
   requireAdmin,
   asyncHandler(async (_req, res) => {
-    const { getWorkerHealth } = await import("../jobs/workerRegistry");
-    ok(res, { worker: getWorkerHealth() });
+    const worker = await getWorkerHealthWithQueue();
+    ok(res, { worker });
+  }),
+);
+
+// Dead-letter diagnostics: DEAD jobs only, filterable + paginated, redacted.
+adminRouter.get(
+  "/jobs/dead",
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const q = jobListQuerySchema.parse(req.query);
+    let before = null as ReturnType<typeof decodeCursor>;
+    if (q.cursor) {
+      before = decodeCursor(q.cursor);
+      if (!before) throw Errors.invalidCursor();
+    }
+    const rows = await jobRepo.listJobs({
+      status: JobStatus.DEAD,
+      jobType: q.jobType,
+      limit: q.limit,
+      before,
+    });
+    const nextCursor =
+      rows.length === q.limit
+        ? encodeCursor({ createdAt: rows[rows.length - 1].created_at, id: rows[rows.length - 1].id })
+        : null;
+    ok(res, { jobs: rows.map(jobService.toView), nextCursor });
   }),
 );
 
@@ -397,6 +434,121 @@ adminRouter.get(
     const row = await jobRepo.getById(id);
     if (!row) throw Errors.jobNotFound();
     ok(res, { job: jobService.toView(row) });
+  }),
+);
+
+const jobReasonSchema = z.object({ reason: z.string().max(500).optional() });
+
+// Retry (requeue) a job. Only DEAD jobs may be requeued (SUCCEEDED/RUNNING/
+// active jobs are never silently rerun). Idempotency is preserved: the job's
+// own idempotency key still prevents duplicate LIVE copies. Audited +
+// operational event recorded (no raw payload).
+adminRouter.post(
+  "/jobs/:id/retry",
+  requireAdmin,
+  adminLimiter,
+  asyncHandler(async (req, res) => {
+    const { id } = uuidParam("id").parse(req.params);
+    const { reason } = jobReasonSchema.parse(req.body ?? {});
+    const existing = await jobRepo.getById(id);
+    if (!existing) throw Errors.jobNotFound();
+    if (existing.status !== JobStatus.DEAD) throw Errors.jobNotRetryable();
+    const updated = await jobRepo.requeueDead(id);
+    if (!updated) throw Errors.jobNotRetryable(); // raced to non-DEAD
+    await audit({
+      actorUserId: req.userId!,
+      action: "job.requeued",
+      targetType: "JOB",
+      targetId: id,
+      metadata: { jobType: updated.job_type, reason: reason ?? null },
+      ...ctxOf(req),
+    });
+    await recordOperationalEvent({
+      eventType: OperationalEventType.JOB_MANUALLY_REQUEUED,
+      severity: OperationalSeverity.WARNING,
+      actorUserId: req.userId!,
+      jobId: id,
+      entityType: "JOB",
+      metadata: { jobType: updated.job_type, reason: reason ?? null },
+    });
+    ok(res, { job: jobService.toView(updated) });
+  }),
+);
+
+// Cancel a job. Only NON-terminal, NOT-currently-RUNNING jobs can be cancelled
+// safely: a PENDING/RETRY_WAIT job is marked CANCELLED. A RUNNING job's handler
+// may already be executing an external call we cannot abort, so we refuse
+// (JOB_NOT_CANCELLABLE) rather than falsely claim it was killed. Audited.
+adminRouter.post(
+  "/jobs/:id/cancel",
+  requireAdmin,
+  adminLimiter,
+  asyncHandler(async (req, res) => {
+    const { id } = uuidParam("id").parse(req.params);
+    const { reason } = jobReasonSchema.parse(req.body ?? {});
+    const existing = await jobRepo.getById(id);
+    if (!existing) throw Errors.jobNotFound();
+    if (existing.status === JobStatus.RUNNING) {
+      // Honest semantics: we do not kill an already-executing handler.
+      throw Errors.jobNotCancellable(
+        "A running job cannot be cancelled; let it finish or expire its lease.",
+      );
+    }
+    if (
+      existing.status === JobStatus.SUCCEEDED ||
+      existing.status === JobStatus.DEAD ||
+      existing.status === JobStatus.CANCELLED
+    ) {
+      throw Errors.jobNotCancellable();
+    }
+    const cancelled = await jobRepo.cancel(id);
+    if (!cancelled) throw Errors.jobNotCancellable(); // raced
+    await audit({
+      actorUserId: req.userId!,
+      action: "job.cancelled",
+      targetType: "JOB",
+      targetId: id,
+      metadata: { jobType: existing.job_type, reason: reason ?? null },
+      ...ctxOf(req),
+    });
+    await recordOperationalEvent({
+      eventType: OperationalEventType.JOB_CANCELLED,
+      severity: OperationalSeverity.WARNING,
+      actorUserId: req.userId!,
+      jobId: id,
+      entityType: "JOB",
+      metadata: { jobType: existing.job_type, reason: reason ?? null },
+    });
+    ok(res, { cancelled: true });
+  }),
+);
+
+// ======================= OPERATIONAL EVENTS (admin only, read-only) ===========
+
+const opEventQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(100).default(50),
+  cursor: z.string().min(1).optional(),
+  eventType: z.string().max(100).optional(),
+  severity: z.string().max(20).optional(),
+});
+
+adminRouter.get(
+  "/operational-events",
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const q = opEventQuerySchema.parse(req.query);
+    let before = null as ReturnType<typeof decodeCursor>;
+    if (q.cursor) {
+      before = decodeCursor(q.cursor);
+      if (!before) throw Errors.invalidCursor();
+    }
+    const { events, nextCursor } = await listOperationalEvents({
+      eventType: q.eventType,
+      severity: q.severity,
+      limit: q.limit,
+      before,
+    });
+    ok(res, { events, nextCursor: nextCursor ? encodeCursor(nextCursor) : null });
   }),
 );
 

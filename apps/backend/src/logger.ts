@@ -3,7 +3,8 @@ import { config } from "./config";
 
 /** Structured logger. In production, emit JSON for log aggregation. */
 export const logger = pino({
-  level: config.isTest ? "silent" : config.isProduction ? "info" : "debug",
+  // Level is config-driven (LOG_LEVEL); forced to 'silent' under test.
+  level: config.observability.logLevel,
   base: undefined, // omit pid/hostname noise
   redact: {
     // Never log secrets or sensitive content.

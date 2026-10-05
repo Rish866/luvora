@@ -247,6 +247,27 @@ the claim transaction commits before any external work runs. Retention:
 (default 7), `DEAD` after `JOB_DEAD_RETENTION_DAYS` (default 30), keyed on the
 stable terminal timestamp — never deleting active jobs or audit logs.
 
+## Migration 0010 — observability & operational events (Increment 10)
+
+`0010_observability_operations.sql` adds a single durable table for SIGNIFICANT
+operational/security events. Additive; alters no existing table.
+
+| Table / column | Purpose / notable constraints |
+|----------------|-------------------------------|
+| `operational_events` | Low-volume operational/security event store (worker lifecycle, admin operational actions, threshold/circuit signals). `severity` is CHECK-constrained to `INFO`/`WARNING`/`ERROR`/`CRITICAL`. `actor_user_id` FK `ON DELETE SET NULL`; `job_id` is a plain uuid (NOT an FK — a job row may be pruned). `correlation_id`/`entity_type`/`entity_id` optional. `metadata jsonb` is **sanitized by the application** before insert — flat, safe scalars only, never tokens/bodies/credentials/raw payloads. |
+
+Indexes: `operational_events_created` (recent-first + retention scan),
+`operational_events_type` and `_severity` (diagnostics filters), and partial
+`_actor` / `_job` indexes for correlating an actor's or a job's events.
+
+**Not persisted here (by design):** high-frequency telemetry — per-HTTP-request
+counts, request/DB/job durations, WebSocket counts — lives in an in-process
+metrics registry (exposed at `GET /metrics`), so this table never becomes a
+per-request firehose. Retention: operational events are pruned by the
+`BACKGROUND_JOB_CLEANUP` job after `OPERATIONAL_EVENT_RETENTION_DAYS` (default
+90) — a SEPARATE policy from `audit_logs`, which are append-only and never
+deleted by cleanup.
+
 ## Resetting a dev/test database
 
 Migrations are forward-only; to reset, drop and recreate the database, then

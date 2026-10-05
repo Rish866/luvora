@@ -6,6 +6,7 @@ import {
   type PushPayload,
 } from "@luvora/shared";
 import { logger } from "../logger";
+import { metrics } from "../observability/metrics";
 import * as deviceRepo from "./deviceRepository";
 import * as deliveryRepo from "./deliveryRepository";
 import { getPushProvider } from "./push/pushProviders";
@@ -316,11 +317,13 @@ async function attemptForJob(
 
   if (result.ok) {
     await deliveryRepo.markDelivered(deliveryId, result.providerMessageId);
+    recordPushMetric("sent", device.provider);
     return "delivered";
   }
 
   if (result.failure === PushFailureKind.PERMANENT) {
     await deliveryRepo.markRevoked(deliveryId, result.errorCode);
+    recordPushMetric("revoked", device.provider);
     if (result.errorCode !== "PUSH_DISABLED") {
       await deviceRepo.revokeById(device.id);
       logger.info(
@@ -332,5 +335,21 @@ async function attemptForJob(
   }
 
   await deliveryRepo.markFailed(deliveryId, result.errorCode);
+  recordPushMetric("failed", device.provider);
   return result.errorCode; // temporary
+}
+
+/** Record a push delivery result metric by provider (bounded labels). */
+function recordPushMetric(result: "sent" | "failed" | "revoked", provider: string): void {
+  try {
+    const name =
+      result === "sent"
+        ? "notification_push_sent_total"
+        : result === "failed"
+          ? "notification_push_failed_total"
+          : "notification_push_revoked_total";
+    metrics.incr(name, { provider });
+  } catch {
+    /* best-effort */
+  }
 }

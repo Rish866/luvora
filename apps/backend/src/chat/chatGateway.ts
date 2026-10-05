@@ -13,6 +13,12 @@ import { clientChatEventSchema } from "./chatEventSchemas";
 import * as chat from "./chatService";
 import { isAccountActive } from "../auth/accountState";
 import { presenceRegistry } from "../presence/presenceRegistry";
+import {
+  recordWsConnection,
+  recordWsDisconnect,
+  recordWsMessage,
+  recordWsError,
+} from "../observability/websocketMetrics";
 import type { WsChannel, WsDispatcher } from "../ws/wsDispatcher";
 
 /**
@@ -204,6 +210,7 @@ export function attachChatGateway(dispatcher: WsDispatcher): ChatGateway {
     hub.add(userId, socket);
     // Presence: count this socket toward the user's cross-channel presence.
     presenceRegistry.connect(userId, connectionId);
+    recordWsConnection("chat");
     logger.info({ userId, sockets: hub.socketCount() }, "chat ws established");
 
     send(socket, { type: "connection.ready", userId });
@@ -218,6 +225,7 @@ export function attachChatGateway(dispatcher: WsDispatcher): ChatGateway {
     socket.on("message", (data) => {
       // Any inbound activity also counts as a heartbeat for presence TTL.
       presenceRegistry.heartbeat(userId, connectionId);
+      recordWsMessage("chat");
       if (!allowEvent(state)) {
         sendError(socket, "RATE_LIMITED", "Too many messages. Slow down.");
         return;
@@ -232,15 +240,17 @@ export function attachChatGateway(dispatcher: WsDispatcher): ChatGateway {
       void handleEvent(socket, state, parsed);
     });
 
-    socket.on("close", () => {
+    socket.on("close", (code) => {
       hub.remove(userId, socket);
       presenceRegistry.disconnect(userId, connectionId);
       stateBySocket.delete(socket);
+      recordWsDisconnect("chat", code);
       logger.info({ userId, sockets: hub.socketCount() }, "chat ws closed");
       void emitPresenceToPartner; // reserved for subscription-based presence
     });
 
     socket.on("error", (err) => {
+      recordWsError("chat");
       logger.warn({ err: err.message }, "chat ws error");
       try {
         socket.close(ChatCloseCodes.INTERNAL);

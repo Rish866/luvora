@@ -21,7 +21,9 @@ import { errorHandler } from "./http/errorHandler";
 import { ok } from "./http/respond";
 import { Errors } from "./http/errors";
 import { makeRateLimiter } from "./http/rateLimiter";
-import { pool } from "./db/pool";
+import { correlationAndMetrics } from "./observability/httpMetrics";
+import { buildReadiness, uptimeSeconds } from "./observability/health";
+import { metricsRouter } from "./observability/metricsRoutes";
 
 /** Build the Express application (no listening) so tests can import it. */
 export function createApp(): Express {
@@ -43,19 +45,29 @@ export function createApp(): Express {
   );
   app.use(express.json({ limit: "1mb" }));
 
+  // Correlation id + request context + HTTP metrics (Increment 10). Runs early
+  // so every downstream log/metric/error carries the correlation id, and so the
+  // X-Correlation-Id response header is always set.
+  app.use(correlationAndMetrics);
+
   // Global rate limit (pass-through under test).
   app.use(makeRateLimiter(config.rateLimit.max));
 
-  // Health & readiness.
-  app.get("/health", (_req, res) => ok(res, { status: "ok" }));
+  // Liveness: cheap, does not depend on optional components (worker/push/etc.).
+  app.get("/health", (_req, res) => ok(res, { status: "ok", uptimeSeconds: uptimeSeconds() }));
+  // Readiness: verifies critical dependencies (DB reachable + schema). Returns a
+  // structured report; 503 when not ready. Never leaks connection strings/SQL.
   app.get("/ready", async (_req, res, next) => {
     try {
-      await pool.query("SELECT 1");
-      ok(res, { status: "ready" });
+      const report = await buildReadiness();
+      ok(res, report, report.status === "ready" ? 200 : 503);
     } catch (err) {
       next(err);
     }
   });
+
+  // Prometheus-compatible metrics (configurable: disabled => 404, auth optional).
+  app.use("/metrics", metricsRouter);
 
   app.use("/api/auth", authRouter);
   app.use("/api/sessions", sessionRouter);

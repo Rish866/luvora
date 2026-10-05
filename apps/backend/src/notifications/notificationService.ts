@@ -14,6 +14,7 @@ import { withTransaction } from "../db/pool";
 import { deliverToUser } from "./realtime";
 import { recordRealtimeAttempt } from "./deliveryDispatcher";
 import { enqueueNotificationPushDelivery } from "../jobs/jobService";
+import { metrics } from "../observability/metrics";
 import { logger } from "../logger";
 
 /**
@@ -114,6 +115,16 @@ export async function create(
   const { row, created } = client
     ? await runInTxn(client)
     : await withTransaction(runInTxn);
+
+  // Observability (best-effort): count created vs deduplicated by category.
+  try {
+    metrics.incr(
+      created ? "notifications_created_total" : "notifications_deduplicated_total",
+      { category },
+    );
+  } catch {
+    /* telemetry is best-effort */
+  }
 
   const view = repo.toView(row);
 

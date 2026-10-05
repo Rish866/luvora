@@ -20,3 +20,4 @@ export * from "./admin";
 export * from "./notifications";
 export * from "./delivery";
 export * from "./jobs";
+export * from "./observability";

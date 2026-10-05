@@ -9,6 +9,12 @@ import { clientGameEventSchema } from "./gameEventSchemas";
 import * as gameplay from "./gameplayService";
 import { isAccountActive } from "../auth/accountState";
 import { presenceRegistry } from "../presence/presenceRegistry";
+import {
+  recordWsConnection,
+  recordWsDisconnect,
+  recordWsMessage,
+  recordWsError,
+} from "../observability/websocketMetrics";
 import type { WsChannel, WsDispatcher } from "../ws/wsDispatcher";
 
 /**
@@ -146,6 +152,7 @@ export function attachGameGateway(dispatcher: WsDispatcher): GameGateway {
     stateBySocket.set(socket, state);
     gameHub.add(userId, socket);
     presenceRegistry.connect(userId, connectionId);
+    recordWsConnection("game");
     logger.info({ userId, sockets: gameHub.socketCount() }, "game ws established");
 
     send(socket, { type: "game.ready", userId });
@@ -157,6 +164,7 @@ export function attachGameGateway(dispatcher: WsDispatcher): GameGateway {
 
     socket.on("message", (data) => {
       presenceRegistry.heartbeat(userId, connectionId);
+      recordWsMessage("game");
       if (!allowEvent(state)) {
         sendError(socket, "RATE_LIMITED", "Too many actions. Slow down.");
         return;
@@ -171,14 +179,16 @@ export function attachGameGateway(dispatcher: WsDispatcher): GameGateway {
       void handleEvent(socket, state, parsed);
     });
 
-    socket.on("close", () => {
+    socket.on("close", (code) => {
       gameHub.remove(userId, socket);
       presenceRegistry.disconnect(userId, connectionId);
       stateBySocket.delete(socket);
+      recordWsDisconnect("game", code);
       logger.info({ userId, sockets: gameHub.socketCount() }, "game ws closed");
     });
 
     socket.on("error", (err) => {
+      recordWsError("game");
       logger.warn({ err: err.message }, "game ws error");
       try {
         socket.close(4500);
