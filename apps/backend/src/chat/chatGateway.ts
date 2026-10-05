@@ -11,6 +11,7 @@ import { hub } from "./connectionRegistry";
 import { clientChatEventSchema } from "./chatEventSchemas";
 import * as chat from "./chatService";
 import { isAccountActive } from "../auth/accountState";
+import { presenceRegistry } from "../presence/presenceRegistry";
 import type { WsChannel, WsDispatcher } from "../ws/wsDispatcher";
 
 /**
@@ -190,6 +191,8 @@ export function attachChatGateway(dispatcher: WsDispatcher): ChatGateway {
     stateBySocket.set(socket, state);
 
     hub.add(userId, socket);
+    // Presence: count this socket toward the user's cross-channel presence.
+    presenceRegistry.connect(userId);
     logger.info({ userId, sockets: hub.socketCount() }, "chat ws established");
 
     send(socket, { type: "connection.ready", userId });
@@ -215,6 +218,7 @@ export function attachChatGateway(dispatcher: WsDispatcher): ChatGateway {
 
     socket.on("close", () => {
       hub.remove(userId, socket);
+      presenceRegistry.disconnect(userId);
       stateBySocket.delete(socket);
       logger.info({ userId, sockets: hub.socketCount() }, "chat ws closed");
       void emitPresenceToPartner; // reserved for subscription-based presence

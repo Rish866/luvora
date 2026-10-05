@@ -1,5 +1,6 @@
-import { describe, it, expect, beforeAll, beforeEach, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from "vitest";
 import { closePool, pool } from "../src/db/pool";
+import { presenceRegistry } from "../src/presence/presenceRegistry";
 import { seedScenarios } from "../src/db/scenarioSeed";
 import {
   resetDb,
@@ -27,6 +28,14 @@ beforeAll(async () => {
 beforeEach(async () => {
   await resetDb();
   await seedScenarios();
+  presenceRegistry.reset();
+});
+afterEach(async () => {
+  // Closing a game socket triggers an async presence transition (persisting
+  // last-seen). Drain it + reset the shared registry so its DB work cannot
+  // overlap the next test file's resetDb() TRUNCATE and deadlock.
+  presenceRegistry.reset();
+  await new Promise((r) => setTimeout(r, 150));
 });
 afterAll(async () => {
   await srv.close();

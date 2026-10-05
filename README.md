@@ -17,8 +17,9 @@ non-graphic and non-explicit.
 This repository contains **Increment 1 (backend foundation)**,
 **Increment 2 (discovery & matching)**, **Increment 3 (private chat +
 WebSockets)**, **Increment 4 (data-driven fantasy engine)**,
-**Increment 5 (secure media, attachments & moderation)**, and
-**Increment 6 (admin + safety + moderation operations)**. All are working,
+**Increment 5 (secure media, attachments & moderation)**,
+**Increment 6 (admin + safety + moderation operations)**, and
+**Increment 7 (notifications + presence infrastructure)**. All are working,
 tested slices (not mocked screens).
 
 **Increment 1 — foundation:**
@@ -101,9 +102,54 @@ tested slices (not mocked screens).
 - ✅ **Append-only audit log** (admin read-only, sanitized metadata, no edit/delete API)
 - ✅ No admin backdoor — first admin provisioned via a DB update (documented)
 
-- ✅ **225 passing tests** (188 prior + 37 new) against a real PostgreSQL, including
-      RBAC, report privacy, concurrent moderation, suspension/session-revocation,
-      WebSocket safety, admin safeguards, audit immutability, and block integration.
+**Increment 7 — notifications + presence infrastructure:**
+- ✅ **PostgreSQL-authoritative notifications** — a normalized `notifications`
+      table drives feed, unread count, read/read-all; the WebSocket
+      `notification.created` event is a best-effort real-time optimization, never
+      the source of truth
+- ✅ Notification types (`MATCH_CREATED`, `MESSAGE_RECEIVED`, `FANTASY_INVITE`/
+      `ACCEPTED`/`STARTED`/`COMPLETED`, `SESSION_PAUSED`/`RESUMED`, `SAFETY_ACTION`,
+      `SYSTEM`) wired into the match, chat, fantasy, and safety flows
+- ✅ **Minimal, privacy-safe payloads** — the persistent notification never stores
+      the message body, consent answers, media storage keys, reporter/moderator
+      identity, or the suspension reason; the client DTO exposes only safe fields
+- ✅ **Deterministic dedup** — a unique partial index on
+      `(user_id, dedupe_key)` + `ON CONFLICT DO NOTHING` makes repeated/idempotent
+      triggers (e.g. a resent message or a reciprocal-like race) produce at most one
+      notification per logical event
+- ✅ **Per-category preferences** (`notification_preferences`) — missing row defaults
+      to enabled; disabling a category suppresses its notifications; the critical
+      **SAFETY** category cannot be disabled and bypasses the preference check
+- ✅ Feed API (`/api/notifications`, keyset-paginated), `unread-count`,
+      `:id/read`, `read-all`, and `preferences` (GET/PUT) — all auth-scoped and
+      IDOR-safe (a user can only read/mutate their own notifications)
+- ✅ Expiry + operational **cleanup** — non-critical notifications get a 90-day
+      `expires_at` (SAFETY never expires); expired rows are excluded from feed/count
+      and removed by a cleanup job
+- ✅ **Process-local presence** (`PresenceRegistry`) — ref-counted across BOTH
+      `/ws/chat` and `/ws/game`, so a user is `ONLINE` while holding ANY socket and
+      only `OFFLINE` when the final socket closes; `users.last_seen_at` is persisted
+      **only** on the `ONLINE→OFFLINE` transition (no per-heartbeat writes)
+- ✅ **Privacy-aware presence** — `GET /api/users/:id/presence` and the
+      `presence.changed` fan-out are visible **only** to `ACTIVE`-match partners with
+      no block in either direction (reuses the chat trust relationship); strangers get
+      a generic `403` that reveals neither existence nor online state
+- ✅ Suspension force-closes a user's sockets, which flips them `OFFLINE` through the
+      same registry path
+
+- ✅ **261 passing tests** (225 prior + 36 new) against a real PostgreSQL, including
+      notification dedup/expiry/preferences, SAFETY bypass, feed IDOR, presence
+      accounting across channels, last-seen-on-final-close, presence visibility
+      privacy, and real-time `notification.created` / `presence.changed` delivery
+      to authorized observers only. **135 live end-to-end smoke checks** (102 prior +
+      33 new) pass against the running server.
+
+> **Honesty note (Increment 7).** Presence is **process-local**: with multiple
+> backend instances it would require a shared store / pub-sub (e.g. Redis), which is
+> **not** implemented. There is **no** push-notification delivery — no FCM, no APNs,
+> no web-push — only in-app PostgreSQL notifications plus the optional WebSocket
+> event. A future push provider would plug in behind the existing notification
+> service as a new delivery channel; that abstraction is noted but not built.
 
 See [`docs/INCREMENTS.md`](docs/INCREMENTS.md) for the roadmap and what is
 **intentionally deferred** to later increments.
@@ -251,17 +297,23 @@ See [`docs/SECURITY.md`](docs/SECURITY.md) for details and known gaps.
 
 ## What is implemented vs. deferred
 
-**Implemented (Increments 1–6, backend):** auth + 18+ age gate; consent + session
+**Implemented (Increments 1–7, backend):** auth + 18+ age gate; consent + session
 state machine; discovery/matching/blocking; private chat (REST + `/ws/chat`);
 the data-driven fantasy engine + scenario library + gameplay (`/ws/game`); secure
-media uploads, chat attachments, and the moderation/safety pipeline; and the
-admin control plane — RBAC, safety reports, moderation queue + media moderation,
-user suspension/role management with session revocation, and audit logging.
+media uploads, chat attachments, and the moderation/safety pipeline; the admin
+control plane — RBAC, safety reports, moderation queue + media moderation, user
+suspension/role management with session revocation, and audit logging; and
+in-app notifications + process-local presence (feed/unread/read-state,
+per-category preferences, dedup, expiry/cleanup, privacy-aware presence, and
+real-time `notification.created` / `presence.changed` WebSocket events).
 
 **Intentionally deferred** (later increments): production media providers
 (S3/R2 storage, real malware scanner, real content-safety moderation — the
 interfaces exist, only local/test adapters ship); fantasy-session user media;
-multi-instance WebSocket scaling (process-local today); a moderation/admin UI;
-admin MFA; push notifications; recommendations; payments; production
-infrastructure; and all frontend/Android UI. See
-[`docs/INCREMENTS.md`](docs/INCREMENTS.md).
+multi-instance WebSocket scaling **and distributed presence** (both process-local
+today — a shared store / pub-sub such as Redis is required for horizontal scale
+and is not implemented); **push-notification delivery** (no FCM / APNs / web-push —
+only in-app notifications ship; a push provider would plug in behind the
+notification service as a future delivery channel); a moderation/admin UI; admin
+MFA; recommendations; payments; production infrastructure; and all
+frontend/Android UI. See [`docs/INCREMENTS.md`](docs/INCREMENTS.md).

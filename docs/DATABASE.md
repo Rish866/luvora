@@ -169,6 +169,32 @@ Indexes: `users_role`, `users_account_status` (both partial on non-deleted).
 The Increment 5 `media_reports` table is preserved for compatibility; new
 reports flow through `safety_reports`.
 
+## Migration 0007 — notifications + presence (Increment 7)
+
+`0007_notifications_presence.sql` adds a PostgreSQL-authoritative notification
+store, per-category preferences, and a single persistent presence column.
+Forward-only and additive.
+
+| Table / column | Purpose / notable constraints |
+|----------------|-------------------------------|
+| `notifications` | Authoritative per-user notification store. `type` and `category` are `CHECK`-constrained enums. `title`/`body` are short display-only text (`<= 200` / `<= 500` chars) that **never** hold private bodies/PII. `entity_type`/`entity_id` only *reference* a related object (the client re-fetches + re-authorizes it via normal APIs). `dedupe_key` is an optional deterministic idempotency key. `read_at`/`expires_at` nullable; `created_at` default `now()`. FK `user_id ON DELETE CASCADE`. |
+| `notification_preferences` | Per-`(user_id, category)` enable toggle, PK `(user_id, category)`. A **missing** row means "default" (resolved lazily by the app as enabled) — so there is no per-user initialization race. `updated_at` maintained by the shared `set_updated_at` trigger. FK `ON DELETE CASCADE`. |
+| `users.last_seen_at` (additive column) | The **only** persisted presence state. Written **only** on the `ONLINE→OFFLINE` transition. Live "online" is deliberately NOT stored — it lives in the in-memory `PresenceRegistry` so it can never go stale across restarts. |
+
+Indexes on `notifications`:
+
+| Index | Purpose |
+|-------|---------|
+| `notifications_user_feed` on `(user_id, created_at DESC, id DESC)` | Keyset-paginated feed, newest first. |
+| `notifications_user_unread` partial `WHERE read_at IS NULL` | Fast unread count + `unread=true` filter. |
+| `notifications_dedupe` **unique** partial on `(user_id, dedupe_key) WHERE dedupe_key IS NOT NULL` | Enforces at most one notification per `(user, dedupe_key)`; backs `ON CONFLICT DO NOTHING` dedup. |
+| `notifications_expires` partial `WHERE expires_at IS NOT NULL` | Supports expiry/cleanup scans. |
+
+Expiry convention: non-critical notifications are created with a 90-day
+`expires_at`; SAFETY notifications are created with `expires_at = NULL` (never
+expire). Expired rows are filtered out of the feed/count by
+`(expires_at IS NULL OR expires_at > now())` and removed by the cleanup job.
+
 ## Resetting a dev/test database
 
 Migrations are forward-only; to reset, drop and recreate the database, then

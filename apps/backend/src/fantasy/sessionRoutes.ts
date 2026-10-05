@@ -9,6 +9,8 @@ import * as repo from "./sessionRepository";
 import * as service from "./sessionService";
 import * as gameplay from "./gameplayService";
 import { gameHub } from "./gameConnectionRegistry";
+import * as notifications from "../notifications/notificationService";
+import { NotificationType } from "@luvora/shared";
 
 export const sessionRouter = Router();
 sessionRouter.use(requireAuth);
@@ -53,6 +55,16 @@ sessionRouter.post(
       scenarioVersion: input.scenarioVersion,
       initiatorId: userId,
       inviteeId,
+    });
+    // Notify the invitee of the fantasy invitation (no scenario/consent detail).
+    await notifications.create({
+      userId: inviteeId,
+      type: NotificationType.FANTASY_INVITE,
+      title: "Fantasy invitation",
+      body: "You've been invited to a fantasy.",
+      entityType: "session",
+      entityId: session.id,
+      dedupeKey: `fantasy:${session.id}:invite:${inviteeId}`,
     });
     ok(res, { sessionId: session.id, state: session.state }, 201);
   }),

@@ -180,10 +180,56 @@
   header, or magic account. The first admin is provisioned by an operator via a
   direct DB update (see docs/API.md "Production admin provisioning").
 
+## Notifications & presence security (Increment 7)
+- **Authoritative store, best-effort transport:** notifications live in
+  PostgreSQL; the WebSocket `notification.created`/`presence.changed` events are
+  an optimization only. A dropped or spoofed socket event cannot create, hide, or
+  alter a notification — the REST feed/count/read-state remain the source of
+  truth.
+- **Minimal payloads (no sensitive data at rest or in transit):** stored
+  notifications and their events carry only safe display fields plus an
+  `entity_type`/`entity_id` *reference*. They never contain the chat message
+  body, consent answers, media storage keys, the reporter/moderator identity, or
+  the suspension reason (tested — message/fantasy/safety notifications are
+  asserted not to leak these). The client re-fetches the referenced entity
+  through the normal, re-authorized APIs.
+- **Feed & read-state IDOR-safe:** every notification query/mutation is scoped to
+  the authenticated user. Marking another user's notification read returns
+  `404 NOTIFICATION_NOT_FOUND` (ownership is never confirmed via a different
+  status), and `read-all` only touches the caller's rows (tested).
+- **Preferences with a non-suppressible safety channel:** users may disable
+  non-critical categories, but **SAFETY** cannot be disabled
+  (`CRITICAL_PREFERENCE`) and the service bypasses the preference check for it —
+  so a user can never silence suspension/safety notices, even by writing a
+  disabled row directly in the DB (tested).
+- **Deterministic dedup prevents notification storms / probing:** a unique
+  partial index on `(user_id, dedupe_key)` plus `ON CONFLICT DO NOTHING` makes
+  idempotent and concurrent triggers (resent messages, reciprocal-like races)
+  collapse to a single notification.
+- **Privacy-aware presence:** presence (both the API and the `presence.changed`
+  fan-out) is visible only to `ACTIVE`-match partners with no block in either
+  direction — the same relationship chat trusts. A non-observer gets a generic
+  `403 PRESENCE_NOT_AUTHORIZED` that reveals neither account existence nor online
+  status (tested for strangers and blocked matches). Presence exposes only
+  `ONLINE`/`OFFLINE` + last-seen; socket/device counts are never surfaced.
+- **Minimal persisted presence state:** only `users.last_seen_at` is stored, and
+  only on the `ONLINE→OFFLINE` transition — there is no stale "online" flag that
+  could survive a crash and no per-heartbeat write amplification.
+- **Safety actions flip presence:** suspending a user force-closes their sockets
+  (Increment 6), which drives them `OFFLINE` through the same registry path.
+- **Parameterized SQL:** the notification repository builds only `$N`
+  placeholders and fixed, allow-listed SQL fragments (the keyset/unread clauses);
+  all user values pass as bound parameters.
+
 ## Known gaps (planned for later increments)
 - Email/phone verification flow (fields exist; sending not wired).
-- Multi-instance WebSocket presence/delivery (process-local today; needs shared
-  pub/sub such as Redis — deferred to the hardening increment).
+- **Push-notification delivery** (FCM / APNs / web-push) is **not** implemented —
+  only in-app PostgreSQL notifications plus the optional WebSocket event ship. A
+  push provider would be added behind the notification service as a new delivery
+  channel (abstraction noted, not built).
+- Multi-instance WebSocket delivery **and distributed presence** (both
+  process-local today; need a shared store / pub-sub such as Redis — deferred to
+  the hardening increment).
 - A moderation/admin UI (this increment is backend/API only).
 - **Production media providers:** real S3/R2 storage adapters, a real malware
   scanner (ClamAV/cloud), and a real content-safety moderation provider — the

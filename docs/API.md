@@ -656,3 +656,115 @@ with database access, e.g.:
 UPDATE users SET role = 'ADMIN' WHERE email = 'ops@yourdomain' AND deleted_at IS NULL;
 ```
 Thereafter admins manage roles through the audited `POST /api/admin/users/:id/role`.
+
+## Notifications & presence (Increment 7)
+
+In-app notifications are **PostgreSQL-authoritative**. The WebSocket
+`notification.created` and `presence.changed` events (delivered over the
+existing `/ws/chat` and `/ws/game` connections) are a best-effort real-time
+optimization — a client that misses them can always reconstruct exact state
+from the REST endpoints below. There is **no** push delivery (no FCM/APNs/
+web-push) in this increment.
+
+All endpoints require authentication and operate only on the caller's own data.
+
+### Notification DTO
+
+A notification is returned as a safe, display-only shape — it never contains a
+chat message body, consent answers, media storage keys, a reporter/moderator
+identity, or a suspension reason:
+
+```json
+{
+  "id": "uuid",
+  "type": "MESSAGE_RECEIVED",
+  "category": "MESSAGES",
+  "title": "New message",
+  "body": "You have a new message.",
+  "entityType": "conversation",
+  "entityId": "uuid",
+  "readAt": null,
+  "createdAt": "2026-10-05T12:00:00.000Z"
+}
+```
+
+`type` ∈ `MATCH_CREATED` · `MESSAGE_RECEIVED` · `FANTASY_INVITE` ·
+`FANTASY_ACCEPTED` · `FANTASY_STARTED` · `FANTASY_COMPLETED` · `SESSION_PAUSED` ·
+`SESSION_RESUMED` · `SAFETY_ACTION` · `SYSTEM`. `category` ∈ `MATCHES` ·
+`MESSAGES` · `FANTASY` · `SYSTEM` · `SAFETY`. `entityType`/`entityId` only
+*reference* a related object; the client re-fetches and re-authorizes it through
+the normal APIs.
+
+### Feed & read state — *auth required*
+
+```
+GET  /api/notifications?unread=&limit=&cursor=
+GET  /api/notifications/unread-count
+POST /api/notifications/:id/read
+POST /api/notifications/read-all
+```
+
+- `GET /api/notifications` — keyset-paginated, newest first. `unread=true`
+  returns only unread. Expired notifications are excluded. Response:
+  `{ notifications: NotificationView[], nextCursor: string | null }`. A malformed
+  `cursor` is a `400`.
+- `GET /api/notifications/unread-count` — `{ count }` (excludes expired).
+- `POST /api/notifications/:id/read` — idempotent. Marking a notification that
+  does not belong to the caller returns `404 NOTIFICATION_NOT_FOUND` (ownership
+  is never revealed via a different status).
+- `POST /api/notifications/read-all` — marks all of the caller's unread
+  notifications read; affects no one else.
+
+### Preferences — *auth required*
+
+```
+GET /api/notifications/preferences
+PUT /api/notifications/preferences      { "category": "MATCHES", "enabled": false }
+```
+
+- `GET` returns every category with its effective enabled flag (a user with no
+  stored rows sees all categories enabled by default).
+- `PUT` sets one category's flag. Disabling a category suppresses future
+  notifications of that category. The critical **SAFETY** category cannot be
+  disabled — attempting to do so returns `400 CRITICAL_PREFERENCE`, and the
+  service bypasses the preference check for SAFETY regardless of any stored row.
+
+### Presence — *auth required, matched + not-blocked only*
+
+```
+GET /api/users/:userId/presence
+```
+
+Returns `{ status: "ONLINE" }`, or `{ status: "OFFLINE", lastSeenAt: string|null }`.
+Visible only to users who share an `ACTIVE` match with the target **and** have no
+block in either direction (the same trust relationship chat uses); a caller may
+always query their own presence. Any other caller receives
+`403 PRESENCE_NOT_AUTHORIZED` — a generic error that reveals neither account
+existence nor online status. Presence exposes only `ONLINE`/`OFFLINE`
+(+ last-seen); socket/device counts are never surfaced. A non-UUID `:userId` is a
+`400`.
+
+### Real-time events (over `/ws/chat` and `/ws/game`)
+
+These user-scoped events are delivered to **all** of a user's authenticated
+sockets across both channels; they are additive and do not change existing chat/
+game protocols.
+
+- `notification.created` → `{ type, notification: NotificationView }` — mirrors a
+  freshly persisted notification (same safe DTO; no body leak).
+- `presence.changed` → `{ type, userId, status, lastSeenAt? }` — emitted to the
+  target's authorized observers (matched, non-blocked) who are themselves
+  connected. `ONLINE` fires on a user's first socket; `OFFLINE` (with
+  `lastSeenAt`) on their last socket closing. Strangers and blocked users never
+  receive these events.
+
+### Presence model & limitations
+
+Presence is maintained by an in-process, ref-counted `PresenceRegistry` that
+**both** gateways notify on connect/disconnect: a user is `ONLINE` while holding
+any socket on either channel and `OFFLINE` only when the final one closes.
+`users.last_seen_at` is persisted **only** on the `ONLINE→OFFLINE` transition.
+Suspending a user force-closes their sockets, which flips them `OFFLINE` through
+the same path. **Limitation:** this is process-local — across multiple backend
+instances, presence would require a shared store / pub-sub (e.g. Redis), which is
+not implemented in this increment.

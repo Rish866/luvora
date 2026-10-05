@@ -392,6 +392,76 @@ check "normal user denied audit logs" '403' "$(code $B/api/admin/audit-logs -H "
 # Privilege escalation attempt via body is ignored.
 check "self-promote via body fails" '403' "$(code -X POST $B/api/admin/users/$URU2/role -H "Authorization: Bearer $TRU1" -H 'Content-Type: application/json' -d '{"role":"ADMIN"}')"
 
+# ---- Increment 7: notifications + presence ----
+# Fresh matched pair + an unrelated stranger.
+NA=$(reg "na.smoke@example.com" "NotifA"); TNA=$(tok "$NA"); UNA=$(uid "$NA")
+NB=$(reg "nb.smoke@example.com" "NotifB"); TNB=$(tok "$NB"); UNB=$(uid "$NB")
+NS=$(reg "ns.smoke@example.com" "NotifStranger"); TNS=$(tok "$NS")
+json -X POST $B/api/discovery/$UNB/like -H "Authorization: Bearer $TNA" >/dev/null
+NMATCHJSON=$(json -X POST $B/api/discovery/$UNA/like -H "Authorization: Bearer $TNB")
+NMATCH=$(echo "$NMATCHJSON" | sed -n 's/.*"matchId":"\([^"]*\)".*/\1/p')
+check "notif match formed" 'UUID_OK' "$(echo "$NMATCH" | grep -Eq '^[0-9a-f-]{36}$' && echo UUID_OK || echo none)"
+
+# A mutual match created MATCH_CREATED notifications for both.
+check "match created notification" '"type":"MATCH_CREATED"' "$(json $B/api/notifications -H "Authorization: Bearer $TNA")"
+# Feed + unread-count require auth.
+check "notifications require auth 401" '401' "$(code $B/api/notifications)"
+check "unread-count requires auth 401" '401' "$(code $B/api/notifications/unread-count)"
+# Unread count is at least 1 after the match.
+UC=$(json $B/api/notifications/unread-count -H "Authorization: Bearer $TNA")
+check "unread count >=1 after match" '"count":' "$UC"
+# Feed DTO exposes only safe fields (no dedupe_key / user_id leak).
+NFEED=$(json $B/api/notifications -H "Authorization: Bearer $TNA")
+if echo "$NFEED" | grep -qiE 'dedupe|user_id|expires_at'; then echo "FAIL: notification feed leaks internal fields"; FAIL=$((FAIL+1)); else echo "PASS: notification feed exposes no internal fields"; PASS=$((PASS+1)); fi
+
+# Mark one notification read (idempotent), then read-all -> unread goes to 0.
+NID=$(echo "$NFEED" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const j=JSON.parse(s);process.stdout.write(j.data.notifications[0].id);})')
+check "mark one read" '"success":true' "$(json -X POST $B/api/notifications/$NID/read -H "Authorization: Bearer $TNA")"
+check "mark read idempotent" '"success":true' "$(json -X POST $B/api/notifications/$NID/read -H "Authorization: Bearer $TNA")"
+# IDOR: B cannot mark A's notification read.
+check "notification read IDOR rejected" 'NOTIFICATION_NOT_FOUND' "$(json -X POST $B/api/notifications/$NID/read -H "Authorization: Bearer $TNB")"
+json -X POST $B/api/notifications/read-all -H "Authorization: Bearer $TNA" >/dev/null
+check "read-all clears unread" '"count":0' "$(json $B/api/notifications/unread-count -H "Authorization: Bearer $TNA")"
+
+# Preferences: default all enabled; SAFETY cannot be disabled; MATCHES can.
+check "preferences default enabled" '"enabled":true' "$(json $B/api/notifications/preferences -H "Authorization: Bearer $TNA")"
+check "cannot disable SAFETY preference" 'CRITICAL_PREFERENCE' "$(json -X PUT $B/api/notifications/preferences -H "Authorization: Bearer $TNA" -H 'Content-Type: application/json' -d '{"category":"SAFETY","enabled":false}')"
+check "can disable MATCHES preference" '"enabled":false' "$(json -X PUT $B/api/notifications/preferences -H "Authorization: Bearer $TNA" -H 'Content-Type: application/json' -d '{"category":"MATCHES","enabled":false}')"
+
+# Presence API: self visible; stranger rejected; matched visible.
+check "presence self visible" '"status":' "$(json $B/api/users/$UNA/presence -H "Authorization: Bearer $TNA")"
+check "presence requires auth 401" '401' "$(code $B/api/users/$UNA/presence)"
+check "presence stranger rejected" 'PRESENCE_NOT_AUTHORIZED' "$(json $B/api/users/$UNA/presence -H "Authorization: Bearer $TNS")"
+check "presence matched visible" '"status":' "$(json $B/api/users/$UNA/presence -H "Authorization: Bearer $TNB")"
+# Presence must not leak online state to strangers.
+PSTR=$(json $B/api/users/$UNA/presence -H "Authorization: Bearer $TNS")
+if echo "$PSTR" | grep -qi 'lastSeen\|ONLINE\|OFFLINE'; then echo "FAIL: stranger presence leaks status"; FAIL=$((FAIL+1)); else echo "PASS: stranger presence leaks no status"; PASS=$((PASS+1)); fi
+
+# Real WebSocket flow: presence transitions + notification.created delivery.
+NPOUT=$(WS_PORT="$PORT" WS_BASE="$B" WS_TA="$TNA" WS_TB="$TNB" WS_UA="$UNA" WS_MATCH="$NMATCH" node "$(dirname "$0")/notif-presence-smoke-client.js" 2>&1)
+echo "$NPOUT" | sed 's/^/[notifws] /'
+for key in NP_READY_B NP_PRESENCE_ONLINE NP_API_ONLINE NP_API_STILL_ONLINE_2SOCK NP_NOTIF_EVENT NP_NOTIF_NO_BODY_LEAK NP_NOTIF_PERSISTED NP_UNREAD_COUNT NP_STILL_ONLINE_AFTER_1_CLOSE NP_PRESENCE_OFFLINE NP_PRESENCE_OFFLINE_LASTSEEN NP_API_OFFLINE_LASTSEEN; do
+  if echo "$NPOUT" | grep -q "$key=ok"; then echo "PASS: notifws $key"; PASS=$((PASS+1));
+  else echo "FAIL: notifws $key"; FAIL=$((FAIL+1)); fi
+done
+
+# Suspension creates a SAFETY notification that bypasses preferences.
+NADM=$(reg "nadmin.smoke@example.com" "NotifAdmin"); UNADM=$(uid "$NADM")
+promote_role "$UNADM" "ADMIN"
+NADMLOGIN=$(json -X POST $B/api/auth/login -H 'Content-Type: application/json' -d '{"email":"nadmin.smoke@example.com","password":"Passw0rd!x"}')
+TNADM=$(tok "$NADMLOGIN")
+NVIC=$(reg "nvictim.smoke@example.com" "NotifVictim"); TNVIC=$(tok "$NVIC"); UNVIC=$(uid "$NVIC")
+json -X POST $B/api/admin/users/$UNVIC/suspend -H "Authorization: Bearer $TNADM" -H 'Content-Type: application/json' -d '{"reason":"harassment"}' >/dev/null
+json -X POST $B/api/admin/users/$UNVIC/unsuspend -H "Authorization: Bearer $TNADM" >/dev/null
+# After unsuspend the victim can log in and read their SAFETY notification.
+NVICLOGIN=$(json -X POST $B/api/auth/login -H 'Content-Type: application/json' -d '{"email":"nvictim.smoke@example.com","password":"Passw0rd!x"}')
+TNVIC=$(tok "$NVICLOGIN")
+VSAFE=$(json $B/api/notifications -H "Authorization: Bearer $TNVIC")
+check "suspension emits SAFETY notification" '"type":"SAFETY_ACTION"' "$VSAFE"
+# SAFETY notification must not leak the moderator id or the reason.
+if echo "$VSAFE" | grep -q "$UNADM"; then echo "FAIL: SAFETY notification leaks moderator id"; FAIL=$((FAIL+1)); else echo "PASS: SAFETY notification hides moderator id"; PASS=$((PASS+1)); fi
+if echo "$VSAFE" | grep -qi 'harassment'; then echo "FAIL: SAFETY notification leaks reason"; FAIL=$((FAIL+1)); else echo "PASS: SAFETY notification hides reason detail"; PASS=$((PASS+1)); fi
+
 echo "----"
 echo "LIVE SMOKE: $PASS passed, $FAIL failed"
 

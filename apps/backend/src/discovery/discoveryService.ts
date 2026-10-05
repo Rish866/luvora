@@ -15,6 +15,8 @@ import {
   encodeCursor,
 } from "./discoverySchemas";
 import { notifyConversationBlocked } from "../chat/chatGateway";
+import * as notifications from "../notifications/notificationService";
+import { NotificationType } from "@luvora/shared";
 
 /**
  * Server-authoritative discovery & matching.
@@ -90,7 +92,13 @@ export async function like(
   await requireValidTarget(actorId, targetId);
 
   try {
-    const { matchId } = await repo.likeAndMaybeMatch({ actorId, targetId });
+    const { matchId, created } = await repo.likeAndMaybeMatch({ actorId, targetId });
+    if (matchId && created) {
+      // Notify BOTH participants exactly once (only the insert that created the
+      // match reports created=true, so concurrent reciprocal likes don't
+      // produce duplicate notifications). dedupe_key is a second safety net.
+      await notifyMatchCreated(matchId, actorId, targetId);
+    }
     return {
       action: DiscoveryAction.LIKE,
       userId: targetId,
@@ -102,6 +110,30 @@ export async function like(
       throw Errors.interactionNotAllowed();
     }
     throw err;
+  }
+}
+
+/** Create MATCH_CREATED notifications for both users (idempotent via dedupe). */
+async function notifyMatchCreated(
+  matchId: string,
+  userA: string,
+  userB: string,
+): Promise<void> {
+  for (const [recipient, other] of [
+    [userA, userB],
+    [userB, userA],
+  ] as const) {
+    await notifications.create({
+      userId: recipient,
+      type: NotificationType.MATCH_CREATED,
+      title: "New match",
+      body: "You have a new match.",
+      entityType: "match",
+      entityId: matchId,
+      // Deterministic per (match, recipient): survives retries + concurrency.
+      dedupeKey: `match:${matchId}:created:${recipient}`,
+    });
+    void other;
   }
 }
 

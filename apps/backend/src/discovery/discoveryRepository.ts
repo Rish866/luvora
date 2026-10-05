@@ -178,7 +178,7 @@ export async function hasLikedBack(
 export async function likeAndMaybeMatch(input: {
   actorId: string;
   targetId: string;
-}): Promise<{ matchId: string | null }> {
+}): Promise<{ matchId: string | null; created: boolean }> {
   return withTransaction(async (client) => {
     const { actorId, targetId } = input;
 
@@ -212,19 +212,22 @@ export async function likeAndMaybeMatch(input: {
       [targetId, actorId],
     );
     if (!reciprocal.rowCount) {
-      return { matchId: null };
+      return { matchId: null, created: false };
     }
 
     // Canonical pair ordering satisfies the matches_order CHECK (user_a<user_b).
     const [low, high] = actorId < targetId ? [actorId, targetId] : [targetId, actorId];
 
-    // Race-safe insert: ON CONFLICT absorbs a concurrent duplicate.
-    await client.query(
+    // Race-safe insert: ON CONFLICT absorbs a concurrent duplicate. `created`
+    // is true only for the insert that actually produced the row, so a caller
+    // can notify exactly once (no duplicate match-notification storm).
+    const insertRes = await client.query(
       `INSERT INTO matches (user_a, user_b, state)
        VALUES ($1, $2, 'ACTIVE')
        ON CONFLICT (user_a, user_b) DO NOTHING`,
       [low, high],
     );
+    const created = (insertRes.rowCount ?? 0) > 0;
 
     // Read back the single match row for this pair (ACTIVE only — a previously
     // BLOCKED match is not resurrected here).
@@ -233,7 +236,7 @@ export async function likeAndMaybeMatch(input: {
         WHERE user_a = $1 AND user_b = $2 AND state = 'ACTIVE'`,
       [low, high],
     );
-    return { matchId: match.rows[0]?.id ?? null };
+    return { matchId: match.rows[0]?.id ?? null, created };
   });
 }
 

@@ -7,6 +7,8 @@ import { hub } from "../chat/connectionRegistry";
 import { gameHub } from "../fantasy/gameConnectionRegistry";
 import { audit } from "./auditService";
 import { writeModerationAction } from "./auditRepository";
+import * as notifications from "../notifications/notificationService";
+import { NotificationType } from "@luvora/shared";
 
 /**
  * Account safety actions (admin-only). Each action validates the target and
@@ -50,6 +52,21 @@ export async function suspend(input: {
     ? new Date(Date.now() + input.durationHours * 3600 * 1000)
     : null;
 
+  // Create the SAFETY notification BEFORE suspending — once suspended the
+  // account is non-ACTIVE and the notification service would suppress it. The
+  // notification is deliberately minimal: no reporter/moderator identity, no
+  // report content, no internal notes.
+  await notifications.create({
+    userId: input.targetId,
+    type: NotificationType.SAFETY_ACTION,
+    title: "Account suspended",
+    body: "Your account has been suspended by the Luvora safety team.",
+    entityType: "account",
+    entityId: null,
+    dedupeKey: null,
+    expiresAt: null,
+  });
+
   await users.suspendUser(input.targetId, suspendedUntil, input.reason);
   await revokeAll(input.targetId);
 
@@ -85,6 +102,16 @@ export async function unsuspend(input: {
   if (!target) throw Errors.adminUserNotFound();
 
   await users.unsuspendUser(input.targetId);
+  await notifications.create({
+    userId: input.targetId,
+    type: NotificationType.SAFETY_ACTION,
+    title: "Suspension lifted",
+    body: "Your account suspension has been lifted.",
+    entityType: "account",
+    entityId: null,
+    dedupeKey: null,
+    expiresAt: null,
+  });
   await writeModerationAction({
     actorUserId: input.actorId,
     action: "user.unsuspended",
@@ -147,6 +174,17 @@ export async function reactivate(input: {
   const target = await users.findById(input.targetId);
   if (!target) throw Errors.adminUserNotFound();
   await users.reactivateUser(input.targetId);
+  // Account is ACTIVE again, so the safety notification is delivered normally.
+  await notifications.create({
+    userId: input.targetId,
+    type: NotificationType.SAFETY_ACTION,
+    title: "Account reactivated",
+    body: "Your account has been reactivated.",
+    entityType: "account",
+    entityId: null,
+    dedupeKey: null,
+    expiresAt: null,
+  });
   await writeModerationAction({
     actorUserId: input.actorId,
     action: "user.reactivated",

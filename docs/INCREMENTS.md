@@ -172,11 +172,73 @@ exist); fantasy-session user media (no gameplay attachment point yet).
 **Deferred:** a moderation/admin UI; admin MFA; production media provider
 adapters (interfaces exist); fantasy-session user media.
 
-## ⏳ Increment 7 — Android client (React Native)
+## ✅ Increment 7 — Notifications + presence infrastructure (DONE)
+
+- **PostgreSQL-authoritative notifications** (migration
+  `0007_notifications_presence.sql`): a normalized `notifications` table
+  (type, category, title, short body, nullable `entity_type`/`entity_id`,
+  `read_at`, `dedupe_key`, `expires_at`) is the single source of truth for the
+  feed, unread count, and read state. The WebSocket `notification.created` event
+  is a best-effort real-time optimization carrying the same safe DTO — never
+  authoritative.
+- **Event coverage** wired into existing flows (no systems rebuilt):
+  `MATCH_CREATED` (on a new mutual match, once per user), `MESSAGE_RECEIVED`
+  (recipient only), `FANTASY_INVITE`/`FANTASY_ACCEPTED`/`FANTASY_COMPLETED`,
+  and `SAFETY_ACTION` (suspend/unsuspend/reactivate). `FANTASY_STARTED`,
+  `SESSION_PAUSED`/`RESUMED`, and `SYSTEM` types exist in the shared contract for
+  forward use.
+- **Minimal, privacy-safe payloads:** the stored notification never contains the
+  chat message body, consent answers, media storage keys, the reporter/moderator
+  identity, or the suspension reason. The client DTO exposes only
+  `{id, type, category, title, body, entityType, entityId, readAt, createdAt}`.
+- **Deterministic dedup:** a unique partial index on `(user_id, dedupe_key)
+  WHERE dedupe_key IS NOT NULL` plus `ON CONFLICT DO NOTHING` guarantees at most
+  one notification per logical event — covering idempotent message resends and
+  concurrent reciprocal-like / concurrent-create races.
+- **Per-category preferences** (`notification_preferences(user_id, category,
+  enabled)`): a missing row defaults to **enabled** (no init race); disabling a
+  category suppresses future notifications of that category. The **SAFETY**
+  category is critical — it cannot be disabled (`CRITICAL_PREFERENCE`) and the
+  service bypasses the preference check for it entirely.
+- **Feed API:** `GET /api/notifications` (keyset-paginated, `unread=true`
+  filter, expiry-filtered), `GET /api/notifications/unread-count`,
+  `POST /api/notifications/:id/read` (idempotent, ownership-checked →
+  `NOTIFICATION_NOT_FOUND` on another user's row), `POST
+  /api/notifications/read-all`, and `GET`/`PUT /api/notifications/preferences`.
+  Everything is auth-scoped and IDOR-safe.
+- **Retention + cleanup:** non-critical notifications get a 90-day `expires_at`
+  (SAFETY never expires); expired rows are excluded from feed/count and removed
+  by a scheduler-callable cleanup function.
+- **Process-local presence** (`PresenceRegistry`): a ref-counted registry that
+  **both** gateways (`/ws/chat` and `/ws/game`) notify on connect/disconnect, so
+  a user is `ONLINE` while holding ANY socket and `OFFLINE` only when the final
+  socket closes. `users.last_seen_at` is written **only** on the
+  `ONLINE→OFFLINE` transition (no per-heartbeat writes). Suspension force-closes
+  sockets, which flips the user `OFFLINE` through the same path.
+- **Privacy-aware presence:** `GET /api/users/:id/presence` and the
+  `presence.changed` fan-out are visible only to `ACTIVE`-match partners with no
+  block in either direction (the same relationship chat trusts). A non-observer
+  receives a generic `PRESENCE_NOT_AUTHORIZED` (403) that reveals neither
+  account existence nor online status. Presence exposes only
+  `ONLINE`/`OFFLINE` (+ `lastSeenAt` when offline) — never socket/device counts.
+- 36 new tests (24 notification + 12 presence/real-time WS): dedup, expiry,
+  preferences, SAFETY bypass, feed/read-state IDOR, chat/match/fantasy/safety
+  integration, presence accounting across channels, last-seen-on-final-close,
+  visibility privacy, and authorized-only `notification.created` /
+  `presence.changed` delivery. **Total: 261 passing** against real PostgreSQL.
+  Live smoke: 135/135 (incl. a real multi-socket presence + notification WS flow).
+
+**Honesty note / deferred:** presence is **process-local** — multi-instance
+(distributed) presence needs a shared store / pub-sub (e.g. Redis) and is **not**
+implemented. There is **no** push delivery (no FCM / APNs / web-push); only in-app
+notifications ship. A push provider would be added behind the notification service
+as a new delivery channel (abstraction noted, not built).
+
+## ⏳ Increment 8 — Android client (React Native)
 
 Onboarding/age gate, the five sections, consent + gameplay UI, push, offline UX.
 
-## ⏳ Increment 8 — Hardening
+## ⏳ Increment 9 — Hardening
 
 Full security test matrix, load testing, OpenAPI/WS docs, deployment runbooks,
 Android release build.

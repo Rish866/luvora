@@ -148,6 +148,14 @@ export const Errors = {
   invalidRole: (message = "Invalid role.") =>
     new AppError(ErrorCodes.INVALID_ROLE, 400, message),
 
+  // ---- Notifications & presence (Increment 7) ----
+  notificationNotFound: (message = "Notification not found.") =>
+    new AppError(ErrorCodes.NOTIFICATION_NOT_FOUND, 404, message),
+  presenceNotAuthorized: (message = "You are not authorized to view this presence.") =>
+    new AppError(ErrorCodes.PRESENCE_NOT_AUTHORIZED, 403, message),
+  criticalPreference: (message = "This notification category cannot be disabled.") =>
+    new AppError(ErrorCodes.CRITICAL_PREFERENCE, 400, message),
+
   internal: (message = "An unexpected error occurred.") =>
     new AppError(ErrorCodes.INTERNAL, 500, message),
 };

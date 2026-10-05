@@ -7,6 +7,7 @@ import { gameHub } from "./gameConnectionRegistry";
 import { clientGameEventSchema } from "./gameEventSchemas";
 import * as gameplay from "./gameplayService";
 import { isAccountActive } from "../auth/accountState";
+import { presenceRegistry } from "../presence/presenceRegistry";
 import type { WsChannel, WsDispatcher } from "../ws/wsDispatcher";
 
 /**
@@ -137,6 +138,7 @@ export function attachGameGateway(dispatcher: WsDispatcher): GameGateway {
     const state: SocketState = { userId, isAlive: true, recent: [] };
     stateBySocket.set(socket, state);
     gameHub.add(userId, socket);
+    presenceRegistry.connect(userId);
     logger.info({ userId, sockets: gameHub.socketCount() }, "game ws established");
 
     send(socket, { type: "game.ready", userId });
@@ -162,6 +164,7 @@ export function attachGameGateway(dispatcher: WsDispatcher): GameGateway {
 
     socket.on("close", () => {
       gameHub.remove(userId, socket);
+      presenceRegistry.disconnect(userId);
       stateBySocket.delete(socket);
       logger.info({ userId, sockets: gameHub.socketCount() }, "game ws closed");
     });

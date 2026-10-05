@@ -12,6 +12,9 @@ import { scenarioRouter } from "./scenario/scenarioRoutes";
 import { mediaRouter } from "./media/mediaRoutes";
 import { adminRouter } from "./admin/adminRoutes";
 import { reportRouter } from "./admin/reportRoutes";
+import { notificationRouter } from "./notifications/notificationRoutes";
+import { presenceRouter } from "./presence/presenceRoutes";
+import { initPresence } from "./presence/presenceService";
 import { errorHandler } from "./http/errorHandler";
 import { ok } from "./http/respond";
 import { Errors } from "./http/errors";
@@ -20,6 +23,9 @@ import { pool } from "./db/pool";
 
 /** Build the Express application (no listening) so tests can import it. */
 export function createApp(): Express {
+  // Wire presence transitions (last-seen persistence + presence.changed events).
+  initPresence();
+
   const app = express();
 
   app.set("trust proxy", 1);
@@ -58,6 +64,10 @@ export function createApp(): Express {
   app.use("/api/media", mediaRouter);
   app.use("/api/reports", reportRouter);
   app.use("/api/admin", adminRouter);
+  app.use("/api/notifications", notificationRouter);
+  // Presence lookups live under /api/users/:userId/presence (coexists with the
+  // block routes already mounted at /api/users).
+  app.use("/api/users", presenceRouter);
 
   // 404 for unknown routes.
   app.use((_req, _res, next) => next(Errors.notFound("Route not found.")));

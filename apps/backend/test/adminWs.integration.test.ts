@@ -1,6 +1,7 @@
-import { describe, it, expect, beforeAll, beforeEach, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from "vitest";
 import request from "supertest";
 import { closePool } from "../src/db/pool";
+import { presenceRegistry } from "../src/presence/presenceRegistry";
 import {
   resetDb,
   registerUser,
@@ -25,6 +26,15 @@ beforeAll(async () => {
 });
 beforeEach(async () => {
   await resetDb();
+  presenceRegistry.reset();
+});
+afterEach(async () => {
+  // Suspension force-closes sockets, which now drives an ASYNchronous presence
+  // OFFLINE transition (persisting last-seen). Let any in-flight handler drain
+  // and reset the shared registry so its DB work cannot overlap the next test
+  // file's resetDb() TRUNCATE (which would deadlock).
+  presenceRegistry.reset();
+  await new Promise((r) => setTimeout(r, 150));
 });
 afterAll(async () => {
   await srv.close();

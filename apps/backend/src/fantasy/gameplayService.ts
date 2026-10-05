@@ -10,10 +10,12 @@ import {
   type GameNodeView,
   type GameChoiceView,
 } from "@luvora/shared";
+import { NotificationType } from "@luvora/shared";
 import { Errors } from "../http/errors";
 import * as sessionRepo from "./sessionRepository";
 import * as gameplayRepo from "./gameplayRepository";
 import * as scenarioRepo from "../scenario/scenarioRepository";
+import * as notifications from "../notifications/notificationService";
 
 /**
  * Server-authoritative gameplay engine.
@@ -289,10 +291,26 @@ export async function choose(
   }
 
   const updated = result.session!;
+  const justCompleted = updated.state === SessionState.COMPLETED;
+  if (justCompleted) {
+    // Notify both participants that the fantasy completed (no choice/consent
+    // detail). Deduped per (session, recipient).
+    for (const uid of participants) {
+      await notifications.create({
+        userId: uid,
+        type: NotificationType.FANTASY_COMPLETED,
+        title: "Fantasy complete",
+        body: "Your fantasy has reached its ending.",
+        entityType: "session",
+        entityId: sessionId,
+        dedupeKey: `fantasy:${sessionId}:completed:${uid}`,
+      });
+    }
+  }
   return {
     state: await buildStateView(updated),
     participants,
-    completed: updated.state === SessionState.COMPLETED,
+    completed: justCompleted,
     idempotentReplay: false,
   };
 }

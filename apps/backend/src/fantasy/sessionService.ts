@@ -11,6 +11,8 @@ import {
 } from "@luvora/shared";
 import { Errors } from "../http/errors";
 import * as repo from "./sessionRepository";
+import * as notifications from "../notifications/notificationService";
+import { NotificationType } from "@luvora/shared";
 
 /**
  * Server-authoritative session + consent logic.
@@ -85,6 +87,16 @@ export async function acceptInvite(
     throw Errors.unauthorized("Only the invited player can accept.");
   }
   const accepted = await transition(session, SessionState.ACCEPTED);
+  // Notify the initiator that their invitation was accepted.
+  await notifications.create({
+    userId: session.initiator_id,
+    type: NotificationType.FANTASY_ACCEPTED,
+    title: "Fantasy accepted",
+    body: "Your fantasy invitation was accepted.",
+    entityType: "session",
+    entityId: session.id,
+    dedupeKey: `fantasy:${session.id}:accepted:${session.initiator_id}`,
+  });
   // Immediately advance into the consent stage.
   return transition(accepted, SessionState.CONSENT);
 }

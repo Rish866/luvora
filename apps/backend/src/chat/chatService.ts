@@ -4,10 +4,12 @@ import {
   type ChatMessage,
   type AttachmentView,
 } from "@luvora/shared";
+import { NotificationType } from "@luvora/shared";
 import { Errors } from "../http/errors";
 import * as chatRepo from "./chatRepository";
 import * as mediaRepo from "../media/mediaRepository";
 import { toAttachmentView } from "../media/mediaService";
+import * as notifications from "../notifications/notificationService";
 import {
   authorizeByConversation,
   authorizeByMatch,
@@ -125,6 +127,20 @@ export async function createMessage(
   });
 
   const attachments = await loadAttachmentViews(row.id);
+
+  // Notify the RECIPIENT (never the sender). The notification references the
+  // conversation only — it never carries the message body (privacy). Deduped
+  // per (message, recipient) so an idempotent resend doesn't double-notify.
+  await notifications.create({
+    userId: context.partnerId,
+    type: NotificationType.MESSAGE_RECEIVED,
+    title: "New message",
+    body: "You have a new message.",
+    entityType: "conversation",
+    entityId: context.conversationId,
+    dedupeKey: `message:${row.id}:received:${context.partnerId}`,
+  });
+
   return { message: toChatMessage(row, attachments), context };
 }
 

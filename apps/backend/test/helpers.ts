@@ -5,7 +5,9 @@ import { pool } from "../src/db/pool";
 /** Truncate all data tables between tests for isolation. */
 export async function resetDb(): Promise<void> {
   await pool.query(`
-    TRUNCATE media_reports, message_attachments, media_assets,
+    TRUNCATE notifications, notification_preferences,
+             safety_reports, moderation_actions, audit_logs,
+             media_reports, message_attachments, media_assets,
              consent_responses, fantasy_players, fantasy_sessions,
              blocks, matches, likes, photos, profiles,
              devices, auth_sessions, users
