@@ -225,3 +225,137 @@ for the same pair.
 Keyset (cursor) pagination over the deterministic `(created_at, id)` order. The
 cursor is an opaque base64url token encoding only that ordering key (a public
 user id + its created_at). `nextCursor` is `null` on the final page.
+
+---
+
+## Private chat (Increment 3)
+
+Chat is available **only between the two participants of an `ACTIVE` match**.
+There is exactly one conversation per match, created lazily and race-safely on
+first access. Authorization always derives from the authenticated identity + the
+match relationship — knowing a `matchId` or `conversationId` is never enough.
+
+Additional error codes: `CONVERSATION_NOT_FOUND` (404), `CHAT_NOT_AUTHORIZED`
+(403 — generic; also used for blocked relationships so block details never
+leak), `MATCH_NOT_ACTIVE` (409), `MESSAGE_EMPTY` (400), `MESSAGE_TOO_LONG`
+(400), `INVALID_CURSOR` (400), `INVALID_WEBSOCKET_MESSAGE` (400).
+
+Message size limit: **4000 Unicode code points** (enforced in the application;
+empty / whitespace-only bodies are rejected).
+
+### REST — `*all auth required*`
+
+#### `GET /api/matches/:matchId/messages?limit=&cursor=`
+Paginated history for the match's conversation (creating the conversation if it
+does not yet exist).
+
+- `limit`: 1–100, default 50. `cursor`: opaque token from `nextCursor`.
+- Messages are returned **oldest→newest** within the page; `nextCursor` pages
+  further **back** into history (older messages). Ordering is deterministic on
+  `(created_at, id)`.
+- `403 CHAT_NOT_AUTHORIZED` for non-participants and blocked matches;
+  `409 MATCH_NOT_ACTIVE` for a non-active (e.g. UNMATCHED) match;
+  `400 INVALID_CURSOR` for a tampered cursor.
+
+```jsonc
+{
+  "success": true,
+  "data": {
+    "conversationId": "UUID",
+    "messages": [
+      { "id": "UUID", "conversationId": "UUID", "senderId": "UUID",
+        "body": "Hello 👋", "clientMessageId": null, "createdAt": "…" }
+    ],
+    "nextCursor": "opaque" | null
+  }
+}
+```
+
+#### `POST /api/matches/:matchId/messages`
+Create a message. The sender is **always** the authenticated user; any
+`senderId`/`id` in the body is ignored.
+
+```jsonc
+// request
+{ "body": "Hello 👋", "clientMessageId": "optional-uuid" }
+// 201
+{ "success": true, "data": { "message": { /* ChatMessage */ } } }
+```
+- `400 MESSAGE_EMPTY` / `400 MESSAGE_TOO_LONG`; `403 CHAT_NOT_AUTHORIZED` for
+  non-participants / blocked matches.
+- **Idempotency:** repeating a send with the same `clientMessageId` (per
+  conversation + sender) returns the existing message rather than creating a
+  duplicate.
+
+Both the REST `POST` and the WebSocket `message.send` go through the **same**
+message service, so authorization/validation/persistence are identical.
+
+---
+
+## WebSocket chat gateway (Increment 3)
+
+The gateway runs on the **same HTTP server/port** as the REST API.
+
+```
+ws(s)://<host>/ws/chat
+```
+
+### Authentication (handshake)
+Authentication happens during the HTTP upgrade and is **mandatory** — an
+unauthenticated upgrade is rejected with `401` before any WebSocket is
+established. Provide the existing **access token** either as:
+
+- `Authorization: Bearer <access-token>` (preferred), or
+- `?access_token=<access-token>` query parameter (for browser clients that
+  cannot set handshake headers).
+
+Tokens are never logged. Refresh tokens must **not** be used here. On success
+the server immediately sends `connection.ready`.
+
+### Client → server events
+```jsonc
+{ "type": "message.send", "conversationId": "UUID", "body": "Hello", "clientMessageId": "optional-uuid" }
+{ "type": "message.read", "conversationId": "UUID", "messageId": "UUID" }
+{ "type": "typing.start", "conversationId": "UUID" }
+{ "type": "typing.stop",  "conversationId": "UUID" }
+```
+Any client-supplied sender/user id is ignored; the server always uses the
+authenticated connection identity.
+
+### Server → client events
+```jsonc
+{ "type": "connection.ready", "userId": "UUID" }
+{ "type": "message.created", "message": { "id": "UUID", "conversationId": "UUID",
+   "senderId": "UUID", "body": "Hello", "clientMessageId": null, "createdAt": "…" } }
+{ "type": "message.read", "conversationId": "UUID", "messageId": "UUID", "userId": "UUID" }
+{ "type": "typing", "conversationId": "UUID", "userId": "UUID", "state": "start" | "stop" }
+{ "type": "presence", "conversationId": "UUID", "userId": "UUID", "state": "online" | "offline" }
+{ "type": "chat.blocked", "conversationId": "UUID" }
+{ "type": "error", "code": "CHAT_NOT_AUTHORIZED", "message": "…", "clientMessageId": "…?" }
+```
+
+### Semantics & guarantees
+- **Persist-then-broadcast:** a message is written to PostgreSQL before any
+  `message.created` is emitted. The DB record is authoritative; `id` is
+  server-generated.
+- **Recipient routing:** `message.created` is delivered only to the two match
+  participants' sockets — never globally. A user may have multiple sockets
+  (phone/browser/tablet); all receive the event, but only one DB row is written.
+- **Block enforcement:** every `message.send` (and read/typing) is
+  re-authorized against the current match state, so a block takes effect
+  immediately even on a pre-existing socket. When a block invalidates a match,
+  connected sockets receive `chat.blocked`.
+- **Read receipts:** `message.read` validates the message belongs to the
+  conversation, stores a per-user "last read" marker, and notifies the partner
+  with the authenticated `userId`.
+- **Typing / presence** are ephemeral (never persisted) and routed only to the
+  matched partner.
+- **Malformed input** (bad JSON, unknown event type, invalid UUID, oversized /
+  empty body) returns a structured `error` event and never crashes the server.
+- **Heartbeat:** the server pings periodically and terminates unresponsive
+  sockets; disconnects clean up the in-memory registry.
+
+### Limitation
+WebSocket presence/delivery state is **process-local**. A multi-instance
+deployment would need a shared pub/sub (e.g. Redis); that is deferred to a later
+hardening increment.

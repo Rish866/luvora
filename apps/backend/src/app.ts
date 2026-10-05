@@ -7,6 +7,7 @@ import { sessionRouter } from "./fantasy/sessionRoutes";
 import { discoveryRouter } from "./discovery/discoveryRoutes";
 import { matchRouter } from "./discovery/matchRoutes";
 import { userBlockRouter } from "./discovery/blockRoutes";
+import { chatRouter } from "./chat/chatRoutes";
 import { errorHandler } from "./http/errorHandler";
 import { ok } from "./http/respond";
 import { Errors } from "./http/errors";
@@ -44,6 +45,9 @@ export function createApp(): Express {
   app.use("/api/auth", authRouter);
   app.use("/api/sessions", sessionRouter);
   app.use("/api/discovery", discoveryRouter);
+  // Chat history/send is nested under a match; mount it BEFORE the match router
+  // so /api/matches/:matchId/messages resolves to the chat router.
+  app.use("/api/matches/:matchId/messages", chatRouter);
   app.use("/api/matches", matchRouter);
   app.use("/api/users", userBlockRouter);
 

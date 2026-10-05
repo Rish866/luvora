@@ -14,6 +14,7 @@ import {
   decodeCursor,
   encodeCursor,
 } from "./discoverySchemas";
+import { notifyConversationBlocked } from "../chat/chatGateway";
 
 /**
  * Server-authoritative discovery & matching.
@@ -134,7 +135,13 @@ export async function block(
   blockedId: string,
 ): Promise<void> {
   await requireValidTarget(blockerId, blockedId);
-  await blocks.createBlock({ blockerId, blockedId });
+  const { conversationId } = await blocks.createBlock({ blockerId, blockedId });
+  // If the pair had a conversation, notify any live chat sockets so stale
+  // connections stop using it. (Enforcement is independent: chat sends are
+  // re-authorized on every message against the now-BLOCKED match.)
+  if (conversationId) {
+    notifyConversationBlocked([blockerId, blockedId], conversationId);
+  }
 }
 
 export async function unblock(

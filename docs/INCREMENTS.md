@@ -51,10 +51,33 @@ before the next is added. Below is the plan and current status.
   assertions). **Total: 72 passing** against real PostgreSQL. Live HTTP smoke:
   43/43.
 
-## ⏳ Increment 3 — Private chat + WebSockets
+## ✅ Increment 3 — Private chat + WebSockets (DONE)
 
-Authenticated WebSocket gateway, per-match conversations, messages, typing,
-read receipts, presence, reconnection with sequence numbers.
+- **One conversation per `ACTIVE` match**, created lazily and race-safely
+  (`UNIQUE(match_id)` + `ON CONFLICT`). Append-only `messages`; compact per-user
+  `conversation_read_state`. Migration `0003_chat.sql`.
+- **REST** (`GET`/`POST /api/matches/:matchId/messages`): keyset-paginated
+  history (oldest→newest), send with server-generated id, 4000-code-point limit,
+  empty/oversized rejection, `clientMessageId` idempotency.
+- **WebSocket gateway** on the same HTTP port at `/ws/chat`, authenticated at
+  the handshake via the existing access token (header or `?access_token`).
+  Events: `connection.ready`, `message.send`/`message.created`,
+  `message.read`, `typing.start`/`typing.stop` → `typing`, `error`,
+  `chat.blocked`. Discriminated-union protocol types live in
+  `packages/shared/src/chat.ts`.
+- **Single message service** shared by REST + WS, so authorization, validation,
+  and persist-then-broadcast behave identically. Sender identity always comes
+  from the authenticated connection; client-supplied ids are ignored.
+- **Central authorization helper** (participant + ACTIVE match + no block in
+  either direction) reused by history, send, read, typing. Block is
+  **re-checked on every send**, so a block takes effect immediately on existing
+  sockets; `chat.blocked` is pushed to live connections.
+- Multi-socket-per-user delivery, in-memory connection registry keyed by
+  verified user id, heartbeat/dead-socket cleanup, graceful shutdown closes
+  WS + HTTP + pool. Presence/typing are ephemeral (not persisted); WebSocket
+  state is **process-local** (shared pub/sub deferred to Increment 8).
+- 36 new tests (19 chat REST + 17 real WebSocket). **Total: 108 passing**
+  against real PostgreSQL. Live smoke: 58/58 (incl. a real two-socket WS flow).
 
 ## ⏳ Increment 4 — Data-driven fantasy engine
 

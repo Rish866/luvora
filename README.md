@@ -15,8 +15,8 @@ non-graphic and non-explicit.
 ## Implementation status
 
 This repository contains **Increment 1 (backend foundation)** and
-**Increment 2 (discovery & matching)**. Both are working, tested slices (not
-mocked screens).
+**Increment 2 (discovery & matching)**, and **Increment 3 (private chat +
+WebSockets)**. All are working, tested slices (not mocked screens).
 
 **Increment 1 — foundation:**
 - ✅ Auth: register / login / refresh / logout / logout-all / `me`
@@ -41,9 +41,23 @@ mocked screens).
 - ✅ Match list & detail (`/api/matches`) — participant-only, IDOR-safe
 - ✅ Discovery-safe DTOs — no auth/consent/private fields ever leak
 
-- ✅ **72 passing tests** (27 Increment 1 + 45 Increment 2) against a real
-      PostgreSQL, including a concurrent-reciprocal-like race test, consent-
-      privacy, and IDOR-authorization security tests.
+**Increment 3 — private chat + WebSockets:**
+- ✅ One conversation per `ACTIVE` match (lazy, race-safe); append-only messages
+- ✅ REST history + send (`/api/matches/:matchId/messages`) — keyset pagination,
+      4000-code-point limit, empty/oversized rejection, `clientMessageId` idempotency
+- ✅ **WebSocket gateway** at `/ws/chat` on the same port — handshake auth via the
+      existing access token; `connection.ready`, `message.send`/`message.created`,
+      `message.read`, `typing`, `chat.blocked`, `error`
+- ✅ Single message service shared by REST + WS; **persist-then-broadcast**;
+      sender identity is always the authenticated connection (no spoofing)
+- ✅ **Block re-checked on every send** — stale sockets cannot bypass a block
+- ✅ Multi-socket-per-user delivery; recipient-only routing (never global);
+      heartbeat + registry cleanup; graceful shutdown
+- ✅ Discriminated-union protocol types in `packages/shared`
+
+- ✅ **108 passing tests** (27 + 45 + 36) against a real PostgreSQL, including
+      real WebSocket connections, a conversation-creation race, idempotency
+      races, block enforcement over live sockets, IDOR, and privacy assertions.
 
 See [`docs/INCREMENTS.md`](docs/INCREMENTS.md) for the roadmap and what is
 **intentionally deferred** to later increments.

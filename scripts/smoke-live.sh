@@ -221,6 +221,40 @@ check "third player treated as non-participant" 'SESSION_NOT_AUTHORIZED' "$THIRD
 LEAVE=$(json -X POST $B/api/sessions/$SID/leave -H "Authorization: Bearer $TA")
 check "leave -> ABANDONED" '"state":"ABANDONED"' "$LEAVE"
 
+# ---- Increment 3: private chat (HTTP) + real WebSocket ----
+PG1=$(reg "cg.smoke@example.com" "ChatG"); TG=$(tok "$PG1"); UG=$(uid "$PG1")
+PH1=$(reg "ch.smoke@example.com" "ChatH"); TH=$(tok "$PH1"); UH=$(uid "$PH1")
+PCI=$(reg "ci.smoke@example.com" "ChatI"); TI=$(tok "$PCI"); UI=$(uid "$PCI")
+# Form a match via real discovery.
+json -X POST $B/api/discovery/$UH/like -H "Authorization: Bearer $TG" >/dev/null
+CMATCHJSON=$(json -X POST $B/api/discovery/$UG/like -H "Authorization: Bearer $TH")
+CMATCH=$(echo "$CMATCHJSON" | sed -n 's/.*"matchId":"\([^"]*\)".*/\1/p')
+check "chat match formed" 'UUID_OK' "$(echo "$CMATCH" | grep -Eq '^[0-9a-f-]{36}$' && echo UUID_OK || echo none)"
+
+# History starts empty; unrelated user and unauth are rejected.
+check "empty history ok" '"messages":\[\]' "$(json $B/api/matches/$CMATCH/messages -H "Authorization: Bearer $TG")"
+check "chat history requires auth 401" '401' "$(code $B/api/matches/$CMATCH/messages)"
+check "chat history IDOR rejected" 'CHAT_NOT_AUTHORIZED' "$(json $B/api/matches/$CMATCH/messages -H "Authorization: Bearer $TI")"
+
+# Send via HTTP; empty + oversized rejected.
+SENT=$(json -X POST $B/api/matches/$CMATCH/messages -H "Authorization: Bearer $TG" -H 'Content-Type: application/json' -d '{"body":"Hello over HTTP 👋"}')
+check "http send ok" '"body":"Hello over HTTP 👋"' "$SENT"
+check "http send not spoofable" "\"senderId\":\"$UG\"" "$SENT"
+check "empty message rejected" 'MESSAGE_EMPTY' "$(json -X POST $B/api/matches/$CMATCH/messages -H "Authorization: Bearer $TG" -H 'Content-Type: application/json' -d '{"body":"   "}')"
+check "history now has message" 'Hello over HTTP' "$(json $B/api/matches/$CMATCH/messages -H "Authorization: Bearer $TG")"
+
+# Real WebSocket flow via a tiny node ws client.
+WSOUT=$(WS_PORT="$PORT" WS_TG="$TG" WS_TH="$TH" WS_TI="$TI" WS_MATCH="$CMATCH" WS_BASE="$B" node "$(dirname "$0")/ws-smoke-client.js" 2>&1)
+echo "$WSOUT" | sed 's/^/[ws] /'
+for key in WS_READY_G WS_READY_H WS_RECV_H WS_RECV_SENDER_OK WS_PERSISTED WS_IDOR_REJECTED; do
+  if echo "$WSOUT" | grep -q "$key=ok"; then echo "PASS: websocket $key"; PASS=$((PASS+1));
+  else echo "FAIL: websocket $key"; FAIL=$((FAIL+1)); fi
+done
+
+# Block enforcement over chat: G blocks H, then H's HTTP send is rejected.
+json -X POST $B/api/users/$UH/block -H "Authorization: Bearer $TG" >/dev/null
+check "chat send rejected after block" 'CHAT_NOT_AUTHORIZED' "$(json -X POST $B/api/matches/$CMATCH/messages -H "Authorization: Bearer $TH" -H 'Content-Type: application/json' -d '{"body":"after block"}')"
+
 echo "----"
 echo "LIVE SMOKE: $PASS passed, $FAIL failed"
 

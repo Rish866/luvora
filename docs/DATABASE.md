@@ -61,6 +61,32 @@ indexes the discovery and relationship queries need — no table redesign:
 - `matches.state ∈ {ACTIVE, UNMATCHED, BLOCKED}` → blocking sets an existing
   match to `BLOCKED`; active listings and discovery filter on `ACTIVE`.
 
+## Migration 0003 — private chat (Increment 3)
+
+`0003_chat.sql` adds the chat tables. One conversation per match; messages are
+append-only; read state is a compact per-user marker.
+
+| Table | Purpose / notable constraints |
+|-------|-------------------------------|
+| `conversations` | One per match. `UNIQUE (match_id)` enforces that at the DB layer; FK → `matches(id) ON DELETE CASCADE`. Created lazily + race-safely via `INSERT ... ON CONFLICT (match_id)`. |
+| `messages` | Append-only. `id` server-generated UUID; FK `conversation_id` → `conversations`, `sender_id` → `users`. `client_message_id` is an optional idempotency key. |
+| `conversation_read_state` | Per-user "last read message" marker. PK `(conversation_id, user_id)`; `last_read_message_id` FK → `messages ON DELETE SET NULL`. |
+
+Indexes / constraints:
+- `messages_conversation_order (conversation_id, created_at, id)` — deterministic
+  keyset history pagination, no N+1.
+- `messages_idempotency` — partial `UNIQUE (conversation_id, sender_id,
+  client_message_id) WHERE client_message_id IS NOT NULL` — at most one message
+  per client idempotency key; keyless messages are unconstrained.
+- `messages_body_nonempty` (`length(btrim(body)) >= 1`) and
+  `messages_body_max_bytes` (`octet_length(body) <= 32000`). The **authoritative**
+  4000-code-point limit is enforced in the application (`chatService.validateBody`);
+  these DB checks are encoding-independent backstops (4000 code points ≤ 16000
+  UTF-8 bytes, so 32000 bytes is safe headroom) and never reject a value the
+  application already accepted.
+
+Presence and typing are ephemeral and are **not** persisted.
+
 ## Resetting a dev/test database
 
 Migrations are forward-only; to reset, drop and recreate the database, then

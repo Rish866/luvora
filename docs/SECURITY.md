@@ -45,9 +45,37 @@
   via vitest, etc.); these are not shipped in the production runtime bundle.
   Track and update in the hardening increment.
 
+## Chat & WebSocket security (Increment 3)
+- **WebSocket authentication at the handshake:** the HTTP upgrade is rejected
+  (`401`) unless a valid, non-revoked access token is presented (reusing the
+  existing `verifyAccessToken` + live-user check). No unauthenticated socket is
+  ever left open. Tokens are never logged.
+- **Authorization on every action:** a single helper (`chatAuthorization`)
+  verifies participant membership + `ACTIVE` match + no block (either
+  direction) for history, send, read, and typing. Block is re-checked on every
+  `message.send`, so a stale socket cannot bypass a block applied after connect.
+- **Sender spoofing impossible:** the message sender is always the authenticated
+  connection identity; client-supplied `senderId`/`id`/`userId` are ignored.
+- **IDOR:** knowing a `matchId`/`conversationId` grants nothing; a non-participant
+  gets the generic `CHAT_NOT_AUTHORIZED` (so block details never leak).
+- **Persist-then-broadcast:** messages are written to PostgreSQL before any
+  broadcast; the DB id is authoritative. `message.created` is routed only to the
+  two participants' sockets — never a global broadcast.
+- **Input validation:** malformed JSON, unknown event types, invalid UUIDs, and
+  empty/oversized bodies yield a structured `error` event and never crash the
+  process. REST + WS share one validated message service.
+- **Rate limiting:** REST send reuses the project limiter; the WS gateway adds a
+  per-connection sliding-window throttle.
+- **Privacy:** message payloads expose only `id`, `conversationId`, `senderId`,
+  `body`, `clientMessageId`, `createdAt`. Presence is partner-scoped (not global)
+  and ephemeral. Message bodies are not logged.
+- **Parameterized SQL** throughout the chat module; cursors are opaque and
+  always passed as parameters.
+
 ## Known gaps (planned for later increments)
 - Email/phone verification flow (fields exist; sending not wired).
-- WebSocket auth/authorization (arrives with chat/gameplay).
+- Multi-instance WebSocket presence/delivery (process-local today; needs shared
+  pub/sub such as Redis — deferred to the hardening increment).
 - Media signed-URL authorization + moderation pipeline.
 - Admin RBAC + audit logging.
 - Full automated security test matrix and load testing.

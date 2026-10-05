@@ -52,6 +52,24 @@ export const Errors = {
   matchNotAuthorized: (message = "You are not authorized to access this match.") =>
     new AppError(ErrorCodes.MATCH_NOT_AUTHORIZED, 403, message),
 
+  // ---- Chat (Increment 3) ----
+  conversationNotFound: (message = "Conversation not found.") =>
+    new AppError(ErrorCodes.CONVERSATION_NOT_FOUND, 404, message),
+  /** Generic chat authorization failure — used for non-participants AND for
+   *  blocked relationships, so we never reveal who blocked whom. */
+  chatNotAuthorized: (message = "You are not authorized to use this conversation.") =>
+    new AppError(ErrorCodes.CHAT_NOT_AUTHORIZED, 403, message),
+  matchNotActive: (message = "This match is not active.") =>
+    new AppError(ErrorCodes.MATCH_NOT_ACTIVE, 409, message),
+  messageTooLong: (message = `Message exceeds the ${4000}-character limit.`) =>
+    new AppError(ErrorCodes.MESSAGE_TOO_LONG, 400, message),
+  messageEmpty: (message = "Message cannot be empty.") =>
+    new AppError(ErrorCodes.MESSAGE_EMPTY, 400, message),
+  invalidCursor: (message = "Invalid pagination cursor.") =>
+    new AppError(ErrorCodes.INVALID_CURSOR, 400, message),
+  invalidWebSocketMessage: (message = "Invalid WebSocket message.") =>
+    new AppError(ErrorCodes.INVALID_WEBSOCKET_MESSAGE, 400, message),
+
   internal: (message = "An unexpected error occurred.") =>
     new AppError(ErrorCodes.INTERNAL, 500, message),
 };
