@@ -25,6 +25,11 @@ threats that are only partially addressed or out of scope.
    `TRUST_PROXY_HOPS` so `X-Forwarded-For` cannot be spoofed by clients.
 4. **API ↔ external providers** (push, media scan/moderation). Currently TEST/
    DISABLED providers; real providers would introduce an outbound boundary.
+5. **API ↔ Redis** (private, optional; Increment 12). Holds only ephemeral,
+   fingerprinted abuse state — never PII or source-of-truth data. Must be on a
+   private network with auth/TLS (see `docs/REDIS_OPERATIONS.md`). A Redis
+   compromise cannot deanonymise users (keys are HMAC fingerprints) and cannot
+   corrupt core data (that lives only in PostgreSQL).
 
 ## STRIDE summary
 
@@ -62,8 +67,12 @@ threats that are only partially addressed or out of scope.
   reads; `Referrer-Policy: no-referrer` prevents URL leakage.
 
 ### Denial of service
-- Process-local abuse control (`AbuseGuard`) with **bounded memory** (LRU +
-  sweep) on login and write/action surfaces.
+- Abuse control (`AbuseGuard`) on login and write/action surfaces. The in-memory
+  backend is bounded (LRU + sweep); the Redis backend is bounded by per-key TTLs
+  (no application sweep needed) and shares state across instances (Increment 12).
+- Abuse keys are fingerprinted + length-bounded, so an attacker cannot inflate
+  the keyspace or craft oversized keys; `clear()` only ever touches the
+  configured namespace (never `FLUSHALL`).
 - WebSocket per-user connection cap + inbound frame-size limit + event throttle.
 - Media decompression-bomb defence (pixel-count cap + sharp input limits).
 - Request body/URL size limits.
@@ -77,10 +86,12 @@ threats that are only partially addressed or out of scope.
 
 ## Explicitly partial / out-of-scope (honest limitations)
 
-- **Distributed enforcement**: rate limiting / abuse control is **process-local**.
-  With multiple API instances, each enforces its own limits — this is NOT global
-  throttling. A shared backend (e.g. Redis) is required for cluster-wide
-  enforcement; the `AbuseBackend` interface marks the seam. Not implemented.
+- **Distributed enforcement**: rate limiting / abuse control is distributed
+  across instances when `ABUSE_BACKEND=redis` (atomic Redis Lua; enforced
+  cluster-wide, Increment 12). With the default `memory` backend it is
+  **process-local** — each instance enforces its own limits, which is NOT global
+  throttling. WebSocket per-connection event throttles / per-user connection
+  caps remain process-local by design. Metrics remain process-local.
 - **DDoS / volumetric attacks**: must be handled at the edge (CDN/WAF/LB). The
   application-layer limits here are not a substitute.
 - **External push security** (FCM/APNs/WebPush): unimplemented placeholders;

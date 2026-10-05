@@ -877,6 +877,18 @@ SEC_EVENTS=$(json $B/api/admin/security-events -H "Authorization: Bearer $TJADM"
 check "admin lists security events" '"events"' "$SEC_EVENTS"
 if echo "$SEC_EVENTS" | grep -qE '([0-9]{1,3}\.){3}[0-9]{1,3}'; then echo "FAIL: admin security-events leaks raw IP"; FAIL=$((FAIL+1)); else echo "PASS: admin security-events exposes no raw IP"; PASS=$((PASS+1)); fi
 
+# ---- Increment 12: abuse backend diagnostics (admin only) ----
+# This default smoke runs with the process-local (memory) backend. The admin
+# diagnostic must report that honestly and must NEVER expose a Redis URL/creds.
+ABUSE_DIAG=$(json $B/api/admin/abuse-backend -H "Authorization: Bearer $TJADM")
+check "abuse-backend diagnostic requires auth 401" '401' "$(code $B/api/admin/abuse-backend)"
+check "abuse-backend diagnostic forbids normal user 403" '403' "$(code $B/api/admin/abuse-backend -H "Authorization: Bearer $TJA")"
+check "abuse backend reports memory (process-local)" '"backend":"memory"' "$ABUSE_DIAG"
+check "abuse backend reports disabled status (no redis configured)" '"status":"disabled"' "$ABUSE_DIAG"
+if echo "$ABUSE_DIAG" | grep -qiE 'redis://|password|@'; then echo "FAIL: abuse diagnostic leaks connection info"; FAIL=$((FAIL+1)); else echo "PASS: abuse diagnostic exposes no connection info"; PASS=$((PASS+1)); fi
+# Readiness reports the abuse backend sub-check (disabled with memory backend).
+check "readiness includes abuseBackend check" 'abuseBackend' "$(json $B/ready)"
+
 echo "----"
 echo "LIVE SMOKE: $PASS passed, $FAIL failed"
 

@@ -506,7 +506,58 @@ placeholders; TEST/DISABLED only). Distributed presence/realtime remain
 placeholders. Job execution remains at-least-once (no exactly-once external side
 effects). There is no frontend/Android client in this repository.
 
-## ⏳ Increment 12 — Android client (React Native)
+## ✅ Increment 12 — Distributed abuse infrastructure & dependency remediation
+
+Addressing the two limitations called out at the end of Increment 11
+(process-local rate limiting; runtime `file-type`/`sharp` advisories):
+
+- **Distributed abuse backend.** The abuse abstraction gained a second,
+  interchangeable backend behind one async `AbuseBackend` interface:
+  `InMemoryAbuseBackend` (process-local, default) and `RedisAbuseBackend`
+  (distributed), selected by `ABUSE_BACKEND`. Application code depends only on
+  `AbuseGuard`, never on Redis directly. The Redis backend uses an atomic
+  server-side Lua script for sliding-window check-and-increment plus TTL penalty
+  blocks, so limits hold cluster-wide and cannot be raced.
+- **Distributed login brute force.** With Redis, the per-IP and per-account
+  failure limits are enforced across all instances — alternating requests
+  between instances no longer bypasses them.
+- **Key privacy.** Identifiers (IP/email/user id) are HMAC-fingerprinted before
+  becoming keys, so no raw PII is stored in Redis; keys are namespaced +
+  length-bounded; the fingerprint secret and Redis URL are never logged.
+- **Fail policy.** `ABUSE_FAIL_POLICY=closed` (default, production-required)
+  denies security-critical checks and flips `/ready` to 503 when Redis is down —
+  no silent downgrade to process-local. `open` is forbidden in prod+redis.
+  Redis readiness + an admin diagnostic (`GET /api/admin/abuse-backend`) expose
+  only safe status, never connection details. Graceful connect/close wired into
+  server lifecycle; bounded reconnect; connection reuse.
+- **Dependency remediation.** `sharp` 0.33.5→0.35.5 (patched libvips/libheif),
+  `file-type` 16→21.3.4 (ESM-only; loaded via dynamic import on Node 22's
+  `require(esm)`). **`npm audit --omit=dev` → 0 vulnerabilities.** Accepted media
+  formats unchanged (JPEG/PNG/WebP; HEIF/AVIF NOT enabled). Added `ioredis` as
+  the (abstracted) Redis client.
+- **No schema change.** Redis fully owns the ephemeral distributed abuse state;
+  Increment 12 requires no database migration (no `0012`). PostgreSQL remains
+  the sole source of truth; Redis is disposable.
+- **Tests.** +33 net new automated tests (async backend mechanics, real Redis
+  integration incl. a genuine two-OS-process multi-instance proof, distributed
+  login, fail-open/closed, config fail-fast). **Total: 512 passing**, run 3×
+  consecutively in BOTH memory and Redis modes (`verify` / `verify:redis`),
+  no flakes. Live smoke: **255** (memory) + a dedicated **13**-check distributed
+  Redis smoke (`scripts/smoke-redis.sh`), each 3× clean. Production Docker image
+  rebuilt + validated (non-root, prod-deps-only, boots, file-type/sharp/ioredis
+  load, graceful SIGTERM, fail-closed readiness when Redis is down).
+
+**Honest limitations:** rate limiting is distributed ONLY when
+`ABUSE_BACKEND=redis` is configured; the default remains process-local (and is
+documented as such). WebSocket per-connection event throttles and per-user
+connection caps are intentionally process-local (avoiding a Redis round-trip per
+high-frequency ephemeral event). External push (FCM/APNs/WebPush) and
+distributed presence/realtime remain unimplemented placeholders; job execution
+is at-least-once. There is still no frontend/Android client in this repository.
+Dev-only `npm audit` advisories (vitest/esbuild toolchain) remain but are not
+shipped in the production image.
+
+## ⏳ Increment 13 — Android client (React Native)
 
 Onboarding/age gate, the five sections, consent + gameplay UI, push, offline UX.
 Full load testing, OpenAPI/WS schema docs, and an Android release build remain

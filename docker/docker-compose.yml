@@ -1,9 +1,13 @@
-# Development PostgreSQL for the Luvora platform.
+# Development dependencies for the Luvora platform (PostgreSQL + optional Redis).
 # Usage (from repo root): `docker compose -f docker/docker-compose.yml up -d`
 #
-# In a build sandbox without a Docker daemon, an ephemeral native PostgreSQL is
-# used for verification instead (see apps/backend/scripts/verify.ts and
-# `npm run verify`). The connection string format is identical either way.
+# This is DEVELOPMENT ONLY. In a build sandbox without a Docker daemon, an
+# ephemeral native PostgreSQL (and, for the distributed abuse tests, an ephemeral
+# native Redis) is used instead — see apps/backend/scripts/verify.ts
+# (`npm run verify` / `npm run verify:redis`). Connection strings are identical.
+#
+# PRODUCTION does NOT require Redis unless ABUSE_BACKEND=redis is configured; the
+# default backend is process-local memory. See docs/REDIS_OPERATIONS.md.
 services:
   db:
     image: postgres:16-alpine
@@ -18,6 +22,22 @@ services:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U app -d luvora_dev"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Optional development Redis for the distributed abuse backend
+  # (ABUSE_BACKEND=redis, REDIS_URL=redis://localhost:6379). Not required for the
+  # default (memory) backend. No persistence is configured — abuse counters are
+  # intentionally ephemeral (see docs/REDIS_OPERATIONS.md).
+  redis:
+    image: redis:7-alpine
+    container_name: luvora_redis
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 10

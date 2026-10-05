@@ -1,8 +1,34 @@
 import sharp from "sharp";
 import crypto from "node:crypto";
-import FileType from "file-type";
+
+// sharp 0.35 ships dual ESM/CJS type definitions behind an `exports` map. Under
+// the project's classic module resolution, the value import above resolves fine
+// but the `sharp.X` namespace types do not; alias the type namespace explicitly.
+type SharpMetadata = import("sharp").Metadata;
+type SharpInstance = import("sharp").Sharp;
 import { ALLOWED_IMAGE_MIME_TYPES, type AllowedImageMimeType } from "@luvora/shared";
 import { config } from "../config";
+
+/**
+ * `file-type` v17+ is published as an ESM-only package (fixing the ASF-parser
+ * advisory GHSA-5v7r-6r5c-r473 present in <21.3.1). This backend is CommonJS,
+ * so we load it with a dynamic `import()` and cache the resolved module. On the
+ * Node 22 runtime (used by the production Docker image) this resolves cleanly
+ * via the built-in `require(esm)` support. We only ever use `fileTypeFromBuffer`
+ * — magic-byte sniffing of an in-memory buffer; no filesystem/stream APIs.
+ */
+type FileTypeModule = {
+  fileTypeFromBuffer: (
+    data: Uint8Array | ArrayBuffer,
+  ) => Promise<{ ext: string; mime: string } | undefined>;
+};
+let fileTypeModulePromise: Promise<FileTypeModule> | null = null;
+function loadFileType(): Promise<FileTypeModule> {
+  if (!fileTypeModulePromise) {
+    fileTypeModulePromise = import("file-type") as unknown as Promise<FileTypeModule>;
+  }
+  return fileTypeModulePromise;
+}
 
 /**
  * Server-side image inspection, validation, normalization, and thumbnailing.
@@ -58,13 +84,14 @@ function formatToMime(format: string | undefined): AllowedImageMimeType | null {
  */
 async function detectImageMime(data: Buffer): Promise<AllowedImageMimeType | null> {
   // 1) Magic-byte sniff (independent of any header/extension).
-  const sniff = await FileType.fromBuffer(data);
+  const { fileTypeFromBuffer } = await loadFileType();
+  const sniff = await fileTypeFromBuffer(data);
   const sniffMime = sniff?.mime;
   if (!sniffMime || !ALLOWED_IMAGE_MIME_TYPES.includes(sniffMime as AllowedImageMimeType)) {
     return null;
   }
   // 2) sharp must independently decode it to the same family.
-  let meta: sharp.Metadata;
+  let meta: SharpMetadata;
   try {
     meta = await sharp(data, { limitInputPixels: pixelLimit(), failOn: "error" }).metadata();
   } catch {
@@ -83,7 +110,7 @@ export async function inspectImage(data: Buffer): Promise<InspectedImage | null>
   const detectedMime = await detectImageMime(data);
   if (!detectedMime) return null;
 
-  let meta: sharp.Metadata;
+  let meta: SharpMetadata;
   try {
     meta = await sharp(data, { limitInputPixels: pixelLimit(), failOn: "error" }).metadata();
   } catch {
@@ -125,7 +152,7 @@ export async function processImage(input: {
         withoutEnlargement: true,
       });
 
-  const encode = (pipeline: sharp.Sharp): sharp.Sharp => {
+  const encode = (pipeline: SharpInstance): SharpInstance => {
     switch (inspected.detectedMime) {
       case "image/jpeg":
         return pipeline.jpeg({ quality: 85 });

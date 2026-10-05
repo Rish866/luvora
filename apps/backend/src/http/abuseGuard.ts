@@ -1,224 +1,255 @@
+import crypto from "node:crypto";
 import { config } from "../config";
+import { metrics } from "../observability/metrics";
+import { log } from "../observability/logger";
+import {
+  type AbuseBackend,
+  type AbuseDecision,
+  type AbuseRule,
+  InMemoryAbuseBackend,
+} from "./abuseBackend";
+
+export type { AbuseBackend, AbuseDecision, AbuseRule } from "./abuseBackend";
+export { InMemoryAbuseBackend } from "./abuseBackend";
 
 /**
- * Process-local abuse / rate-limit control (Increment 11).
+ * AbuseGuard — the application-facing API over a pluggable AbuseBackend
+ * (Increment 11 → distributed in Increment 12).
  *
- * A single reusable primitive behind every abuse-sensitive surface (login,
- * reports, device registration, discovery interactions, WebSocket events, ...).
- * Scattered endpoint-specific logic now funnels through this.
+ * Responsibilities (security semantics live HERE, not in the backend):
+ *  - rules / limits / scopes / key construction
+ *  - FINGERPRINTING raw identifiers (IP / email / user id) with an HMAC so no
+ *    raw PII ever reaches the backend keyspace (critical for Redis)
+ *  - retry-after shaping + the `ABUSE_GUARD_ENABLED` master switch
+ *  - metrics + sanitized logging
+ *  - the fail-open / fail-closed policy when a distributed backend errors
  *
- * Design:
- *  - Sliding-window counting keyed by an opaque SCOPE:KEY string. Callers choose
- *    the key dimension(s) — e.g. IP, account id, or a composite — so an attacker
- *    cannot bypass protection by rotating a single dimension (callers check more
- *    than one key where appropriate).
- *  - BOUNDED memory: at most `maxKeys` entries; when full, the oldest-touched
- *    entries are evicted (approximate LRU). Expired entries are also swept
- *    periodically. There is no unbounded Map.
- *  - Deterministic + injectable clock for tests.
+ * The backend owns only counters/windows/TTL/atomicity/distribution.
  *
- * LIMITATION (documented, not hidden): this is PROCESS-LOCAL. With multiple API
- * instances each process enforces its own limits — it is NOT a global/
- * distributed limiter. A distributed backend (e.g. Redis) would be required for
- * cluster-wide enforcement; the `AbuseBackend` shape below marks where that
- * plugs in. Only the in-memory backend is implemented.
+ * DISTRIBUTION: with the memory backend this is process-local (NOT globally
+ * enforced). With the redis backend, state is shared across all instances and
+ * check-and-increment is atomic, so limits hold cluster-wide. The configured
+ * fail policy governs behaviour if Redis is unavailable.
  */
 
-export interface AbuseDecision {
-  /** True when the request/attempt is allowed. */
-  allowed: boolean;
-  /** Remaining attempts in the current window (>= 0). */
-  remaining: number;
-  /** Seconds until the window resets / the caller may retry. */
-  retryAfterSeconds: number;
-  /** Current count within the window (for diagnostics/tests). */
-  count: number;
-}
+const DECISION_ALLOWED = (rule: AbuseRule): AbuseDecision => ({
+  allowed: true,
+  remaining: rule.limit,
+  retryAfterSeconds: 0,
+  count: 0,
+});
 
-export interface AbuseRule {
-  /** Max events permitted within `windowMs`. */
-  limit: number;
-  windowMs: number;
-}
-
-interface Entry {
-  /** Timestamps (ms) of events within the current window. */
-  hits: number[];
-  /** Last touch (ms) — used for LRU eviction. */
-  touched: number;
-  /** Explicit block-until (ms) for penalty-style throttling (0 = none). */
-  blockedUntil: number;
-}
-
-/** Pluggable backend seam. Only InMemoryAbuseBackend is implemented; a
- *  distributed (Redis) backend would implement the same surface. */
-export interface AbuseBackend {
-  check(key: string, rule: AbuseRule, now: number): AbuseDecision;
-  /** Non-counting probe: is `key` under an active penalty block right now? */
-  blockedFor(key: string, now: number): number;
-  /** Record a penalty block for `key` lasting `seconds` from `now`. */
-  block(key: string, seconds: number, now: number): void;
-  /** Clear all state for a key (e.g. reset login failures on success). */
-  reset(key: string): void;
-  size(): number;
-  clear(): void;
-}
-
-export class InMemoryAbuseBackend implements AbuseBackend {
-  private readonly map = new Map<string, Entry>();
-  private lastSweep = 0;
-
-  constructor(private readonly maxKeys: number) {}
-
-  private sweep(now: number): void {
-    // Sweep at most ~once/sec to bound overhead.
-    if (now - this.lastSweep < 1000) return;
-    this.lastSweep = now;
-    // Remove entries with no recent hits and no active block. We cap work by
-    // iterating lazily; the hard LRU cap below is the real memory bound.
-    for (const [k, e] of this.map) {
-      const recent = e.hits.length > 0 ? e.hits[e.hits.length - 1] : e.touched;
-      if (now - recent > 3_600_000 && e.blockedUntil <= now) {
-        this.map.delete(k);
-      }
-    }
-  }
-
-  private evictIfNeeded(): void {
-    if (this.map.size < this.maxKeys) return;
-    // Approximate LRU: evict the oldest-touched ~1% of entries.
-    const toEvict = Math.max(1, Math.floor(this.maxKeys * 0.01));
-    const entries = [...this.map.entries()].sort((a, b) => a[1].touched - b[1].touched);
-    for (let i = 0; i < toEvict && i < entries.length; i++) {
-      this.map.delete(entries[i][0]);
-    }
-  }
-
-  check(key: string, rule: AbuseRule, now: number): AbuseDecision {
-    this.sweep(now);
-    let e = this.map.get(key);
-    if (!e) {
-      this.evictIfNeeded();
-      e = { hits: [], touched: now, blockedUntil: 0 };
-      this.map.set(key, e);
-    }
-    e.touched = now;
-
-    // Active penalty block takes precedence.
-    if (e.blockedUntil > now) {
-      return {
-        allowed: false,
-        remaining: 0,
-        retryAfterSeconds: Math.ceil((e.blockedUntil - now) / 1000),
-        count: e.hits.length,
-      };
-    }
-
-    // Drop hits outside the window.
-    const windowStart = now - rule.windowMs;
-    e.hits = e.hits.filter((t) => t > windowStart);
-
-    if (e.hits.length >= rule.limit) {
-      const oldest = e.hits[0];
-      const retryAfterMs = Math.max(0, oldest + rule.windowMs - now);
-      return {
-        allowed: false,
-        remaining: 0,
-        retryAfterSeconds: Math.max(1, Math.ceil(retryAfterMs / 1000)),
-        count: e.hits.length,
-      };
-    }
-
-    e.hits.push(now);
-    return {
-      allowed: true,
-      remaining: Math.max(0, rule.limit - e.hits.length),
-      retryAfterSeconds: 0,
-      count: e.hits.length,
-    };
-  }
-
-  blockedFor(key: string, now: number): number {
-    const e = this.map.get(key);
-    if (!e || e.blockedUntil <= now) return 0;
-    return Math.ceil((e.blockedUntil - now) / 1000);
-  }
-
-  block(key: string, seconds: number, now: number): void {
-    let e = this.map.get(key);
-    if (!e) {
-      this.evictIfNeeded();
-      e = { hits: [], touched: now, blockedUntil: 0 };
-      this.map.set(key, e);
-    }
-    e.touched = now;
-    e.blockedUntil = Math.max(e.blockedUntil, now + seconds * 1000);
-  }
-
-  reset(key: string): void {
-    this.map.delete(key);
-  }
-
-  size(): number {
-    return this.map.size;
-  }
-
-  clear(): void {
-    this.map.clear();
-    this.lastSweep = 0;
-  }
-}
-
-/**
- * The AbuseGuard — the application-facing API over a backend. Honours the global
- * `ABUSE_GUARD_ENABLED` switch (independent of the legacy express-rate-limit
- * `rateLimitEnabled`, so tests can exercise throttling under NODE_ENV=test).
- */
 export class AbuseGuard {
+  private readonly fingerprintKey: Buffer;
+  private backend: AbuseBackend;
+
   constructor(
-    private readonly backend: AbuseBackend,
+    backend: AbuseBackend,
     private readonly enabled: boolean,
+    private readonly failPolicy: "open" | "closed",
+    fingerprintSecret: string,
     private readonly clock: () => number = () => Date.now(),
-  ) {}
+  ) {
+    this.backend = backend;
+    this.fingerprintKey = Buffer.from(fingerprintSecret || "luvora-abuse", "utf8");
+  }
 
-  /** Count one event against `scope:key` and decide. When disabled, always
-   *  allows (but still returns a well-formed decision). */
-  hit(scope: string, key: string, rule: AbuseRule): AbuseDecision {
-    if (!this.enabled) {
-      return { allowed: true, remaining: rule.limit, retryAfterSeconds: 0, count: 0 };
+  /** Swap the underlying backend in place (startup wiring installs Redis after
+   *  the connection is ready). All existing holders of this singleton see the
+   *  change — the identity of the guard never changes. */
+  setBackend(backend: AbuseBackend): void {
+    this.backend = backend;
+  }
+
+  /** Which backend is active (for diagnostics/readiness). */
+  get backendKind(): string {
+    return this.backend.kind;
+  }
+
+  /**
+   * HMAC-fingerprint a raw identifier so it is safe to use inside a backend key
+   * (never a raw IP/email/user id). Deterministic + non-reversible. Returns a
+   * short hex digest. An empty/unknown identifier yields a stable "none" token
+   * so callers still produce a well-formed key.
+   */
+  fingerprint(identifier: string | undefined | null): string {
+    if (!identifier || identifier === "unknown") return "none";
+    return crypto
+      .createHmac("sha256", this.fingerprintKey)
+      .update(identifier)
+      .digest("hex")
+      .slice(0, 20);
+  }
+
+  /** Compose the opaque backend key. `scope` is a fixed, bounded label; `fp` is
+   *  already a fingerprint. No raw PII, no secrets. */
+  private composeKey(scope: string, fp: string): string {
+    return `${scope}:${fp}`;
+  }
+
+  private recordOp(op: string): void {
+    try {
+      metrics.incr("abuse_backend_requests_total", { backend: this.backend.kind, op });
+    } catch {
+      /* best-effort */
     }
-    return this.backend.check(`${scope}:${key}`, rule, this.clock());
   }
 
-  /** Non-counting probe: seconds remaining on an active penalty block for
-   *  `scope:key` (0 = not blocked). */
-  blockedFor(scope: string, key: string): number {
+  /** Handle a backend error according to the fail policy. For a COUNTING check,
+   *  fail-closed denies (deny-list a request rather than silently stop
+   *  protecting); fail-open allows. Always records metrics + a sanitized log. */
+  private onBackendError(op: string, err: unknown): void {
+    try {
+      metrics.incr("abuse_backend_errors_total", { backend: this.backend.kind, op });
+      metrics.incr("abuse_backend_fallbacks_total", { policy: this.failPolicy });
+    } catch {
+      /* best-effort */
+    }
+    log.warn(
+      {
+        component: "abuse-guard",
+        backend: this.backend.kind,
+        op,
+        policy: this.failPolicy,
+        errorName: (err as Error)?.name ?? "AbuseBackendError",
+      },
+      "abuse backend unavailable; applying fail policy",
+    );
+  }
+
+  private observeLatency(ms: number): void {
+    if (this.backend.kind !== "redis") return;
+    try {
+      metrics.observe("abuse_redis_latency_ms", ms);
+    } catch {
+      /* best-effort */
+    }
+  }
+
+  /**
+   * Count one event against `scope`+`identifier` and decide. The identifier is
+   * fingerprinted before it reaches the backend. When disabled, always allows.
+   * On backend error, applies the fail policy (closed => deny, open => allow).
+   */
+  async hit(scope: string, identifier: string, rule: AbuseRule): Promise<AbuseDecision> {
+    if (!this.enabled) return DECISION_ALLOWED(rule);
+    const key = this.composeKey(scope, this.fingerprint(identifier));
+    const started = Date.now();
+    try {
+      this.recordOp("check");
+      const decision = await this.backend.check(key, rule, this.clock());
+      this.observeLatency(Date.now() - started);
+      if (!decision.allowed && this.backend.kind === "redis") {
+        try {
+          metrics.incr("abuse_redis_rejections_total", { scope });
+        } catch {
+          /* best-effort */
+        }
+      }
+      return decision;
+    } catch (err) {
+      this.observeLatency(Date.now() - started);
+      this.onBackendError("check", err);
+      if (this.failPolicy === "closed") {
+        // Deny: a security control that cannot verify must not wave traffic
+        // through. Give a short, finite retry-after.
+        return { allowed: false, remaining: 0, retryAfterSeconds: 5, count: 0 };
+      }
+      return DECISION_ALLOWED(rule);
+    }
+  }
+
+  /** Pre-fingerprinted variant for callers that already fingerprinted (avoids
+   *  double-hashing). Used by the brute-force module which keys by both IP and
+   *  account and wants matching fingerprints across hit/block/reset. */
+  async hitFingerprinted(scope: string, fp: string, rule: AbuseRule): Promise<AbuseDecision> {
+    if (!this.enabled) return DECISION_ALLOWED(rule);
+    const key = this.composeKey(scope, fp);
+    const started = Date.now();
+    try {
+      this.recordOp("check");
+      const decision = await this.backend.check(key, rule, this.clock());
+      this.observeLatency(Date.now() - started);
+      return decision;
+    } catch (err) {
+      this.observeLatency(Date.now() - started);
+      this.onBackendError("check", err);
+      if (this.failPolicy === "closed") {
+        return { allowed: false, remaining: 0, retryAfterSeconds: 5, count: 0 };
+      }
+      return DECISION_ALLOWED(rule);
+    }
+  }
+
+  /**
+   * Non-counting probe: seconds remaining on an active penalty block for
+   * `scope`+fingerprint (0 = not blocked). On backend error this returns 0 (a
+   * probe cannot by itself deny — the subsequent counting `hit` applies the
+   * fail policy), so a Redis blip never permanently locks a user out.
+   */
+  async blockedForFingerprinted(scope: string, fp: string): Promise<number> {
     if (!this.enabled) return 0;
-    return this.backend.blockedFor(`${scope}:${key}`, this.clock());
+    try {
+      this.recordOp("blockedFor");
+      return await this.backend.blockedFor(this.composeKey(scope, fp), this.clock());
+    } catch (err) {
+      this.onBackendError("blockedFor", err);
+      return 0;
+    }
   }
 
-  /** Apply an explicit penalty block to `scope:key`. */
-  block(scope: string, key: string, seconds: number): void {
+  /** Apply an explicit penalty block to `scope`+fingerprint. */
+  async blockFingerprinted(scope: string, fp: string, seconds: number): Promise<void> {
     if (!this.enabled) return;
-    this.backend.block(`${scope}:${key}`, seconds, this.clock());
+    try {
+      this.recordOp("block");
+      await this.backend.block(this.composeKey(scope, fp), seconds, this.clock());
+    } catch (err) {
+      this.onBackendError("block", err);
+    }
   }
 
-  /** Clear state for `scope:key` (e.g. after a successful login). */
-  reset(scope: string, key: string): void {
-    this.backend.reset(`${scope}:${key}`);
+  /** Clear state for `scope`+fingerprint (e.g. after a successful login). */
+  async resetFingerprinted(scope: string, fp: string): Promise<void> {
+    try {
+      this.recordOp("reset");
+      await this.backend.reset(this.composeKey(scope, fp));
+    } catch (err) {
+      this.onBackendError("reset", err);
+    }
   }
 
-  size(): number {
-    return this.backend.size();
+  async size(): Promise<number> {
+    try {
+      return await this.backend.size();
+    } catch {
+      return 0;
+    }
   }
 
-  clear(): void {
-    this.backend.clear();
+  async clear(): Promise<void> {
+    try {
+      await this.backend.clear();
+    } catch {
+      /* best-effort (test isolation helper) */
+    }
   }
 }
 
-/** Shared process-wide abuse guard. */
+/** Build the backend selected by config. Only the memory backend is
+ *  constructed eagerly; the Redis backend is wired lazily in wireRedisBackend()
+ *  (called from server startup) so processes that don't use Redis never connect. */
+function buildDefaultBackend(): AbuseBackend {
+  return new InMemoryAbuseBackend(config.security.abuseGuardMaxKeys);
+}
+
+/** Shared process-wide abuse guard. Starts on the in-memory backend; if
+ *  ABUSE_BACKEND=redis, server startup swaps in the Redis backend via
+ *  abuseGuard.setBackend() after the connection is initialised. Everyone imports
+ *  this one stable instance, so the backend swap is seen everywhere. */
 export const abuseGuard = new AbuseGuard(
-  new InMemoryAbuseBackend(config.security.abuseGuardMaxKeys),
+  buildDefaultBackend(),
   config.security.abuseGuardEnabled,
+  config.security.abuse.failPolicy,
+  config.security.abuse.fingerprintSecret,
 );

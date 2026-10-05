@@ -1,154 +1,217 @@
 import { describe, it, expect } from "vitest";
-import {
-  AbuseGuard,
-  InMemoryAbuseBackend,
-  type AbuseRule,
-} from "../src/http/abuseGuard";
+import { AbuseGuard } from "../src/http/abuseGuard";
+import { InMemoryAbuseBackend, type AbuseRule } from "../src/http/abuseBackend";
 
 /**
- * Pure unit tests for the AbuseGuard primitive (Increment 11). These use an
- * INJECTED clock so sliding-window / penalty-block behaviour is deterministic
- * and never depends on wall-clock timing (no flaky sleeps).
+ * Pure unit tests for the AbuseBackend mechanics and the AbuseGuard wrapper
+ * (Increment 11 → async in Increment 12). An INJECTED clock makes sliding-window
+ * / penalty-block behaviour deterministic (no flaky sleeps). The backend
+ * interface is async; the in-memory implementation resolves immediately.
  */
-
-function makeGuard(opts: { maxKeys?: number; enabled?: boolean; now?: () => number } = {}) {
-  const backend = new InMemoryAbuseBackend(opts.maxKeys ?? 1000);
-  const guard = new AbuseGuard(backend, opts.enabled ?? true, opts.now ?? (() => 0));
-  return { backend, guard };
-}
 
 const rule: AbuseRule = { limit: 3, windowMs: 10_000 };
 
-describe("AbuseGuard: sliding-window counting", () => {
-  it("allows up to the limit, then throttles", () => {
-    const { guard } = makeGuard();
-    expect(guard.hit("s", "k", rule).allowed).toBe(true);
-    expect(guard.hit("s", "k", rule).allowed).toBe(true);
-    expect(guard.hit("s", "k", rule).allowed).toBe(true);
-    const d = guard.hit("s", "k", rule);
+function backend(maxKeys = 1000) {
+  return new InMemoryAbuseBackend(maxKeys);
+}
+
+describe("InMemoryAbuseBackend: sliding-window counting", () => {
+  it("allows up to the limit, then throttles", async () => {
+    const b = backend();
+    expect((await b.check("k", rule, 0)).allowed).toBe(true);
+    expect((await b.check("k", rule, 0)).allowed).toBe(true);
+    expect((await b.check("k", rule, 0)).allowed).toBe(true);
+    const d = await b.check("k", rule, 0);
     expect(d.allowed).toBe(false);
     expect(d.remaining).toBe(0);
     expect(d.retryAfterSeconds).toBeGreaterThan(0);
   });
 
-  it("reports decreasing remaining as the window fills", () => {
-    const { guard } = makeGuard();
-    expect(guard.hit("s", "k", rule).remaining).toBe(2);
-    expect(guard.hit("s", "k", rule).remaining).toBe(1);
-    expect(guard.hit("s", "k", rule).remaining).toBe(0);
+  it("reports decreasing remaining as the window fills", async () => {
+    const b = backend();
+    expect((await b.check("k", rule, 0)).remaining).toBe(2);
+    expect((await b.check("k", rule, 0)).remaining).toBe(1);
+    expect((await b.check("k", rule, 0)).remaining).toBe(0);
   });
 
-  it("recovers once the window slides past old hits", () => {
-    let t = 0;
-    const { guard } = makeGuard({ now: () => t });
-    expect(guard.hit("s", "k", rule).allowed).toBe(true); // t=0
-    expect(guard.hit("s", "k", rule).allowed).toBe(true);
-    expect(guard.hit("s", "k", rule).allowed).toBe(true);
-    expect(guard.hit("s", "k", rule).allowed).toBe(false); // over limit
-    t = 10_001; // all three original hits are now outside the window
-    expect(guard.hit("s", "k", rule).allowed).toBe(true);
+  it("recovers once the window slides past old hits", async () => {
+    const b = backend();
+    expect((await b.check("k", rule, 0)).allowed).toBe(true);
+    expect((await b.check("k", rule, 0)).allowed).toBe(true);
+    expect((await b.check("k", rule, 0)).allowed).toBe(true);
+    expect((await b.check("k", rule, 0)).allowed).toBe(false);
+    // All three original hits are now outside the window.
+    expect((await b.check("k", rule, 10_001)).allowed).toBe(true);
   });
 
-  it("keeps independent counters per scope and per key", () => {
-    const { guard } = makeGuard();
-    for (let i = 0; i < 3; i++) guard.hit("a", "k", rule);
-    // Different scope, same key: unaffected.
-    expect(guard.hit("b", "k", rule).allowed).toBe(true);
-    // Same scope, different key: unaffected.
-    expect(guard.hit("a", "other", rule).allowed).toBe(true);
-    // Same scope+key: throttled.
-    expect(guard.hit("a", "k", rule).allowed).toBe(false);
+  it("keeps independent counters per key", async () => {
+    const b = backend();
+    for (let i = 0; i < 3; i++) await b.check("a", rule, 0);
+    expect((await b.check("other", rule, 0)).allowed).toBe(true);
+    expect((await b.check("a", rule, 0)).allowed).toBe(false);
   });
 
-  it("computes retryAfterSeconds from the oldest hit in the window", () => {
-    let t = 0;
-    const { guard } = makeGuard({ now: () => t });
-    guard.hit("s", "k", rule); // oldest at t=0
-    t = 2_000;
-    guard.hit("s", "k", rule);
-    t = 4_000;
-    guard.hit("s", "k", rule);
-    t = 5_000;
-    const d = guard.hit("s", "k", rule);
+  it("computes retryAfterSeconds from the oldest hit in the window", async () => {
+    const b = backend();
+    await b.check("k", rule, 0); // oldest at t=0
+    await b.check("k", rule, 2_000);
+    await b.check("k", rule, 4_000);
+    const d = await b.check("k", rule, 5_000);
     expect(d.allowed).toBe(false);
     // oldest(0) + window(10000) - now(5000) = 5000ms => 5s
     expect(d.retryAfterSeconds).toBe(5);
   });
 });
 
-describe("AbuseGuard: penalty blocks", () => {
-  it("block() denies via a non-counting probe and expires", () => {
-    let t = 0;
-    const { guard } = makeGuard({ now: () => t });
-    expect(guard.blockedFor("s", "k")).toBe(0);
-    guard.block("s", "k", 300);
-    expect(guard.blockedFor("s", "k")).toBe(300);
-    t = 299_000;
-    expect(guard.blockedFor("s", "k")).toBe(1);
-    t = 300_001;
-    expect(guard.blockedFor("s", "k")).toBe(0);
+describe("InMemoryAbuseBackend: penalty blocks", () => {
+  it("block() denies via a non-counting probe and expires", async () => {
+    const b = backend();
+    expect(await b.blockedFor("k", 0)).toBe(0);
+    await b.block("k", 300, 0);
+    expect(await b.blockedFor("k", 0)).toBe(300);
+    expect(await b.blockedFor("k", 299_000)).toBe(1);
+    expect(await b.blockedFor("k", 300_001)).toBe(0);
   });
 
-  it("blockedFor() does NOT consume window budget", () => {
-    const { guard } = makeGuard();
-    for (let i = 0; i < 50; i++) expect(guard.blockedFor("s", "k")).toBe(0);
-    // After 50 probes, a real hit should still be allowed (probes didn't count).
-    expect(guard.hit("s", "k", rule).allowed).toBe(true);
+  it("blockedFor() does NOT consume window budget", async () => {
+    const b = backend();
+    for (let i = 0; i < 50; i++) expect(await b.blockedFor("k", 0)).toBe(0);
+    expect((await b.check("k", rule, 0)).allowed).toBe(true);
   });
 
-  it("an active block takes precedence over window counting", () => {
-    let t = 0;
-    const { guard } = makeGuard({ now: () => t });
-    guard.block("s", "k", 60);
-    const d = guard.hit("s", "k", rule);
+  it("an active block takes precedence over window counting", async () => {
+    const b = backend();
+    await b.block("k", 60, 0);
+    const d = await b.check("k", rule, 0);
     expect(d.allowed).toBe(false);
     expect(d.retryAfterSeconds).toBe(60);
   });
 
-  it("block() extends but never shortens an existing block", () => {
-    let t = 0;
-    const { guard } = makeGuard({ now: () => t });
-    guard.block("s", "k", 300);
-    guard.block("s", "k", 10); // shorter — must not reduce
-    expect(guard.blockedFor("s", "k")).toBe(300);
+  it("block() extends but never shortens an existing block", async () => {
+    const b = backend();
+    await b.block("k", 300, 0);
+    await b.block("k", 10, 0); // shorter — must not reduce
+    expect(await b.blockedFor("k", 0)).toBe(300);
   });
 
-  it("reset() clears both counts and blocks for a key", () => {
-    const { guard } = makeGuard();
-    guard.hit("s", "k", rule);
-    guard.hit("s", "k", rule);
-    guard.block("s", "k", 300);
-    guard.reset("s", "k");
-    expect(guard.blockedFor("s", "k")).toBe(0);
-    expect(guard.hit("s", "k", rule).allowed).toBe(true);
-  });
-});
-
-describe("AbuseGuard: disabled mode", () => {
-  it("always allows and never blocks when disabled", () => {
-    const { guard } = makeGuard({ enabled: false });
-    for (let i = 0; i < 100; i++) {
-      expect(guard.hit("s", "k", rule).allowed).toBe(true);
-    }
-    guard.block("s", "k", 300);
-    expect(guard.blockedFor("s", "k")).toBe(0);
+  it("reset() clears both counts and blocks for a key", async () => {
+    const b = backend();
+    await b.check("k", rule, 0);
+    await b.check("k", rule, 0);
+    await b.block("k", 300, 0);
+    await b.reset("k");
+    expect(await b.blockedFor("k", 0)).toBe(0);
+    expect((await b.check("k", rule, 0)).allowed).toBe(true);
   });
 });
 
 describe("InMemoryAbuseBackend: bounded memory", () => {
-  it("never exceeds the configured max key count (LRU eviction)", () => {
-    const { guard, backend } = makeGuard({ maxKeys: 100 });
-    for (let i = 0; i < 1000; i++) {
-      guard.hit("s", `key-${i}`, rule);
-    }
-    expect(backend.size()).toBeLessThanOrEqual(100);
+  it("never exceeds the configured max key count (LRU eviction)", async () => {
+    const b = backend(100);
+    for (let i = 0; i < 1000; i++) await b.check(`key-${i}`, rule, 0);
+    expect(await b.size()).toBeLessThanOrEqual(100);
   });
 
-  it("clear() drops all state", () => {
-    const { guard, backend } = makeGuard();
-    for (let i = 0; i < 10; i++) guard.hit("s", `k${i}`, rule);
-    expect(backend.size()).toBeGreaterThan(0);
-    guard.clear();
-    expect(backend.size()).toBe(0);
+  it("clear() drops all state", async () => {
+    const b = backend();
+    for (let i = 0; i < 10; i++) await b.check(`k${i}`, rule, 0);
+    expect(await b.size()).toBeGreaterThan(0);
+    await b.clear();
+    expect(await b.size()).toBe(0);
+  });
+});
+
+describe("AbuseGuard: wrapper behaviour", () => {
+  function guard(opts: { enabled?: boolean; failPolicy?: "open" | "closed" } = {}) {
+    return new AbuseGuard(
+      backend(),
+      opts.enabled ?? true,
+      opts.failPolicy ?? "closed",
+      "unit-test-fingerprint-secret",
+    );
+  }
+
+  it("exposes the active backend kind", () => {
+    expect(guard().backendKind).toBe("memory");
+  });
+
+  it("fingerprints identifiers (never echoes the raw value)", () => {
+    const g = guard();
+    const fp = g.fingerprint("203.0.113.9");
+    expect(fp).toMatch(/^[0-9a-f]{20}$/);
+    expect(fp).not.toContain("203.0.113.9");
+    // Deterministic + distinct per input.
+    expect(g.fingerprint("203.0.113.9")).toBe(fp);
+    expect(g.fingerprint("203.0.113.10")).not.toBe(fp);
+    // Empty / unknown collapse to a stable sentinel.
+    expect(g.fingerprint(undefined)).toBe("none");
+    expect(g.fingerprint("unknown")).toBe("none");
+  });
+
+  it("enforces the limit through hit() keyed by identifier", async () => {
+    const g = guard();
+    for (let i = 0; i < 3; i++) {
+      expect((await g.hit("scope", "1.2.3.4", rule)).allowed).toBe(true);
+    }
+    expect((await g.hit("scope", "1.2.3.4", rule)).allowed).toBe(false);
+    // A different identifier is unaffected (independent fingerprint).
+    expect((await g.hit("scope", "9.9.9.9", rule)).allowed).toBe(true);
+  });
+
+  it("always allows when disabled", async () => {
+    const g = guard({ enabled: false });
+    for (let i = 0; i < 100; i++) {
+      expect((await g.hit("s", "k", rule)).allowed).toBe(true);
+    }
+  });
+
+  it("fails CLOSED (deny) when the backend throws under the closed policy", async () => {
+    const throwing = {
+      kind: "redis",
+      check: async () => {
+        throw new Error("backend down");
+      },
+      blockedFor: async () => 0,
+      block: async () => {},
+      reset: async () => {},
+      size: async () => 0,
+      clear: async () => {},
+    };
+    const g = new AbuseGuard(throwing, true, "closed", "s");
+    const d = await g.hit("s", "k", rule);
+    expect(d.allowed).toBe(false);
+    expect(d.retryAfterSeconds).toBeGreaterThan(0);
+  });
+
+  it("fails OPEN (allow) when the backend throws under the open policy", async () => {
+    const throwing = {
+      kind: "redis",
+      check: async () => {
+        throw new Error("backend down");
+      },
+      blockedFor: async () => 0,
+      block: async () => {},
+      reset: async () => {},
+      size: async () => 0,
+      clear: async () => {},
+    };
+    const g = new AbuseGuard(throwing, true, "open", "s");
+    expect((await g.hit("s", "k", rule)).allowed).toBe(true);
+  });
+
+  it("a probe (blockedFor) returns 0 on backend error — never a permanent lockout", async () => {
+    const throwing = {
+      kind: "redis",
+      check: async () => ({ allowed: true, remaining: 1, retryAfterSeconds: 0, count: 0 }),
+      blockedFor: async () => {
+        throw new Error("backend down");
+      },
+      block: async () => {},
+      reset: async () => {},
+      size: async () => 0,
+      clear: async () => {},
+    };
+    const g = new AbuseGuard(throwing, true, "closed", "s");
+    expect(await g.blockedForFingerprinted("s", "fp")).toBe(0);
   });
 });

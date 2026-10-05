@@ -24,6 +24,7 @@ import {
   listOperationalEvents,
 } from "../observability/operationalEvents";
 import { listSecurityEvents } from "../security/securityEvents";
+import { abuseBackendDiagnostics } from "../observability/health";
 import {
   JobStatus,
   JobType,
@@ -586,6 +587,21 @@ adminRouter.get(
       before,
     });
     ok(res, { events, nextCursor: nextCursor ? encodeCursor(nextCursor) : null });
+  }),
+);
+
+// ======================= ABUSE BACKEND DIAGNOSTICS (admin only) ===============
+//
+// Safe operational view of the distributed abuse backend (Increment 12):
+// which backend is active ("memory" | "redis"), its health status, and the
+// configured fail policy. NEVER exposes the Redis URL, credentials, host, or
+// any key — only bounded status strings.
+adminRouter.get(
+  "/abuse-backend",
+  requireAdmin,
+  asyncHandler(async (_req, res) => {
+    const diag = await abuseBackendDiagnostics();
+    ok(res, diag);
   }),
 );
 

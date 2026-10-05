@@ -30,8 +30,13 @@ fail-fast at boot; the rest are operational responsibilities.
 - [ ] `ABUSE_GUARD_ENABLED=true`; `ABUSE_GUARD_MAX_KEYS` sized for your traffic.
 - [ ] Legacy limiter budgets (`RATE_LIMIT_MAX`, `AUTH_RATE_LIMIT_MAX`,
       `DEVICE_RATE_LIMIT_MAX`) set to production values.
-- [ ] Understood: these are **process-local** — add a shared backend (e.g.
-      Redis) if you need cluster-wide enforcement.
+- [ ] **Multi-instance?** Set `ABUSE_BACKEND=redis` with `REDIS_URL`,
+      `ABUSE_FAIL_POLICY=closed`, and a strong `ABUSE_FINGERPRINT_SECRET` — the
+      default `memory` backend is process-local and does NOT enforce limits (or
+      login brute-force protection) across instances. See
+      `docs/REDIS_OPERATIONS.md`.
+- [ ] Redis (if used) is on a private network with auth/TLS, never public;
+      `/ready` returns 503 (fail-closed) when Redis is unavailable.
 
 ## Request / WebSocket / media limits
 - [ ] `JSON_BODY_LIMIT_BYTES` and `MAX_URL_LENGTH` set appropriately.
@@ -64,19 +69,19 @@ fail-fast at boot; the rest are operational responsibilities.
 - [ ] Image runs as the non-root `node` user (built-in).
 - [ ] Only production dependencies in the runtime image (built-in).
 - [ ] `npm audit` reviewed. The production image (`--omit=dev`) carries two
-      runtime advisories in the media pipeline: **sharp** (libvips/libheif CVEs)
-      and **file-type** (ASF-parser infinite loop). Both fixes exist only in
-      breaking major upgrades (`sharp@0.35`, `file-type@22`); we are on the
-      latest within the current majors (`sharp@0.33.5`, `file-type@16.5.4`). The
-      vulnerable HEIF/ASF code paths are **not reachable** with Luvora's strict
-      allowlist (only JPEG/PNG/WebP, dual magic-byte + sharp agreement) plus the
-      pixel-count cap and `failOn: "error"`. Treat the major upgrades as a
-      planned, separately-tested follow-up — do NOT run `npm audit fix --force`
-      as part of this pass. The other audit findings (`@vitest/mocker`,
-      `esbuild`, `braces`) are **dev-only** and are not shipped in the image.
+      **`npm audit --omit=dev` → 0 vulnerabilities** (Increment 12 upgraded
+      `sharp` 0.33.5→0.35.5 and `file-type` 16→21.3.4, remediating the former
+      media-pipeline advisories). The remaining `npm audit` findings
+      (`vitest`/`esbuild`/`vite`/`ts-node-dev`) are **dev-only** and are not
+      shipped in the production image (`npm ci --omit=dev`). Still do NOT run
+      `npm audit fix --force` (it would force-bump dev tooling to breaking
+      majors). Accepted media formats remain JPEG/PNG/WebP only — the sharp
+      upgrade did NOT enable HEIF/AVIF.
 
 ## Known limitations (acknowledge, don't paper over)
-- [ ] Process-local rate limiting / metrics (no distributed enforcement).
+- [ ] Rate limiting is distributed ONLY when `ABUSE_BACKEND=redis`; the default
+      is process-local. Metrics remain process-local. WebSocket event/connection
+      limits are process-local by design.
 - [ ] External push (FCM/APNs/WebPush) are unimplemented placeholders.
 - [ ] Distributed presence/realtime are placeholders; jobs are at-least-once.
 - [ ] No frontend/Android client in this repository.

@@ -7,8 +7,15 @@ import { attachChatGateway } from "./chat/chatGateway";
 import { attachGameGateway } from "./fantasy/gameGateway";
 import { startWorkerProcess } from "./jobs/workerMain";
 import { setActiveWorker } from "./jobs/workerRegistry";
+import { initAbuseBackend } from "./http/abuseInit";
+import { closeRedis } from "./http/redisClient";
 
 const app = createApp();
+
+// Initialise the distributed abuse backend (Increment 12). For ABUSE_BACKEND=
+// redis this connects and installs the Redis backend; for memory it is a no-op.
+// Fire-and-forget: startup proceeds and readiness reflects Redis health.
+void initAbuseBackend();
 
 const server = app.listen(config.port, () => {
   logger.info({ port: config.port, env: config.nodeEnv }, "server listening");
@@ -44,6 +51,8 @@ async function shutdown(signal: string): Promise<void> {
     setActiveWorker(null);
   }
   server.close(async () => {
+    // Drain the abuse Redis connection (if any) alongside the PG pool.
+    await closeRedis();
     await closePool();
     process.exit(0);
   });
