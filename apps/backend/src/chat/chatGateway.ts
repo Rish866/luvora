@@ -88,6 +88,7 @@ async function handleEvent(
           conversationId: event.conversationId,
           body: event.body,
           clientMessageId: event.clientMessageId ?? null,
+          attachmentIds: event.attachmentIds,
         });
         // Persisted first, THEN broadcast to both participants' sockets.
         hub.broadcastToUsers([context.userId, context.partnerId], {

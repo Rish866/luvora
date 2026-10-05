@@ -10,6 +10,8 @@
 /** Server-side maximum message size, in Unicode code points. */
 export const MESSAGE_MAX_LENGTH = 4000;
 
+import type { AttachmentView } from "./media";
+
 /** A persisted chat message as exposed to clients (safe fields only). */
 export interface ChatMessage {
   id: string;
@@ -19,6 +21,8 @@ export interface ChatMessage {
   /** Echo of the client idempotency key, if one was supplied. */
   clientMessageId: string | null;
   createdAt: string;
+  /** Safe attachment DTOs (Increment 5). Empty when the message has none. */
+  attachments: AttachmentView[];
 }
 
 // ---------------------------------------------------------------------------
@@ -28,9 +32,12 @@ export interface ChatMessage {
 export interface MessageSendEvent {
   type: "message.send";
   conversationId: string;
-  body: string;
+  /** Optional when attachments are present. */
+  body?: string;
   /** Optional idempotency key (UUID). Never becomes the authoritative id. */
   clientMessageId?: string;
+  /** Optional attachment media ids owned by the sender (Increment 5). */
+  attachmentIds?: string[];
 }
 
 export interface MessageReadEvent {

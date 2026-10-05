@@ -16,8 +16,9 @@ non-graphic and non-explicit.
 
 This repository contains **Increment 1 (backend foundation)**,
 **Increment 2 (discovery & matching)**, **Increment 3 (private chat +
-WebSockets)**, and **Increment 4 (data-driven fantasy engine)**. All are
-working, tested slices (not mocked screens).
+WebSockets)**, **Increment 4 (data-driven fantasy engine)**, and
+**Increment 5 (secure media, attachments & moderation)**. All are working,
+tested slices (not mocked screens).
 
 **Increment 1 — foundation:**
 - ✅ Auth: register / login / refresh / logout / logout-all / `me`
@@ -71,9 +72,22 @@ working, tested slices (not mocked screens).
       `game.state.changed`/`game.completed`; persist-then-broadcast; reconnect-safe
 - ✅ ~5 seeded non-graphic demo scenarios (branching, consent-gated, multiple endings)
 
-- ✅ **140 passing tests** (27 + 45 + 36 + 32) against a real PostgreSQL, including
-      branching/endings, consent gating, idempotency + concurrency races, choice
-      tampering, and IDOR; plus real `/ws/chat` and `/ws/game` WebSocket flows.
+**Increment 5 — secure media, attachments & moderation:**
+- ✅ Provider-independent storage (`MediaStorage` + `LocalMediaStorage`; S3/R2 future)
+- ✅ Two-step upload (`POST /api/media` → `PUT /api/media/:id/content`) with a real
+      pipeline: magic-byte + `sharp` detection, declared-vs-detected MIME check,
+      dimension/decompression-bomb limits, SHA-256, **EXIF/GPS strip**, thumbnail
+- ✅ Media + moderation **state machines** (server-controlled); malware & content-
+      safety **abstractions** with deterministic dev stubs (NOT production protection)
+- ✅ Chat **attachments** (`attachmentIds` on REST + `/ws/chat`), validated + linked
+      **transactionally**, safe DTOs in history & broadcasts; attachment-only messages
+- ✅ Centralized media **authorization** reusing the chat policy — a block immediately
+      revokes recipient media access (no bypass); private delivery headers
+- ✅ Report (controlled reasons, reporter never exposed), owner soft-delete, orphan cleanup
+
+- ✅ **188 passing tests** (140 prior + 48 new) against a real PostgreSQL, including
+      MIME-spoof/malware/moderation/IDOR/block/transaction tests and real
+      `/ws/chat` + `/ws/game` WebSocket flows.
 
 See [`docs/INCREMENTS.md`](docs/INCREMENTS.md) for the roadmap and what is
 **intentionally deferred** to later increments.
@@ -221,11 +235,15 @@ See [`docs/SECURITY.md`](docs/SECURITY.md) for details and known gaps.
 
 ## What is implemented vs. deferred
 
-**Implemented (Increment 1):** auth, 18+ age gate, core DB schema, consent +
-session state machine, security/validation middleware, tests.
+**Implemented (Increments 1–5, backend):** auth + 18+ age gate; consent + session
+state machine; discovery/matching/blocking; private chat (REST + `/ws/chat`);
+the data-driven fantasy engine + scenario library + gameplay (`/ws/game`); and
+secure media uploads, chat attachments, and the moderation/safety pipeline.
 
-**Intentionally deferred** (later increments): discovery/swipe UI, private chat,
-WebSocket gameplay sync, the data-driven scenario authoring system and scenario
-library, media sharing + moderation pipeline, push notifications, the admin
-dashboard, recommendations, payments, and production infrastructure. See
+**Intentionally deferred** (later increments): production media providers
+(S3/R2 storage, real malware scanner, real content-safety moderation — the
+interfaces exist, only local/test adapters ship); fantasy-session user media;
+multi-instance WebSocket scaling (process-local today); push notifications; the
+admin dashboard + RBAC + audit logging; recommendations; payments; production
+infrastructure; and all frontend/Android UI. See
 [`docs/INCREMENTS.md`](docs/INCREMENTS.md).

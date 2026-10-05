@@ -48,12 +48,13 @@ chatRouter.post(
   sendLimiter,
   asyncHandler(async (req, res) => {
     const { matchId } = matchIdParamSchema.parse(req.params);
-    const { body, clientMessageId } = chat.sendBodySchema.parse(req.body);
+    const { body, clientMessageId, attachmentIds } = chat.sendBodySchema.parse(req.body);
     const { message, context } = await chat.createMessage({
       authenticatedUserId: req.userId!,
       matchId,
       body,
       clientMessageId: clientMessageId ?? null,
+      attachmentIds,
     });
     // Deliver in real time to any connected sockets of both participants.
     hub.broadcastToUsers([context.userId, context.partnerId], {

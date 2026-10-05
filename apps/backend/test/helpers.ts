@@ -5,7 +5,8 @@ import { pool } from "../src/db/pool";
 /** Truncate all data tables between tests for isolation. */
 export async function resetDb(): Promise<void> {
   await pool.query(`
-    TRUNCATE consent_responses, fantasy_players, fantasy_sessions,
+    TRUNCATE media_reports, message_attachments, media_assets,
+             consent_responses, fantasy_players, fantasy_sessions,
              blocks, matches, likes, photos, profiles,
              devices, auth_sessions, users
     RESTART IDENTITY CASCADE;
@@ -86,6 +87,74 @@ export async function insertDecision(
      ON CONFLICT (liker_id, likee_id) DO UPDATE SET is_pass = EXCLUDED.is_pass`,
     [likerId, likeeId, isPass],
   );
+}
+
+// ---- Media test fixtures (Increment 5) ----
+// Real images generated with sharp (not downloaded). Keep tiny.
+import sharp from "sharp";
+
+/** A small valid JPEG, optionally with EXIF (orientation + marker). */
+export async function makeJpeg(
+  width = 32,
+  height = 24,
+  opts: { withExif?: boolean; markerText?: string } = {},
+): Promise<Buffer> {
+  let pipe = sharp({
+    create: { width, height, channels: 3, background: { r: 120, g: 80, b: 200 } },
+  });
+  if (opts.withExif) {
+    pipe = pipe.withMetadata({ orientation: 6 });
+  }
+  let buf = await pipe.jpeg().toBuffer();
+  // Append a harmless trailing marker (after EOI) used by the deterministic
+  // test scanner/moderation stubs. sharp/file-type still decode the image.
+  if (opts.markerText) {
+    buf = Buffer.concat([buf, Buffer.from(opts.markerText, "latin1")]);
+  }
+  return buf;
+}
+
+export async function makePng(width = 16, height = 16): Promise<Buffer> {
+  return sharp({
+    create: { width, height, channels: 4, background: { r: 1, g: 2, b: 3, alpha: 1 } },
+  })
+    .png()
+    .toBuffer();
+}
+
+export async function makeWebp(width = 20, height = 20): Promise<Buffer> {
+  return sharp({
+    create: { width, height, channels: 3, background: { r: 9, g: 9, b: 9 } },
+  })
+    .webp()
+    .toBuffer();
+}
+
+/**
+ * Full upload helper: create intent + PUT bytes via the real API. Returns the
+ * media id and the final asset view.
+ */
+export async function uploadImage(
+  app: Express,
+  u: RegisteredUser,
+  data: Buffer,
+  mimeType = "image/jpeg",
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+): Promise<{ mediaId: string; body: any; status: number }> {
+  const intent = await request(app)
+    .post("/api/media")
+    .set(...auth(u.accessToken))
+    .send({ filename: "x.jpg", mimeType, sizeBytes: data.length, context: "chat" });
+  if (intent.status !== 201) {
+    throw new Error(`intent failed: ${intent.status} ${JSON.stringify(intent.body)}`);
+  }
+  const mediaId = intent.body.data.mediaId;
+  const put = await request(app)
+    .put(`/api/media/${mediaId}/content`)
+    .set(...auth(u.accessToken))
+    .set("Content-Type", "application/octet-stream")
+    .send(data);
+  return { mediaId, body: put.body, status: put.status };
 }
 
 /**

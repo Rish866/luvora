@@ -6,6 +6,8 @@ import {
   registerUser,
   createMatch,
   insertBlock,
+  uploadImage,
+  makeJpeg,
   type RegisteredUser,
 } from "./helpers";
 import {
@@ -357,6 +359,83 @@ describe("websocket: block enforcement", () => {
     const err = nextMessage(wsB, (m) => m.type === "error");
     send(wsB, { type: "message.send", conversationId: convId, body: "nope" });
     expect((await err).code).toBe("CHAT_NOT_AUTHORIZED");
+    await closeSocket(wsB);
+  });
+});
+
+describe("websocket: attachments (Increment 5)", () => {
+  it("message.send with attachment delivers a safe attachment DTO to the recipient", async () => {
+    const { a, b, matchId } = await matchedPair();
+    const convId = await conversationFor(matchId);
+    const { mediaId } = await uploadImage(srv.app, a, await makeJpeg(), "image/jpeg");
+
+    const wsA = await openSocket(srv.port, a.accessToken);
+    const wsB = await openSocket(srv.port, b.accessToken);
+    await nextMessage(wsA, (m) => m.type === "connection.ready");
+    await nextMessage(wsB, (m) => m.type === "connection.ready");
+
+    const recvB = nextMessage(wsB, (m) => m.type === "message.created");
+    send(wsA, {
+      type: "message.send",
+      conversationId: convId,
+      body: "photo",
+      attachmentIds: [mediaId],
+    });
+    const evt = await recvB;
+    const msg = evt.message as Record<string, unknown>;
+    const atts = msg.attachments as Array<Record<string, unknown>>;
+    expect(atts).toHaveLength(1);
+    expect(atts[0].id).toBe(mediaId);
+    expect(atts[0].url).toBe(`/api/media/${mediaId}/content`);
+    expect(msg.senderId).toBe(a.userId); // authenticated identity
+    // No storage internals in the WS payload.
+    expect(JSON.stringify(evt)).not.toContain("storage_key");
+    await closeSocket(wsA);
+    await closeSocket(wsB);
+  });
+
+  it("sender cannot attach another user's media over WS", async () => {
+    const { a, b, matchId } = await matchedPair();
+    const convId = await conversationFor(matchId);
+    const { mediaId } = await uploadImage(srv.app, b, await makeJpeg(), "image/jpeg"); // owned by B
+
+    const wsA = await openSocket(srv.port, a.accessToken);
+    await nextMessage(wsA, (m) => m.type === "connection.ready");
+    const err = nextMessage(wsA, (m) => m.type === "error");
+    send(wsA, {
+      type: "message.send",
+      conversationId: convId,
+      body: "steal",
+      attachmentIds: [mediaId],
+    });
+    expect((await err).code).toBe("MEDIA_NOT_AUTHORIZED");
+    // Nothing persisted.
+    const { rows } = await pool.query(`SELECT count(*)::int AS n FROM messages`);
+    expect(rows[0].n).toBe(0);
+    await closeSocket(wsA);
+  });
+
+  it("duplicate clientMessageId with attachments stays idempotent over WS", async () => {
+    const { a, b, matchId } = await matchedPair();
+    const convId = await conversationFor(matchId);
+    const { mediaId } = await uploadImage(srv.app, a, await makeJpeg(), "image/jpeg");
+    const wsA = await openSocket(srv.port, a.accessToken);
+    const wsB = await openSocket(srv.port, b.accessToken);
+    await nextMessage(wsA, (m) => m.type === "connection.ready");
+    await nextMessage(wsB, (m) => m.type === "connection.ready");
+
+    const cmid = "44444444-4444-4444-8444-444444444444";
+    const r1 = nextMessage(wsB, (m) => m.type === "message.created");
+    send(wsA, { type: "message.send", conversationId: convId, body: "p", attachmentIds: [mediaId], clientMessageId: cmid });
+    await r1;
+    const r2 = nextMessage(wsB, (m) => m.type === "message.created");
+    send(wsA, { type: "message.send", conversationId: convId, body: "p", attachmentIds: [mediaId], clientMessageId: cmid });
+    await r2;
+    const msgs = await pool.query(`SELECT count(*)::int AS n FROM messages`);
+    expect(msgs.rows[0].n).toBe(1);
+    const atts = await pool.query(`SELECT count(*)::int AS n FROM message_attachments`);
+    expect(atts.rows[0].n).toBe(1);
+    await closeSocket(wsA);
     await closeSocket(wsB);
   });
 });

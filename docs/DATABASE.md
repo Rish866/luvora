@@ -122,6 +122,28 @@ partial `scenario_versions_published`, `scenario_nodes_version`,
 scenarios (linear, branching, consent-gated, multiple endings) idempotently
 (keyed on slug + version). It is invoked by `seed` and runnable standalone.
 
+## Migration 0005 — secure media & attachments (Increment 5)
+
+`0005_media.sql` adds media infrastructure (normalized relations; no JSON blobs
+in `messages`) and drops the Increment 3 body-non-empty check so attachment-only
+messages are allowed.
+
+| Table | Purpose / notable constraints |
+|-------|-------------------------------|
+| `media_assets` | Server-controlled metadata. `status ∈ {UPLOADING,UPLOADED,PROCESSING,READY,QUARANTINED,REJECTED,DELETED}`; `moderation_status ∈ {PENDING,APPROVED,REJECTED,NEEDS_REVIEW}` (independent); opaque `storage_key`/`thumbnail_storage_key`; `detected_mime_type`, `byte_size`, `sha256`, `width`, `height` all server-derived; `context ∈ {chat,session,profile}`; soft-delete via `deleted_at`. |
+| `message_attachments` | Normalized link: FK `message_id` → messages `ON DELETE CASCADE`, `media_id` → media_assets `ON DELETE RESTRICT`; `UNIQUE(message_id, media_id)` prevents duplicate links. |
+| `media_reports` | FK media/reporter; `reason`/`status` CHECK enums; `UNIQUE(media_id, reporter_id)` throttles duplicate reports. |
+
+Indexes: `media_assets_owner` (partial, non-deleted), `media_assets_status`,
+`media_assets_uploading_created` (partial — supports orphan cleanup),
+`message_attachments_message`, `message_attachments_media`, `media_reports_media`.
+
+Deletion safety: `message_attachments.media_id` is `ON DELETE RESTRICT`, so a
+media asset referenced by a historical message cannot be hard-deleted out from
+under it; media deletion is a soft delete (`status=DELETED`). Orphaned
+`UPLOADING` assets are removed by `cleanupAbandonedUploads()` (a plain function a
+scheduler can call; no cron required).
+
 ## Resetting a dev/test database
 
 Migrations are forward-only; to reset, drop and recreate the database, then

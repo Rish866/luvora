@@ -2,9 +2,12 @@ import { z } from "zod";
 import {
   MESSAGE_MAX_LENGTH,
   type ChatMessage,
+  type AttachmentView,
 } from "@luvora/shared";
 import { Errors } from "../http/errors";
 import * as chatRepo from "./chatRepository";
+import * as mediaRepo from "../media/mediaRepository";
+import { toAttachmentView } from "../media/mediaService";
 import {
   authorizeByConversation,
   authorizeByMatch,
@@ -33,11 +36,16 @@ export const historyQuerySchema = z.object({
 });
 
 export const sendBodySchema = z.object({
-  body: z.string(),
+  // Body is optional when the message carries attachments.
+  body: z.string().optional().default(""),
   clientMessageId: z.string().uuid().optional(),
+  attachmentIds: z.array(z.string().uuid()).optional(),
 });
 
-function toChatMessage(row: chatRepo.MessageRow): ChatMessage {
+function toChatMessage(
+  row: chatRepo.MessageRow,
+  attachments: AttachmentView[] = [],
+): ChatMessage {
   return {
     id: row.id,
     conversationId: row.conversation_id,
@@ -45,19 +53,23 @@ function toChatMessage(row: chatRepo.MessageRow): ChatMessage {
     body: row.body,
     clientMessageId: row.client_message_id,
     createdAt: row.created_at,
+    attachments,
   };
 }
 
 /**
- * Validate a message body: reject empty / whitespace-only, enforce the max
- * length in Unicode code points. Returns the normalized body (trimmed of outer
- * whitespace but preserving inner content and Unicode).
+ * Validate a message body. A message must have EITHER non-empty text OR at
+ * least one attachment. When text is present it is trimmed and length-checked
+ * (Unicode code points). Returns the normalized body (may be "" if attachments
+ * carry the message).
  */
-export function validateBody(raw: unknown): string {
-  if (typeof raw !== "string") throw Errors.messageEmpty();
-  const trimmed = raw.trim();
-  if (trimmed.length === 0) throw Errors.messageEmpty();
-  // Count Unicode code points (not UTF-16 units) so emoji count as expected.
+export function validateBody(raw: unknown, hasAttachments = false): string {
+  const str = typeof raw === "string" ? raw : "";
+  const trimmed = str.trim();
+  if (trimmed.length === 0) {
+    if (hasAttachments) return ""; // attachment-only message is allowed
+    throw Errors.messageEmpty();
+  }
   const codePoints = [...trimmed].length;
   if (codePoints > MESSAGE_MAX_LENGTH) throw Errors.messageTooLong();
   return trimmed;
@@ -70,6 +82,7 @@ export interface CreateMessageInput {
   conversationId?: string;
   body: unknown;
   clientMessageId?: string | null;
+  attachmentIds?: string[];
 }
 
 export interface CreateMessageResult {
@@ -77,10 +90,18 @@ export interface CreateMessageResult {
   context: ChatContext;
 }
 
+/** Serialize the attachments for a single message id (safe DTOs, in order). */
+async function loadAttachmentViews(messageId: string): Promise<AttachmentView[]> {
+  const rows = await mediaRepo.listAttachmentsForMessages([messageId]);
+  return rows.map(toAttachmentView);
+}
+
 /**
  * The single authoritative message-creation path. Authorizes, validates,
- * persists, and returns the canonical message. The sender id is ALWAYS the
- * authenticated user — any client-supplied sender id is ignored.
+ * persists (message + attachments transactionally), and returns the canonical
+ * message. The sender id is ALWAYS the authenticated user — any client-supplied
+ * sender/owner id is ignored. Attachment ownership, READY+APPROVED state, and
+ * limits are enforced inside the same transaction.
  */
 export async function createMessage(
   input: CreateMessageInput,
@@ -92,16 +113,19 @@ export async function createMessage(
         input.conversationId!,
       );
 
-  const body = validateBody(input.body);
+  const attachmentIds = input.attachmentIds ?? [];
+  const body = validateBody(input.body, attachmentIds.length > 0);
 
-  const row = await chatRepo.insertMessage({
+  const row = await chatRepo.insertMessageWithAttachments({
     conversationId: context.conversationId,
     senderId: input.authenticatedUserId, // authoritative identity
     body,
     clientMessageId: input.clientMessageId ?? null,
+    attachmentIds,
   });
 
-  return { message: toChatMessage(row), context };
+  const attachments = await loadAttachmentViews(row.id);
+  return { message: toChatMessage(row, attachments), context };
 }
 
 export interface HistoryResult {
@@ -147,8 +171,18 @@ export async function getHistoryByMatch(input: {
         })
       : null;
 
-  // Present oldest→newest.
-  const messages = [...rowsDesc].reverse().map(toChatMessage);
+  // Present oldest→newest. Batch-load attachments for the whole page (no N+1).
+  const ordered = [...rowsDesc].reverse();
+  const attachmentRows = await mediaRepo.listAttachmentsForMessages(
+    ordered.map((m) => m.id),
+  );
+  const byMessage = new Map<string, AttachmentView[]>();
+  for (const r of attachmentRows) {
+    const list = byMessage.get(r.message_id) ?? [];
+    list.push(toAttachmentView(r));
+    byMessage.set(r.message_id, list);
+  }
+  const messages = ordered.map((m) => toChatMessage(m, byMessage.get(m.id) ?? []));
   return { messages, nextCursor, conversationId: context.conversationId };
 }
 

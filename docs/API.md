@@ -457,3 +457,94 @@ Server → client:
 (persist-then-broadcast); the resulting state is delivered to **both**
 participants' sockets only. `game.subscribe` returns authoritative DB state, so a
 reconnecting client recovers without replaying missed events.
+
+---
+
+## Secure media & attachments (Increment 5)
+
+Images only (`image/jpeg`, `image/png`, `image/webp`). Every upload is inspected
+server-side (magic bytes + decode), normalized (EXIF/GPS stripped), scanned, and
+moderated before it can become `READY`+`APPROVED`. Storage keys are opaque and
+never exposed; clients receive authenticated application URLs.
+
+New error codes: `MEDIA_NOT_FOUND` (404), `MEDIA_NOT_AUTHORIZED` (403),
+`MEDIA_INVALID_STATE` (409), `MEDIA_TYPE_NOT_ALLOWED` (400), `MEDIA_TOO_LARGE`
+(413), `MEDIA_INVALID_CONTENT` (400), `MEDIA_MIME_MISMATCH` (400),
+`MEDIA_NOT_READY` (409), `MEDIA_REJECTED` (409), `TOO_MANY_ATTACHMENTS` (400),
+`ATTACHMENTS_TOO_LARGE` (413).
+
+### Upload lifecycle (two-step) — *auth required*
+
+#### `POST /api/media` — create upload intent
+```jsonc
+// request
+{ "filename": "photo.jpg", "mimeType": "image/jpeg", "sizeBytes": 123456, "context": "chat" }
+// 201
+{ "success": true, "data": {
+  "mediaId": "UUID", "status": "UPLOADING",
+  "uploadUrl": "/api/media/UUID/content", "maxBytes": 10485760 } }
+```
+Validates the *declared* type/size cheaply and generates an opaque storage key.
+`400 MEDIA_TYPE_NOT_ALLOWED`, `413 MEDIA_TOO_LARGE`.
+
+#### `PUT /api/media/:mediaId/content` — upload bytes (raw binary)
+Owner-only, asset must be `UPLOADING`. Runs the full pipeline (see below).
+Returns the `MediaAssetView` with `status: READY`, `moderationStatus: APPROVED`
+on success. Failure modes: `403 MEDIA_NOT_AUTHORIZED`, `409 MEDIA_INVALID_STATE`,
+`400 MEDIA_INVALID_CONTENT` (not a decodable image), `400 MEDIA_MIME_MISMATCH`
+(declared ≠ detected), `413 MEDIA_TOO_LARGE`, `409 MEDIA_REJECTED` (malware /
+moderation / quarantine).
+
+### Access & management — *auth + authorization required*
+
+- `GET /api/media/:mediaId` — JSON `MediaAssetView` (owner sees moderation
+  progress; others only via an authorized conversation). No storage key / sha256
+  / filename exposed.
+- `GET /api/media/:mediaId/content` — normalized image bytes. Headers:
+  `Content-Type`, `Content-Length`, `Cache-Control: private, no-store`,
+  `X-Content-Type-Options: nosniff`. Only `READY` assets stream; others `409`.
+- `GET /api/media/:mediaId/thumbnail` — thumbnail bytes (same auth).
+- `DELETE /api/media/:mediaId` — owner-only soft delete; subsequent downloads
+  `404`.
+- `POST /api/media/:mediaId/report` — body `{ "reason": "CSAM|NONCONSENSUAL|VIOLENCE|HARASSMENT|SPAM|OTHER" }`.
+  Reporter must be able to see the media; duplicate reports are throttled; a
+  sensitive report quarantines the asset for review. Reporter identity is never
+  exposed.
+
+**Authorization.** `GET /api/media/:id` is NOT public. Access = the owner, OR a
+participant of a conversation the asset is attached to **where the chat policy
+currently permits** (ACTIVE match, no block either direction). Guessing a UUID
+grants nothing; a block immediately revokes a recipient's media access.
+
+### Pipeline (what the server does on upload)
+```
+ownership + state → size guard → magic-byte + decode detection →
+declared-vs-detected MIME agreement → dimension / decompression-bomb limits →
+SHA-256(original) → malware scan → normalize + strip EXIF/GPS + thumbnail →
+content moderation → persist derived metadata + resolved statuses → store bytes
+```
+Only `APPROVED` ⇒ `READY`. `REJECTED` ⇒ `REJECTED`. `NEEDS_REVIEW` / scanner
+`UNKNOWN` (quarantine policy) ⇒ `QUARANTINED` (not usable). The **normalized**
+image is stored and served — never the raw original.
+
+### Chat attachments
+`POST /api/matches/:matchId/messages` now accepts:
+```jsonc
+{ "body": "optional text", "clientMessageId": "optional-uuid",
+  "attachmentIds": ["media-uuid", ...] }
+```
+A message needs text OR ≥1 attachment. Each attachment must be owned by the
+sender, `READY`+`APPROVED`, not deleted, within count/size limits. Message +
+attachment rows are committed in ONE transaction (no partial state); duplicate
+`clientMessageId` stays idempotent (no duplicate attachment rows). The response
+and history include safe `attachments` DTOs:
+```jsonc
+{ "id": "media-uuid", "mimeType": "image/jpeg", "byteSize": 12345,
+  "width": 1200, "height": 900, "url": "/api/media/.../content",
+  "thumbnailUrl": "/api/media/.../thumbnail" }
+```
+
+### WebSocket (`/ws/chat`)
+`message.send` accepts an optional `attachmentIds` array; the server validates
+them (same rules) and includes safe `attachments` DTOs in the broadcast
+`message.created` event. `/ws/chat` and `/ws/game` are unchanged otherwise.

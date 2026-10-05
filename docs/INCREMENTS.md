@@ -110,10 +110,38 @@ before the next is added. Below is the plan and current status.
   idempotency, concurrency, and IDOR. **Total: 140 passing** against real
   PostgreSQL. Live smoke: 75/75 (incl. a real `/ws/game` two-socket flow).
 
-## ⏳ Increment 5 — Media + moderation
+## ✅ Increment 5 — Secure media, attachments & moderation (DONE)
 
-Private object storage, signed URLs, upload pipeline, moderation state machine
-+ pluggable provider (mock adapter until credentials supplied).
+- **Provider-independent storage** (`MediaStorage` interface + `LocalMediaStorage`;
+  S3/R2 adapters are a future drop-in). No cloud credentials in dev/test.
+- **Two-step upload** (`POST /api/media` intent → `PUT /api/media/:id/content`)
+  with a real pipeline: magic-byte + `sharp` decode detection, declared-vs-
+  detected MIME agreement, dimension/decompression-bomb limits, SHA-256,
+  malware scan, **EXIF/GPS-stripping normalization**, thumbnail generation,
+  content moderation. Only `READY`+`APPROVED` becomes usable.
+- **Media + moderation state machines** (`UPLOADING…READY/QUARANTINED/REJECTED/
+  DELETED`; `PENDING/APPROVED/REJECTED/NEEDS_REVIEW`), server-controlled.
+- **Scanner & moderation abstractions** (`MediaScanner`,
+  `MediaModerationProvider`) with deterministic DEV stubs clearly documented as
+  NOT production protection; INFECTED⇒quarantine, UNKNOWN⇒configurable.
+- **Chat attachments**: `attachmentIds` on message send (REST + `/ws/chat`),
+  validated + linked transactionally, safe `attachments` DTOs in history and the
+  `message.created` broadcast. Attachment-only messages allowed.
+- **Centralized media authorization** reusing the chat policy — owner or a
+  participant of an attached conversation with an ACTIVE, non-blocked match. A
+  block immediately revokes recipient media access (no bypass).
+- **Report** endpoint (controlled reasons, duplicate-throttled, reporter never
+  exposed, sensitive reports quarantine). **Delete** = owner-only soft delete.
+  **Orphan cleanup** function for abandoned uploads (scheduler-callable).
+- Migration `0005_media.sql` (`media_assets`, `message_attachments`,
+  `media_reports`). Private delivery headers (`no-store`, `nosniff`).
+- 48 new tests (media upload/privacy/malware/moderation/IDOR/delete/report/
+  cleanup + chat attachments + WS attachments). **Total: 188 passing** against
+  real PostgreSQL. Live smoke: 85/85 (incl. a real end-to-end media flow:
+  upload → attach → WS receive → authorized download → IDOR → block).
+
+**Deferred:** production S3/R2 + ClamAV + content-safety adapters (interfaces
+exist); fantasy-session user media (no gameplay attachment point yet).
 
 ## ⏳ Increment 6 — Admin & safety
 

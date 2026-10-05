@@ -105,12 +105,56 @@
   malformed WS frames and unknown event types return structured errors without
   crashing. All SQL parameterized; dynamic fragments are `$N` placeholders only.
 
+## Media security (Increment 5)
+- **Never trust the client:** declared MIME, filename, extension, Content-Length,
+  and dimensions are all ignored for decisions. The server detects the real type
+  via magic bytes (`file-type`) AND an independent `sharp` decode that must agree
+  (defeats MIME/extension spoofing and polyglots), computes dimensions + SHA-256,
+  and bounds pixels (decompression-bomb guard).
+- **Privacy:** images are re-encoded (normalized); EXIF/GPS/XMP/ICC metadata is
+  dropped (verified by a test that asserts the served output has no EXIF). The
+  normalized image is stored/served — never the raw original. DTOs never expose
+  storage keys, sha256, filenames, or detected-vs-declared internals.
+- **Opaque storage + no path traversal:** storage keys are random
+  (`media/<uuid>/original`), never derived from filenames; the local provider
+  validates keys and refuses anything escaping its base dir.
+- **Server-authoritative state:** clients cannot set `status`/`moderation_status`
+  /dimensions. Only `READY`+`APPROVED` assets are usable; `REJECTED` and
+  `QUARANTINED` (NEEDS_REVIEW / scanner UNKNOWN) are never downloadable or
+  attachable.
+- **Malware + moderation are real extension points** (`MediaScanner`,
+  `MediaModerationProvider`). The bundled `TestMediaScanner` /
+  `TestMediaModerationProvider` are deterministic DEV stubs and are **not** real
+  protection — production wires ClamAV / a content-safety service without
+  touching business logic. INFECTED ⇒ quarantine/reject; UNKNOWN ⇒ configurable
+  (defaults to quarantine).
+- **Authorization / IDOR:** `GET /api/media/:id` is authenticated and
+  authorized; access = owner OR a participant of an attached conversation whose
+  chat policy currently permits it. There is **no media path that bypasses chat
+  blocking** — a block immediately revokes a recipient's media access (tested).
+- **Transaction safety:** message + attachment rows commit atomically; a failed
+  attachment validation rolls back the whole message (no partial state); WS
+  broadcast only after commit; duplicate `clientMessageId` stays idempotent.
+- **Delivery headers:** `Cache-Control: private, no-store`,
+  `X-Content-Type-Options: nosniff`, `Content-Disposition: inline`; SVG/HTML are
+  not allowed, so no inline-script rendering risk.
+- **Abuse limits:** upload-intent / content / report endpoints are rate-limited;
+  bytes are bounded by the raw-body limit (no unbounded buffering); attachments
+  per message and total bytes are capped. All media SQL is parameterized.
+
 ## Known gaps (planned for later increments)
 - Email/phone verification flow (fields exist; sending not wired).
 - Multi-instance WebSocket presence/delivery (process-local today; needs shared
   pub/sub such as Redis — deferred to the hardening increment).
 - Scenario authoring/admin tooling (the data model + versioning support it; the
   admin API/RBAC arrives in a later increment).
-- Media signed-URL authorization + moderation pipeline.
+- **Production media providers:** real S3/R2 storage adapters, a real malware
+  scanner (ClamAV/cloud), and a real content-safety moderation provider — the
+  interfaces exist; only local/test implementations ship today. Signed-URL
+  issuance is stubbed in the local provider (the app serves bytes through its own
+  authenticated endpoint).
+- **Fantasy-session user media** was intentionally deferred: the infrastructure
+  is context-aware (`context='session'`), but the Increment 4 gameplay model has
+  no user-generated media attachment point yet, so none was forced in.
 - Admin RBAC + audit logging.
 - Full automated security test matrix and load testing.

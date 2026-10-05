@@ -10,8 +10,9 @@ import { z } from "zod";
 const messageSend = z.object({
   type: z.literal("message.send"),
   conversationId: z.string().uuid(),
-  body: z.string(),
+  body: z.string().optional(),
   clientMessageId: z.string().uuid().optional(),
+  attachmentIds: z.array(z.string().uuid()).optional(),
 });
 
 const messageRead = z.object({

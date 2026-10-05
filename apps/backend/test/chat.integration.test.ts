@@ -240,8 +240,10 @@ describe("chat REST: privacy", () => {
     const res = await getHistory(a, matchId);
     const msg = res.body.data.messages[0];
     expect(new Set(Object.keys(msg))).toEqual(
-      new Set(["id", "conversationId", "senderId", "body", "clientMessageId", "createdAt"]),
+      // `attachments` added in Increment 5 (empty array for text-only messages).
+      new Set(["id", "conversationId", "senderId", "body", "clientMessageId", "createdAt", "attachments"]),
     );
+    expect(msg.attachments).toEqual([]);
     const serialized = JSON.stringify(res.body);
     for (const forbidden of [
       "password",

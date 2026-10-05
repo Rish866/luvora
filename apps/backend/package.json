@@ -21,11 +21,13 @@
     "dotenv": "^16.4.5",
     "express": "^4.21.1",
     "express-rate-limit": "^7.4.1",
+    "file-type": "^16.5.4",
     "helmet": "^8.0.0",
     "jsonwebtoken": "^9.0.2",
     "pg": "^8.13.1",
     "pino": "^9.5.0",
     "pino-http": "^10.3.0",
+    "sharp": "^0.33.5",
     "ws": "^8.22.0",
     "zod": "^3.23.8"
   },

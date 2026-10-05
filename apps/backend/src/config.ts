@@ -42,6 +42,28 @@ const schema = z.object({
     .string()
     .default("false")
     .transform((v) => v === "true"),
+
+  // ---- Media (Increment 5) ----
+  MEDIA_MAX_BYTES: z.coerce.number().int().positive().default(10 * 1024 * 1024),
+  MEDIA_MAX_WIDTH: z.coerce.number().int().positive().default(8000),
+  MEDIA_MAX_HEIGHT: z.coerce.number().int().positive().default(8000),
+  MEDIA_MAX_ATTACHMENTS_PER_MESSAGE: z.coerce.number().int().positive().default(5),
+  MEDIA_MAX_TOTAL_MESSAGE_BYTES: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(25 * 1024 * 1024),
+  MEDIA_THUMBNAIL_SIZE: z.coerce.number().int().positive().default(320),
+  MEDIA_STORAGE_PROVIDER: z.enum(["local"]).default("local"),
+  // Where the local storage provider writes bytes. Defaults to an OS temp dir
+  // per-process when empty, so tests never require config.
+  MEDIA_LOCAL_STORAGE_PATH: z.string().default(""),
+  // Scanner / moderation behaviour. 'test' uses deterministic dev providers.
+  MEDIA_SCAN_MODE: z.enum(["test", "disabled"]).default("test"),
+  MEDIA_MODERATION_MODE: z.enum(["test", "disabled"]).default("test"),
+  // Policy when the scanner returns UNKNOWN: 'quarantine' (safe) or 'allow'.
+  MEDIA_UNKNOWN_SCAN_POLICY: z.enum(["quarantine", "allow"]).default("quarantine"),
+  MEDIA_SIGNED_URL_TTL_SECONDS: z.coerce.number().int().positive().default(300),
 });
 
 const parsed = schema.safeParse(process.env);
@@ -80,6 +102,20 @@ export const config = {
   // Rate limiting is disabled under test so the suite can register many users
   // against a single app instance. It is always enabled otherwise.
   rateLimitEnabled: env.NODE_ENV !== "test",
+  media: {
+    maxBytes: env.MEDIA_MAX_BYTES,
+    maxWidth: env.MEDIA_MAX_WIDTH,
+    maxHeight: env.MEDIA_MAX_HEIGHT,
+    maxAttachmentsPerMessage: env.MEDIA_MAX_ATTACHMENTS_PER_MESSAGE,
+    maxTotalMessageBytes: env.MEDIA_MAX_TOTAL_MESSAGE_BYTES,
+    thumbnailSize: env.MEDIA_THUMBNAIL_SIZE,
+    storageProvider: env.MEDIA_STORAGE_PROVIDER,
+    localStoragePath: env.MEDIA_LOCAL_STORAGE_PATH,
+    scanMode: env.MEDIA_SCAN_MODE,
+    moderationMode: env.MEDIA_MODERATION_MODE,
+    unknownScanPolicy: env.MEDIA_UNKNOWN_SCAN_POLICY,
+    signedUrlTtlSeconds: env.MEDIA_SIGNED_URL_TTL_SECONDS,
+  },
 } as const;
 
 export type Config = typeof config;

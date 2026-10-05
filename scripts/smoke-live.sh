@@ -312,6 +312,25 @@ for key in GW_READY_A GW_READY_B GW_SUBSCRIBE_STATE GW_CHOOSE_BROADCAST_A GW_CHO
   else echo "FAIL: gamews $key"; FAIL=$((FAIL+1)); fi
 done
 
+# ---- Increment 5: secure media + attachments (HTTP) ----
+# Fresh matched pair + an unrelated user, driven by a Node client that uploads a
+# real generated PNG, attaches it to a chat message, downloads it, and checks
+# IDOR + block behavior.
+MA=$(reg "ma.smoke@example.com" "MediaA"); TMA=$(tok "$MA"); UMA=$(uid "$MA")
+MB=$(reg "mb.smoke@example.com" "MediaB"); TMB=$(tok "$MB"); UMB=$(uid "$MB")
+MC=$(reg "mc.smoke@example.com" "MediaC"); TMC=$(tok "$MC")
+json -X POST $B/api/discovery/$UMB/like -H "Authorization: Bearer $TMA" >/dev/null
+MMATCHJSON=$(json -X POST $B/api/discovery/$UMA/like -H "Authorization: Bearer $TMB")
+MMATCH=$(echo "$MMATCHJSON" | sed -n 's/.*"matchId":"\([^"]*\)".*/\1/p')
+check "media match formed" 'UUID_OK' "$(echo "$MMATCH" | grep -Eq '^[0-9a-f-]{36}$' && echo UUID_OK || echo none)"
+
+MEDIAOUT=$(WS_PORT="$PORT" WS_BASE="$B" WS_TA="$TMA" WS_TB="$TMB" WS_TC="$TMC" WS_UB="$UMB" WS_MATCH="$MMATCH" node "$(dirname "$0")/media-smoke-client.js" 2>&1)
+echo "$MEDIAOUT" | sed 's/^/[media] /'
+for key in MD_INTENT MD_UPLOAD_READY MD_DETECT_PNG MD_ATTACH MD_WS_RECV MD_DTO_SAFE MD_DOWNLOAD_BYTES MD_IDOR_REJECTED MD_BLOCK_DENIES; do
+  if echo "$MEDIAOUT" | grep -q "$key=ok"; then echo "PASS: media $key"; PASS=$((PASS+1));
+  else echo "FAIL: media $key"; FAIL=$((FAIL+1)); fi
+done
+
 echo "----"
 echo "LIVE SMOKE: $PASS passed, $FAIL failed"
 

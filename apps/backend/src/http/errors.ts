@@ -95,6 +95,31 @@ export const Errors = {
   gameAlreadyCompleted: (message = "This session has already completed.") =>
     new AppError(ErrorCodes.GAME_ALREADY_COMPLETED, 409, message),
 
+  // ---- Media (Increment 5) ----
+  mediaNotFound: (message = "Media not found.") =>
+    new AppError(ErrorCodes.MEDIA_NOT_FOUND, 404, message),
+  /** Generic media authorization failure (non-owner / non-participant). */
+  mediaNotAuthorized: (message = "You are not authorized to access this media.") =>
+    new AppError(ErrorCodes.MEDIA_NOT_AUTHORIZED, 403, message),
+  mediaInvalidState: (message = "Media is not in a valid state for this action.") =>
+    new AppError(ErrorCodes.MEDIA_INVALID_STATE, 409, message),
+  mediaTypeNotAllowed: (message = "This media type is not allowed.") =>
+    new AppError(ErrorCodes.MEDIA_TYPE_NOT_ALLOWED, 400, message),
+  mediaTooLarge: (message = "Media exceeds the maximum allowed size.") =>
+    new AppError(ErrorCodes.MEDIA_TOO_LARGE, 413, message),
+  mediaInvalidContent: (message = "The uploaded content is not a valid image.") =>
+    new AppError(ErrorCodes.MEDIA_INVALID_CONTENT, 400, message),
+  mediaMimeMismatch: (message = "The declared type does not match the content.") =>
+    new AppError(ErrorCodes.MEDIA_MIME_MISMATCH, 400, message),
+  mediaNotReady: (message = "This attachment is not ready to be used.") =>
+    new AppError(ErrorCodes.MEDIA_NOT_READY, 409, message),
+  mediaRejected: (message = "This attachment was rejected by moderation.") =>
+    new AppError(ErrorCodes.MEDIA_REJECTED, 409, message),
+  tooManyAttachments: (message = "Too many attachments for one message.") =>
+    new AppError(ErrorCodes.TOO_MANY_ATTACHMENTS, 400, message),
+  attachmentsTooLarge: (message = "Total attachment size exceeds the limit.") =>
+    new AppError(ErrorCodes.ATTACHMENTS_TOO_LARGE, 413, message),
+
   internal: (message = "An unexpected error occurred.") =>
     new AppError(ErrorCodes.INTERNAL, 500, message),
 };

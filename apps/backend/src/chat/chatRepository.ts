@@ -149,6 +149,134 @@ export async function insertMessage(input: {
   });
 }
 
+import { MediaStatus, MediaModerationStatus } from "@luvora/shared";
+import * as mediaRepo from "../media/mediaRepository";
+import { Errors } from "../http/errors";
+import { config } from "../config";
+
+export interface AttachmentValidationInput {
+  attachmentIds: string[];
+  senderId: string;
+}
+
+/**
+ * Insert a message AND its attachment relationships atomically, validating each
+ * attachment inside the same transaction (ownership, READY+APPROVED, correct
+ * context, not deleted). Honors clientMessageId idempotency: a retry returns the
+ * existing message without creating duplicate attachment rows.
+ *
+ * All attachment checks happen server-side; a failure rolls back the whole
+ * message so no partial state is created.
+ */
+export async function insertMessageWithAttachments(input: {
+  conversationId: string;
+  senderId: string;
+  body: string;
+  clientMessageId: string | null;
+  attachmentIds: string[];
+}): Promise<MessageRow> {
+  return withTransaction(async (client) => {
+    // Idempotency: an existing message for this (conversation,sender,cmid)
+    // short-circuits (attachments were already linked on the first insert).
+    if (input.clientMessageId) {
+      const existing = await client.query<MessageRow>(
+        `SELECT id, conversation_id, sender_id, body, client_message_id, created_at
+           FROM messages
+          WHERE conversation_id = $1 AND sender_id = $2 AND client_message_id = $3`,
+        [input.conversationId, input.senderId, input.clientMessageId],
+      );
+      if (existing.rows[0]) return existing.rows[0];
+    }
+
+    // Validate attachments (if any) under row locks to avoid TOCTOU races with
+    // a concurrent delete/moderation change.
+    if (input.attachmentIds.length > 0) {
+      if (input.attachmentIds.length > config.media.maxAttachmentsPerMessage) {
+        throw Errors.tooManyAttachments();
+      }
+      // De-duplicate ids defensively.
+      const uniqueIds = [...new Set(input.attachmentIds)];
+      const locked = await mediaRepo.lockMediaByIds(client, uniqueIds);
+      const byId = new Map(locked.map((m) => [m.id, m]));
+
+      let totalBytes = 0;
+      for (const id of uniqueIds) {
+        const m = byId.get(id);
+        // Unknown / not owned by sender -> generic not-authorized (no leak).
+        if (!m || m.owner_id !== input.senderId) {
+          throw Errors.mediaNotAuthorized();
+        }
+        if (m.deleted_at || m.status === MediaStatus.DELETED) {
+          throw Errors.mediaNotFound();
+        }
+        if (m.status !== MediaStatus.READY) {
+          throw Errors.mediaNotReady();
+        }
+        if (m.moderation_status !== MediaModerationStatus.APPROVED) {
+          throw Errors.mediaRejected();
+        }
+        totalBytes += m.byte_size ? Number(m.byte_size) : 0;
+      }
+      if (totalBytes > config.media.maxTotalMessageBytes) {
+        throw Errors.attachmentsTooLarge();
+      }
+
+      // Insert the message, then link attachments.
+      const inserted = await insertMessageRow(client, input);
+      let order = 0;
+      for (const id of uniqueIds) {
+        await mediaRepo.insertAttachment(client, {
+          messageId: inserted.id,
+          mediaId: id,
+          sortOrder: order++,
+        });
+      }
+      await client.query(
+        `UPDATE conversations SET updated_at = now() WHERE id = $1`,
+        [input.conversationId],
+      );
+      return inserted;
+    }
+
+    // No attachments: plain message insert.
+    const inserted = await insertMessageRow(client, input);
+    await client.query(
+      `UPDATE conversations SET updated_at = now() WHERE id = $1`,
+      [input.conversationId],
+    );
+    return inserted;
+  });
+}
+
+/** Insert a single message row, handling the ON CONFLICT idempotency path. */
+async function insertMessageRow(
+  client: import("pg").PoolClient,
+  input: {
+    conversationId: string;
+    senderId: string;
+    body: string;
+    clientMessageId: string | null;
+  },
+): Promise<MessageRow> {
+  const inserted = await client.query<MessageRow>(
+    `INSERT INTO messages (conversation_id, sender_id, body, client_message_id)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (conversation_id, sender_id, client_message_id)
+       WHERE client_message_id IS NOT NULL
+       DO NOTHING
+     RETURNING id, conversation_id, sender_id, body, client_message_id, created_at`,
+    [input.conversationId, input.senderId, input.body, input.clientMessageId],
+  );
+  if (inserted.rows[0]) return inserted.rows[0];
+  const raced = await client.query<MessageRow>(
+    `SELECT id, conversation_id, sender_id, body, client_message_id, created_at
+       FROM messages
+      WHERE conversation_id = $1 AND sender_id = $2 AND client_message_id = $3`,
+    [input.conversationId, input.senderId, input.clientMessageId],
+  );
+  return raced.rows[0];
+}
+
 /** Does the message belong to the given conversation? */
 export async function messageBelongsToConversation(
   messageId: string,
