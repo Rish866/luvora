@@ -14,9 +14,11 @@ non-graphic and non-explicit.
 
 ## Implementation status
 
-This repository currently contains **Increment 1 — the backend foundation**.
-It is a working, tested slice (not mocked screens):
+This repository contains **Increment 1 (backend foundation)** and
+**Increment 2 (discovery & matching)**. Both are working, tested slices (not
+mocked screens).
 
+**Increment 1 — foundation:**
 - ✅ Auth: register / login / refresh / logout / logout-all / `me`
 - ✅ Secure password hashing (bcrypt) and JWT access + rotating refresh tokens
       with reuse/theft detection and revocation
@@ -27,8 +29,21 @@ It is a working, tested slice (not mocked screens):
       to the other player
 - ✅ Request validation, rate limiting, secure headers, consistent error
       envelope, structured logging, health/readiness endpoints
-- ✅ 27 passing tests (unit + integration) against a real PostgreSQL, including
-      consent-privacy and IDOR-authorization security tests
+
+**Increment 2 — discovery & matching:**
+- ✅ Discovery feed (`GET /api/discovery`) — DB-driven, keyset-paginated,
+      excludes self / already-decided / blocked (both ways) / matched / ineligible
+- ✅ Like & Pass (`POST /api/discovery/:userId/{like,pass}`) — one decision per
+      pair, idempotent, LIKE↔PASS converts in place
+- ✅ **Race-safe server-side mutual matching** (reciprocal likes → exactly one match)
+- ✅ Block / Unblock (`/api/users/:userId/block`) — removes from discovery both
+      ways, blocks new likes, invalidates existing match; unblock never recreates
+- ✅ Match list & detail (`/api/matches`) — participant-only, IDOR-safe
+- ✅ Discovery-safe DTOs — no auth/consent/private fields ever leak
+
+- ✅ **72 passing tests** (27 Increment 1 + 45 Increment 2) against a real
+      PostgreSQL, including a concurrent-reciprocal-like race test, consent-
+      privacy, and IDOR-authorization security tests.
 
 See [`docs/INCREMENTS.md`](docs/INCREMENTS.md) for the roadmap and what is
 **intentionally deferred** to later increments.

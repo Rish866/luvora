@@ -62,3 +62,28 @@ export async function createMatch(a: string, b: string): Promise<string> {
 export function auth(token: string): [string, string] {
   return ["Authorization", `Bearer ${token}`];
 }
+
+/** Insert a block directly (for test setup). */
+export async function insertBlock(
+  blockerId: string,
+  blockedId: string,
+): Promise<void> {
+  await pool.query(
+    `INSERT INTO blocks (blocker_id, blocked_id) VALUES ($1, $2)
+     ON CONFLICT (blocker_id, blocked_id) DO NOTHING`,
+    [blockerId, blockedId],
+  );
+}
+
+/** Insert a discovery decision directly (for test setup). */
+export async function insertDecision(
+  likerId: string,
+  likeeId: string,
+  isPass: boolean,
+): Promise<void> {
+  await pool.query(
+    `INSERT INTO likes (liker_id, likee_id, is_pass) VALUES ($1, $2, $3)
+     ON CONFLICT (liker_id, likee_id) DO UPDATE SET is_pass = EXCLUDED.is_pass`,
+    [likerId, likeeId, isPass],
+  );
+}

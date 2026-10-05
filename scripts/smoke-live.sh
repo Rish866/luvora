@@ -93,40 +93,84 @@ json -X POST $B/api/auth/logout -H 'Content-Type: application/json' -d "{\"refre
 AFTER_LOGOUT=$(code -X POST $B/api/auth/refresh -H 'Content-Type: application/json' -d "{\"refreshToken\":\"$NEWREF\"}")
 check "logout revokes refresh 401" '401' "$AFTER_LOGOUT"
 
-# ---- Fantasy session: consent privacy, authorization, state machine ----
-# Create a match via a tiny Node snippet using the same DATABASE_URL (robust
-# against nested shell quoting). Discovery/matching is a later increment.
-make_match() { # args: userLow userHigh  -> prints match uuid
-  node -e '
-    const { Client } = require("pg");
-    (async () => {
-      const c = new Client({ connectionString: process.env.DATABASE_URL });
-      await c.connect();
-      const r = await c.query(
-        "INSERT INTO matches (user_a,user_b,state) VALUES ($1,$2,'"'"'ACTIVE'"'"') RETURNING id",
-        [process.argv[1], process.argv[2]]
-      );
-      process.stdout.write(r.rows[0].id);
-      await c.end();
-    })().catch(e => { console.error(e.message); process.exit(1); });
-  ' "$1" "$2"
-}
-
-# Register two more adults (players) + an outsider.
+# Helpers for registering users and extracting fields.
 reg() { json -X POST $B/api/auth/register -H 'Content-Type: application/json' \
   -d "{\"email\":\"$1\",\"password\":\"Passw0rd!x\",\"displayName\":\"$2\",\"dateOfBirth\":\"1994-02-02\",\"ageConfirmed\":true}"; }
 tok() { echo "$1" | sed -n 's/.*"accessToken":"\([^"]*\)".*/\1/p'; }
 uid() { echo "$1" | sed -n 's/.*"userId":"\([^"]*\)".*/\1/p'; }
 
+# ---- Increment 2: discovery, like/pass, mutual match, block, match list ----
 PA=$(reg "pa.smoke@example.com" "PlayerA"); TA=$(tok "$PA"); UA=$(uid "$PA")
 PB=$(reg "pb.smoke@example.com" "PlayerB"); TB=$(tok "$PB"); UB=$(uid "$PB")
-PO=$(reg "po.smoke@example.com" "Outsider"); TO=$(tok "$PO")
+PO=$(reg "po.smoke@example.com" "Outsider"); TO=$(tok "$PO"); UO=$(uid "$PO")
 
-# Create an ACTIVE match directly (discovery/matching is a later increment),
-# honouring the canonical ordering CHECK (user_a < user_b).
-if [[ "$UA" < "$UB" ]]; then LO="$UA"; HI="$UB"; else LO="$UB"; HI="$UA"; fi
-MATCH=$(make_match "$LO" "$HI" | tr -d '[:space:]')
-check "match created" 'UUID_OK' "$(echo "$MATCH" | grep -Eq '^[0-9a-f-]{36}$' && echo UUID_OK || echo none)"
+# Discovery feed requires auth.
+check "discovery requires auth 401" '401' "$(code $B/api/discovery)"
+# Authenticated feed returns candidates and excludes self.
+DFEED=$(json $B/api/discovery -H "Authorization: Bearer $TA")
+check "discovery feed ok" '"success":true' "$DFEED"
+if echo "$DFEED" | grep -q "\"id\":\"$UA\""; then echo "FAIL: self in discovery"; FAIL=$((FAIL+1)); else echo "PASS: self excluded from discovery"; PASS=$((PASS+1)); fi
+# Discovery must not leak private fields.
+if echo "$DFEED" | grep -qiE 'password|email|refresh_token|date_of_birth|is_disabled'; then
+  echo "FAIL: discovery leaks private field"; FAIL=$((FAIL+1))
+else echo "PASS: discovery exposes no private fields"; PASS=$((PASS+1)); fi
+
+# Self-like rejected.
+check "self-like rejected" 'CANNOT_INTERACT_WITH_SELF' "$(json -X POST $B/api/discovery/$UA/like -H "Authorization: Bearer $TA")"
+# Like nonexistent user rejected.
+check "like nonexistent rejected" 'USER_NOT_FOUND' "$(json -X POST $B/api/discovery/00000000-0000-0000-0000-000000000000/like -H "Authorization: Bearer $TA")"
+# Malformed UUID rejected.
+check "like malformed uuid rejected 400" '400' "$(code -X POST $B/api/discovery/not-a-uuid/like -H "Authorization: Bearer $TA")"
+
+# A likes B -> no match yet.
+check "A likes B no match" '"matched":false' "$(json -X POST $B/api/discovery/$UB/like -H "Authorization: Bearer $TA")"
+# B likes A -> match.
+LIKEBACK=$(json -X POST $B/api/discovery/$UA/like -H "Authorization: Bearer $TB")
+check "B likes A -> matched" '"matched":true' "$LIKEBACK"
+MATCH=$(echo "$LIKEBACK" | sed -n 's/.*"matchId":"\([^"]*\)".*/\1/p')
+check "match id returned" 'UUID_OK' "$(echo "$MATCH" | grep -Eq '^[0-9a-f-]{36}$' && echo UUID_OK || echo none)"
+
+# Match appears in both match lists.
+check "A match list has B" "\"id\":\"$UB\"" "$(json $B/api/matches -H "Authorization: Bearer $TA")"
+check "B match list has A" "\"id\":\"$UA\"" "$(json $B/api/matches -H "Authorization: Bearer $TB")"
+# Matched user excluded from discovery.
+if json $B/api/discovery -H "Authorization: Bearer $TA" | grep -q "\"id\":\"$UB\""; then
+  echo "FAIL: matched user still in discovery"; FAIL=$((FAIL+1))
+else echo "PASS: matched user excluded from discovery"; PASS=$((PASS+1)); fi
+# IDOR: outsider cannot read A/B match detail.
+check "match detail IDOR rejected" 'MATCH_NOT_AUTHORIZED' "$(json $B/api/matches/$MATCH -H "Authorization: Bearer $TO")"
+# Participant can read it.
+check "participant reads match detail" '"success":true' "$(json $B/api/matches/$MATCH -H "Authorization: Bearer $TA")"
+
+# Pass excludes a user from discovery.
+PD=$(reg "pd.smoke@example.com" "PlayerD"); TD=$(tok "$PD"); UD=$(uid "$PD")
+json -X POST $B/api/discovery/$UD/pass -H "Authorization: Bearer $TA" >/dev/null
+if json $B/api/discovery -H "Authorization: Bearer $TA" | grep -q "\"id\":\"$UD\""; then
+  echo "FAIL: passed user still in discovery"; FAIL=$((FAIL+1))
+else echo "PASS: passed user excluded from discovery"; PASS=$((PASS+1)); fi
+
+# Block prevents like and removes match; unblock does not recreate match.
+check "block ok" '"blocked":true' "$(json -X POST $B/api/users/$UB/block -H "Authorization: Bearer $TA")"
+check "like blocked target rejected" 'INTERACTION_NOT_ALLOWED' "$(json -X POST $B/api/discovery/$UB/like -H "Authorization: Bearer $TA")"
+if json $B/api/matches -H "Authorization: Bearer $TA" | grep -q "\"$MATCH\""; then
+  echo "FAIL: blocked match still active"; FAIL=$((FAIL+1))
+else echo "PASS: block removed match from active list"; PASS=$((PASS+1)); fi
+json -X DELETE $B/api/users/$UB/block -H "Authorization: Bearer $TA" >/dev/null
+if json $B/api/matches -H "Authorization: Bearer $TA" | grep -q "\"$MATCH\""; then
+  echo "FAIL: unblock recreated match"; FAIL=$((FAIL+1))
+else echo "PASS: unblock did not recreate match"; PASS=$((PASS+1)); fi
+
+# ---- Fantasy session: reuse a fresh discovery-created match ----
+# Create two new users and form a match through the real discovery flow, then
+# exercise the Increment 1 fantasy consent/state-machine over it.
+PE=$(reg "pe.smoke@example.com" "PlayerE"); TE=$(tok "$PE"); UE=$(uid "$PE")
+PF=$(reg "pf.smoke@example.com" "PlayerF"); TF=$(tok "$PF"); UF=$(uid "$PF")
+json -X POST $B/api/discovery/$UF/like -H "Authorization: Bearer $TE" >/dev/null
+MATCH2JSON=$(json -X POST $B/api/discovery/$UE/like -H "Authorization: Bearer $TF")
+MATCH=$(echo "$MATCH2JSON" | sed -n 's/.*"matchId":"\([^"]*\)".*/\1/p')
+check "fantasy match formed via discovery" 'UUID_OK' "$(echo "$MATCH" | grep -Eq '^[0-9a-f-]{36}$' && echo UUID_OK || echo none)"
+# Rebind the fantasy-section identities to E/F and an outsider.
+TA="$TE"; TB="$TF"; TO="$TO"
 
 # A invites B.
 INV=$(json -X POST $B/api/sessions/invite -H "Authorization: Bearer $TA" -H 'Content-Type: application/json' \

@@ -4,6 +4,9 @@ import cors from "cors";
 import { config } from "./config";
 import { authRouter } from "./auth/authRoutes";
 import { sessionRouter } from "./fantasy/sessionRoutes";
+import { discoveryRouter } from "./discovery/discoveryRoutes";
+import { matchRouter } from "./discovery/matchRoutes";
+import { userBlockRouter } from "./discovery/blockRoutes";
 import { errorHandler } from "./http/errorHandler";
 import { ok } from "./http/respond";
 import { Errors } from "./http/errors";
@@ -40,6 +43,9 @@ export function createApp(): Express {
 
   app.use("/api/auth", authRouter);
   app.use("/api/sessions", sessionRouter);
+  app.use("/api/discovery", discoveryRouter);
+  app.use("/api/matches", matchRouter);
+  app.use("/api/users", userBlockRouter);
 
   // 404 for unknown routes.
   app.use((_req, _res, next) => next(Errors.notFound("Route not found.")));

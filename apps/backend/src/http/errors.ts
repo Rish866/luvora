@@ -36,6 +36,22 @@ export const Errors = {
     new AppError(ErrorCodes.SESSION_NOT_AUTHORIZED, 403, message),
   invalidTransition: (message = "Invalid state transition.") =>
     new AppError(ErrorCodes.INVALID_STATE_TRANSITION, 409, message),
+
+  // ---- Discovery & matching (Increment 2) ----
+  userNotFound: (message = "User not found.") =>
+    new AppError(ErrorCodes.USER_NOT_FOUND, 404, message),
+  cannotInteractWithSelf: (message = "You cannot perform this action on yourself.") =>
+    new AppError(ErrorCodes.CANNOT_INTERACT_WITH_SELF, 400, message),
+  /** Deliberately generic: used for blocked-either-direction and other
+   *  unavailable interactions, so we never reveal that the other party blocked
+   *  the caller. */
+  interactionNotAllowed: (message = "This interaction is not available.") =>
+    new AppError(ErrorCodes.INTERACTION_NOT_ALLOWED, 403, message),
+  matchNotFound: (message = "Match not found.") =>
+    new AppError(ErrorCodes.MATCH_NOT_FOUND, 404, message),
+  matchNotAuthorized: (message = "You are not authorized to access this match.") =>
+    new AppError(ErrorCodes.MATCH_NOT_AUTHORIZED, 403, message),
+
   internal: (message = "An unexpected error occurred.") =>
     new AppError(ErrorCodes.INTERNAL, 500, message),
 };

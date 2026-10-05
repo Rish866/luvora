@@ -24,10 +24,32 @@ before the next is added. Below is the plan and current status.
 - 27 passing tests (unit + integration) run against a real PostgreSQL,
   including consent-privacy and IDOR-authorization security tests.
 
-## ⏳ Increment 2 — Discovery & matching
+## ✅ Increment 2 — Discovery & matching (DONE)
 
-Like/pass, server-side mutual match creation (race-safe), block, discovery feed
-excluding blocked/passed users, match list.
+- **Discovery feed** (`GET /api/discovery`) — database-driven, keyset
+  (cursor) pagination with a deterministic `(created_at, id)` order. Excludes,
+  entirely in SQL: self, already-liked, already-passed, blocks in **both**
+  directions, existing matches, and ineligible (disabled/deleted/non-
+  discoverable) accounts. Returns a discovery-safe DTO only.
+- **Like / Pass** (`POST /api/discovery/:userId/{like,pass}`) — one decision
+  per `(actor, target)` via upsert; LIKE↔PASS converts in place (no
+  contradictory rows); idempotent.
+- **Mutual matching** — a match is created **only by the server** on reciprocal
+  likes, inside a transaction with `ON CONFLICT` on the canonical pair, so
+  concurrent reciprocal likes yield **exactly one** match (race-safe).
+- **Block / Unblock** (`POST`/`DELETE /api/users/:userId/block`) — idempotent;
+  block removes the pair from discovery both ways, rejects new likes, and sets
+  any existing match to `BLOCKED`. Unblock never recreates a match or restores
+  old likes.
+- **Match list + detail** (`GET /api/matches`, `GET /api/matches/:matchId`) —
+  participant-only; detail enforces authorization so match-ID enumeration can't
+  reveal another user's relationship.
+- Reuses Increment 1 auth, age gate, error envelope, and the existing
+  `likes`/`matches`/`blocks` schema. New migration `0002` adds only supporting
+  **indexes** (no table redesign).
+- 45 new tests (incl. a concurrent-reciprocal-like race test and privacy
+  assertions). **Total: 72 passing** against real PostgreSQL. Live HTTP smoke:
+  43/43.
 
 ## ⏳ Increment 3 — Private chat + WebSockets
 

@@ -38,6 +38,29 @@ Later increments add: messages/attachments, scenario content tables,
 fantasy_events, relationship, reports, moderation_actions, notifications,
 audit_log.
 
+## Migration 0002 — discovery & matching indexes (Increment 2)
+
+Increment 2 reuses the Increment 1 `likes`, `matches`, and `blocks` tables
+unchanged (their uniqueness and canonical-ordering constraints already enforce
+the required invariants). Migration `0002_discovery_matching.sql` adds only the
+indexes the discovery and relationship queries need — no table redesign:
+
+| Index | Supports |
+|-------|----------|
+| `likes_liker (liker_id)` | "every decision the viewer already made" (feed exclusion). |
+| `likes_liker_likee_like (liker_id, likee_id) WHERE is_pass = false` | reciprocal "did candidate like me?" (match detection + feed). |
+| `blocks_blocker (blocker_id)` | blocks created by the viewer (0001 had only `blocks_blocked`). |
+| `users_discovery_order (created_at, id) WHERE deleted_at IS NULL AND is_disabled = false` | deterministic keyset ordering of the feed over live accounts. |
+
+### Relationship invariants relied upon (from 0001)
+- `likes UNIQUE (liker_id, likee_id)` → one decision per `(actor, target)`;
+  LIKE/PASS is an upsert on this key.
+- `matches CHECK (user_a < user_b)` + `UNIQUE (user_a, user_b)` → one row per
+  pair; race-safe match creation via `ON CONFLICT DO NOTHING`.
+- `blocks UNIQUE (blocker_id, blocked_id)` → idempotent block via `ON CONFLICT`.
+- `matches.state ∈ {ACTIVE, UNMATCHED, BLOCKED}` → blocking sets an existing
+  match to `BLOCKED`; active listings and discovery filter on `ACTIVE`.
+
 ## Resetting a dev/test database
 
 Migrations are forward-only; to reset, drop and recreate the database, then

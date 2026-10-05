@@ -12,3 +12,4 @@ export * from "./enums";
 export * from "./consent";
 export * from "./api";
 export * from "./stateMachine";
+export * from "./discovery";
