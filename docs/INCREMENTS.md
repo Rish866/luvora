@@ -446,11 +446,68 @@ PostgreSQL-backed; external push is still provider-dependent (TEST/DISABLED
 providers only); job execution remains at-least-once (exactly-once external side
 effects are not claimed). No Redis/Kafka/Prometheus-server/Datadog introduced.
 
-## ⏳ Increment 11 — Android client (React Native)
+## ✅ Increment 11 — Production security hardening & deployment readiness
+
+Hardening the existing backend for production operation (no new mandatory
+infrastructure — no Redis/Kafka/Prometheus-server introduced):
+
+- **Abuse control primitive (`AbuseGuard`)**: a single process-local, bounded
+  (LRU + periodic sweep), injectable-clock sliding-window limiter behind every
+  abuse-sensitive surface. It has its OWN enable switch (`ABUSE_GUARD_ENABLED`,
+  default on) independent of the legacy `rateLimitEnabled`, so throttling is
+  actually exercised under test. Applied to login (brute force) and the
+  write/action surfaces (discovery like/pass, block, chat send, fantasy invite).
+- **Login brute-force / credential-stuffing protection**: dual-dimension (client
+  IP + target account) temporary throttle — NOT a permanent lockout (which could
+  be weaponised for DoS against a victim). The gate runs BEFORE the bcrypt
+  comparison, removing hashing as an amplification vector. A successful login
+  clears the counters.
+- **Strict CORS allowlist** (`CORS_ALLOWED_ORIGINS`, legacy `CORS_ORIGINS`
+  alias): normalized (lowercased, trailing-slash-trimmed, deduped), credentials
+  allowed, never a wildcard. Disallowed origins receive no CORS headers.
+- **Security headers** (centralized): `X-Content-Type-Options`, `X-Frame-Options:
+  DENY`, `Referrer-Policy: no-referrer`, a minimal `Permissions-Policy`, an
+  API-appropriate CSP (`default-src 'none'`), no `X-Powered-By`, and opt-in HSTS.
+- **Request input limits**: configurable JSON body limit (→ `413
+  PAYLOAD_TOO_LARGE`) and a URL-length guard; `trust proxy` driven by
+  `TRUST_PROXY_HOPS` so `X-Forwarded-For` cannot be forged.
+- **WebSocket hardening**: per-user concurrent-connection cap (close `4429`),
+  inbound frame-size limit (`maxPayload`), and the per-connection event throttle
+  wired to config with rejection metrics.
+- **Media hardening**: explicit decompression-bomb / oversized-dimension reject
+  (`MEDIA_MAX_PIXELS`) with a precise error + metric, on top of the existing
+  byte/dimension/dual-MIME checks.
+- **Config fail-fast**: production refuses to boot with weak/dev JWT secrets,
+  equal access/refresh secrets, weak bcrypt rounds, empty/wildcard CORS, or
+  `DEVELOPER_MODE=true` — and never prints a secret value.
+- **Durable security events** (`security_events` table): low-volume, significant
+  events only (brute-force lockout, login throttle, refresh-token reuse). The
+  client source is stored ONLY as a salted, truncated fingerprint — never the
+  raw IP. Pruned by the existing `BACKGROUND_JOB_CLEANUP` job
+  (`SECURITY_EVENT_RETENTION_DAYS`); audit logs remain a separate, append-only
+  policy. Readable via admin-only `GET /api/admin/security-events`.
+- **Deployment artefacts**: a production multi-stage, non-root `Dockerfile`
+  (API + worker from one image), `scripts/backup-db.sh` / `scripts/restore-db.sh`
+  (pg_dump/pg_restore, credentials only via `DATABASE_URL`), and docs:
+  `THREAT_MODEL.md`, `DEPLOYMENT.md`, `DISASTER_RECOVERY.md`,
+  `PRODUCTION_SECURITY_CHECKLIST.md`.
+- **64 new tests** (AbuseGuard unit incl. concurrency/eviction, brute-force,
+  CORS/headers/request-limits, WS caps + frame limit, media dimension guard,
+  security-events + admin endpoint, config fail-fast via subprocess). **Total:
+  479 passing** against real PostgreSQL. Live smoke: **249** (221 prior + 28
+  new) with a real separate worker process.
+
+**Honest limitations:** rate limiting / abuse control and metrics are
+**process-local** — with multiple API instances each process enforces its own
+limits; this is NOT global/distributed enforcement (a shared backend such as
+Redis would be required, and the `AbuseBackend` seam marks where it plugs in).
+External push remains provider-dependent (FCM/APNs/WebPush are unimplemented
+placeholders; TEST/DISABLED only). Distributed presence/realtime remain
+placeholders. Job execution remains at-least-once (no exactly-once external side
+effects). There is no frontend/Android client in this repository.
+
+## ⏳ Increment 12 — Android client (React Native)
 
 Onboarding/age gate, the five sections, consent + gameplay UI, push, offline UX.
-
-## ⏳ Increment 12 — Hardening
-
-Full security test matrix, load testing, OpenAPI/WS docs, deployment runbooks,
-Android release build.
+Full load testing, OpenAPI/WS schema docs, and an Android release build remain
+future work.

@@ -18,6 +18,8 @@ import {
   recordWsDisconnect,
   recordWsMessage,
   recordWsError,
+  recordWsConnectionRejected,
+  recordWsEventRejected,
 } from "../observability/websocketMetrics";
 import type { WsChannel, WsDispatcher } from "../ws/wsDispatcher";
 
@@ -45,10 +47,6 @@ const HEARTBEAT_INTERVAL_MS = Math.max(
   5_000,
   Math.floor((config.presence.heartbeatSeconds * 1000) / 2),
 );
-// Per-connection inbound event throttle (sliding window).
-const WS_RATE_WINDOW_MS = 10_000;
-const WS_RATE_MAX = 50;
-
 // Associate per-socket state without leaking it into the registry.
 const stateBySocket = new WeakMap<WebSocket, SocketState>();
 
@@ -71,12 +69,15 @@ function sendError(
   send(socket, { type: "error", code, message, ...(clientMessageId ? { clientMessageId } : {}) });
 }
 
-/** Simple sliding-window per-connection throttle. Returns true if allowed. */
+/** Simple sliding-window per-connection throttle. Returns true if allowed.
+ *  Window/limit are configurable (config.security.ws.*); defaults preserve the
+ *  previous 50 events / 10s behaviour. Process-local by design. */
 function allowEvent(state: SocketState): boolean {
   if (!config.rateLimitEnabled) return true;
   const now = Date.now();
-  state.recent = state.recent.filter((t) => now - t < WS_RATE_WINDOW_MS);
-  if (state.recent.length >= WS_RATE_MAX) return false;
+  const windowMs = config.security.ws.eventWindowMs;
+  state.recent = state.recent.filter((t) => now - t < windowMs);
+  if (state.recent.length >= config.security.ws.eventMax) return false;
   state.recent.push(now);
   return true;
 }
@@ -200,9 +201,25 @@ export interface ChatGateway {
 
 /** Register the chat channel ("/ws/chat") on the shared WS dispatcher. */
 export function attachChatGateway(dispatcher: WsDispatcher): ChatGateway {
-  const wss = new WebSocketServer({ noServer: true });
+  // maxPayload caps inbound frame size; `ws` closes oversized frames (1009).
+  const wss = new WebSocketServer({
+    noServer: true,
+    maxPayload: config.security.ws.maxFrameBytes,
+  });
 
   const onConnection: WsChannel["onConnection"] = (socket, _req, userId) => {
+    // Per-user concurrent-connection cap (resource-exhaustion defence). The
+    // socket already exists post-handshake, so we refuse by closing it.
+    if (hub.socketsFor(userId).length >= config.security.ws.maxConnectionsPerUser) {
+      recordWsConnectionRejected("chat", "too_many_connections");
+      try {
+        socket.close(ChatCloseCodes.TOO_MANY_CONNECTIONS, "too many connections");
+      } catch {
+        /* ignore */
+      }
+      return;
+    }
+
     const connectionId = `chat:${randomUUID()}`;
     const state: SocketState = { userId, connectionId, isAlive: true, recent: [] };
     stateBySocket.set(socket, state);
@@ -227,6 +244,7 @@ export function attachChatGateway(dispatcher: WsDispatcher): ChatGateway {
       presenceRegistry.heartbeat(userId, connectionId);
       recordWsMessage("chat");
       if (!allowEvent(state)) {
+        recordWsEventRejected("chat");
         sendError(socket, "RATE_LIMITED", "Too many messages. Slow down.");
         return;
       }

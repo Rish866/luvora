@@ -3,6 +3,7 @@ import { asyncHandler } from "../http/asyncHandler";
 import { ok } from "../http/respond";
 import { requireAuth } from "../http/authMiddleware";
 import { makeRateLimiter } from "../http/rateLimiter";
+import { abuseLimit, AbuseRules } from "../http/abuseGuardMiddleware";
 import { config } from "../config";
 import { matchIdParamSchema } from "../discovery/discoverySchemas";
 import * as chat from "./chatService";
@@ -21,6 +22,12 @@ chatRouter.use(requireAuth);
 // pass-through under test). Separate from the global limiter so chat sending
 // has its own budget.
 const sendLimiter = makeRateLimiter(config.rateLimit.max);
+// AbuseGuard per-user send cap (effective under test; process-local).
+const sendAbuseLimit = abuseLimit({
+  scope: "chat-send",
+  rule: AbuseRules.chatSend,
+  by: ["user"],
+});
 
 // GET /api/matches/:matchId/messages?limit=&cursor=
 chatRouter.get(
@@ -46,6 +53,7 @@ chatRouter.get(
 chatRouter.post(
   "/",
   sendLimiter,
+  sendAbuseLimit,
   asyncHandler(async (req, res) => {
     const { matchId } = matchIdParamSchema.parse(req.params);
     const { body, clientMessageId, attachmentIds } = chat.sendBodySchema.parse(req.body);

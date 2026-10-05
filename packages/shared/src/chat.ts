@@ -126,8 +126,12 @@ export type ServerChatEvent =
 
 export type ServerChatEventType = ServerChatEvent["type"];
 
-/** WebSocket close codes used by the chat gateway (application range 4000+). */
+/** WebSocket close codes used by the realtime gateways (application range
+ *  4000+). Shared by the chat and fantasy-game channels. */
 export const ChatCloseCodes = {
   UNAUTHENTICATED: 4401,
+  ACCOUNT_NOT_ACTIVE: 4403,
+  /** The user already has the maximum number of concurrent connections. */
+  TOO_MANY_CONNECTIONS: 4429,
   INTERNAL: 4500,
 } as const;

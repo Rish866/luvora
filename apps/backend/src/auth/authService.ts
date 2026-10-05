@@ -11,6 +11,13 @@ import * as users from "../users/userRepository";
 import * as sessions from "./authSessionRepository";
 import { assertAccountActive } from "./accountState";
 import { config } from "../config";
+import {
+  checkLoginAllowed,
+  recordLoginFailure,
+  clearLoginFailures,
+} from "./bruteForce";
+import { recordSecurityEvent } from "../security/securityEvents";
+import { SecurityEventType, SecuritySeverity } from "@luvora/shared";
 
 /** ---- Validation schemas ---- */
 
@@ -112,12 +119,34 @@ export async function login(
   input: LoginInput,
   ctx: { userAgent?: string; ip?: string } = {},
 ): Promise<AuthResult> {
+  // BRUTE-FORCE GATE (Increment 11): if this IP or this account is currently
+  // throttled from repeated failures, reject BEFORE touching the password hash
+  // — this also removes the bcrypt cost as an amplification vector. Temporary,
+  // not a permanent lockout.
+  const gate = checkLoginAllowed(ctx.ip, input.email);
+  if (!gate.allowed) {
+    await recordSecurityEvent({
+      eventType: SecurityEventType.LOGIN_THROTTLED,
+      severity: SecuritySeverity.WARNING,
+      category: "auth",
+      source: ctx.ip,
+      metadata: { retryAfterSeconds: gate.retryAfterSeconds },
+    });
+    // Opaque to avoid revealing which dimension tripped / whether the account
+    // exists; the Retry-After header is emitted by the error handler.
+    throw Errors.rateLimited("Too many attempts. Try again later.").withRetryAfter(
+      gate.retryAfterSeconds,
+    );
+  }
+
   const user = await users.findByEmail(input.email);
   // Always run a hash comparison to reduce user-enumeration timing signals.
   const hash = user?.password_hash ?? "$2a$12$invalidinvalidinvalidinvalidinvalidinvalidinv";
   const valid = await verifyPassword(input.password, hash);
 
   if (!user || !valid) {
+    // Count the failure on both IP + account dimensions (may trigger a block).
+    await recordLoginFailure(ctx.ip, input.email, user?.id ?? null);
     throw Errors.unauthenticated("Invalid email or password.");
   }
   if (user.is_disabled) {
@@ -127,6 +156,9 @@ export async function login(
   // expired suspension, and throws ACCOUNT_SUSPENDED / ACCOUNT_DEACTIVATED
   // otherwise — a suspended/deactivated user cannot obtain new tokens.
   await assertAccountActive(user.id);
+
+  // Successful authentication clears the failure counters for both dimensions.
+  clearLoginFailures(ctx.ip, input.email);
 
   const t = issueTokens(user.id);
   await sessions.createAuthSession({
@@ -164,6 +196,14 @@ export async function refresh(
     // The presented token was already exchanged once. Legitimate clients never
     // reuse a token, so this indicates theft/replay. Revoke the whole family.
     await sessions.revokeFamily(session.family_id);
+    // Durable, high-signal security event (token theft indicator). Best-effort.
+    await recordSecurityEvent({
+      eventType: SecurityEventType.REFRESH_TOKEN_REUSE,
+      severity: SecuritySeverity.CRITICAL,
+      userId: session.user_id,
+      category: "auth",
+      metadata: { familyId: session.family_id },
+    });
     throw Errors.unauthenticated("Refresh token reuse detected.");
   }
   if (session.revoked_at) {

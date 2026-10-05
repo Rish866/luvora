@@ -196,3 +196,13 @@ metrics.registerCounter("jobs_cancelled_total", "Background jobs cancelled by ty
 metrics.registerCounter("jobs_reclaimed_total", "Background jobs reclaimed from expired leases");
 metrics.registerHistogram("jobs_execution_duration_ms", "Job handler execution duration in ms");
 metrics.registerHistogram("jobs_queue_wait_duration_ms", "Time a job waited before first claim in ms");
+
+// Security / abuse (Increment 11). All labels are bounded, server-controlled.
+metrics.registerCounter("rate_limit_hits_total", "Requests throttled by the abuse guard, by scope/dimension");
+metrics.registerCounter("auth_failures_total", "Authentication failures by kind");
+metrics.registerCounter("auth_throttled_total", "Login attempts throttled by brute-force protection");
+metrics.registerCounter("security_events_total", "Durable security events recorded by type/severity");
+metrics.registerCounter("ws_connections_rejected_total", "WebSocket connections rejected by reason");
+metrics.registerCounter("ws_events_rejected_total", "WebSocket events rejected by reason");
+metrics.registerCounter("media_rejected_total", "Media uploads rejected by reason");
+metrics.registerCounter("oversized_requests_total", "Requests rejected for exceeding size/URL limits");

@@ -268,6 +268,21 @@ per-request firehose. Retention: operational events are pruned by the
 90) — a SEPARATE policy from `audit_logs`, which are append-only and never
 deleted by cleanup.
 
+## Security events (migration 0011)
+
+| Table | Purpose |
+|-------|---------|
+| `security_events` | Durable, LOW-VOLUME store of significant security events (Increment 11): brute-force lockouts, login throttles, refresh-token reuse. `severity` is CHECK-constrained to `INFO`/`WARNING`/`ERROR`/`CRITICAL`. `user_id` FK `ON DELETE SET NULL`. `source_fingerprint` is a salted, truncated (16-char) hash of the client source — the **raw IP is never stored**. `correlation_id`/`category` optional. `metadata jsonb` is **sanitized by the application** (sensitive keys dropped, values bounded; never tokens/bodies/IPs/credentials). |
+
+Indexes: `security_events_created` (recent-first + retention scan),
+`security_events_type`, `_category`, and partial `_user` / `_source` indexes.
+
+High-frequency abuse counters are NOT stored here — they live in the in-process
+`AbuseGuard` — so this table never becomes a per-request firehose (storing them
+would be a self-inflicted DoS). Retention: pruned by the `BACKGROUND_JOB_CLEANUP`
+job after `SECURITY_EVENT_RETENTION_DAYS` (default 90) — again a SEPARATE policy
+from `audit_logs`.
+
 ## Resetting a dev/test database
 
 Migrations are forward-only; to reset, drop and recreate the database, then

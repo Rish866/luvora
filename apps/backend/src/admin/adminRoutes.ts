@@ -23,6 +23,7 @@ import {
   recordOperationalEvent,
   listOperationalEvents,
 } from "../observability/operationalEvents";
+import { listSecurityEvents } from "../security/securityEvents";
 import {
   JobStatus,
   JobType,
@@ -544,6 +545,42 @@ adminRouter.get(
     }
     const { events, nextCursor } = await listOperationalEvents({
       eventType: q.eventType,
+      severity: q.severity,
+      limit: q.limit,
+      before,
+    });
+    ok(res, { events, nextCursor: nextCursor ? encodeCursor(nextCursor) : null });
+  }),
+);
+
+// ======================= SECURITY EVENTS (admin only, read-only) ==============
+//
+// Durable, low-volume security events (brute-force throttles, refresh-token
+// reuse, insecure-config warnings, etc.). Keyset-paginated + filterable. The
+// client source is only ever a salted fingerprint — the raw IP is never stored
+// or returned, so this cannot be used to deanonymise or track users.
+
+const securityEventQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(100).default(50),
+  cursor: z.string().min(1).optional(),
+  eventType: z.string().max(100).optional(),
+  category: z.string().max(100).optional(),
+  severity: z.string().max(20).optional(),
+});
+
+adminRouter.get(
+  "/security-events",
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const q = securityEventQuerySchema.parse(req.query);
+    let before = null as ReturnType<typeof decodeCursor>;
+    if (q.cursor) {
+      before = decodeCursor(q.cursor);
+      if (!before) throw Errors.invalidCursor();
+    }
+    const { events, nextCursor } = await listSecurityEvents({
+      eventType: q.eventType,
+      category: q.category,
       severity: q.severity,
       limit: q.limit,
       before,

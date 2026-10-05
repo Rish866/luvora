@@ -402,8 +402,17 @@ Representative endpoints (full reference in [`docs/API.md`](docs/API.md)):
   server-computed mutual allow-list is shared, and only after both confirm.
 - No secrets are committed; `.env*` is git-ignored and only `.env.example`
   (placeholders) is tracked.
+- **Production hardening (Increment 11):** process-local abuse control + login
+  brute-force throttle, strict CORS allowlist, security headers, request/WS/media
+  input limits, production config fail-fast, and a durable `security_events`
+  store that keeps only salted source fingerprints (never raw IPs).
 
-See [`docs/SECURITY.md`](docs/SECURITY.md) for details and known gaps.
+See [`docs/SECURITY.md`](docs/SECURITY.md) for details and known gaps,
+[`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) for the threat model, and
+[`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) /
+[`docs/DISASTER_RECOVERY.md`](docs/DISASTER_RECOVERY.md) /
+[`docs/PRODUCTION_SECURITY_CHECKLIST.md`](docs/PRODUCTION_SECURITY_CHECKLIST.md)
+for running it in production (a non-root `Dockerfile` is at the repo root).
 
 ---
 

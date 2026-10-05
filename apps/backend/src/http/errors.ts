@@ -6,6 +6,10 @@ import { ErrorCodes, type ErrorCode } from "@luvora/shared";
  * that nothing beyond `code` and `message` reaches the client (§52).
  */
 export class AppError extends Error {
+  /** Optional Retry-After hint (seconds) for throttling responses. The error
+   *  handler emits a `Retry-After` header when set. */
+  public retryAfterSeconds?: number;
+
   constructor(
     public readonly code: ErrorCode,
     public readonly httpStatus: number,
@@ -14,6 +18,12 @@ export class AppError extends Error {
   ) {
     super(message);
     this.name = "AppError";
+  }
+
+  /** Attach a Retry-After hint (fluent). */
+  withRetryAfter(seconds: number): this {
+    this.retryAfterSeconds = Math.max(1, Math.floor(seconds));
+    return this;
   }
 }
 
@@ -175,6 +185,14 @@ export const Errors = {
     new AppError(ErrorCodes.JOB_NOT_FOUND, 404, message),
   queueBackpressure: (message = "The job queue is at capacity; try again shortly.") =>
     new AppError(ErrorCodes.QUEUE_BACKPRESSURE, 503, message),
+
+  // ---- Security hardening (Increment 11) ----
+  payloadTooLarge: (message = "Request payload is too large.") =>
+    new AppError(ErrorCodes.PAYLOAD_TOO_LARGE, 413, message),
+  tooManyConnections: (message = "Too many concurrent connections.") =>
+    new AppError(ErrorCodes.TOO_MANY_CONNECTIONS, 429, message),
+  mediaDimensionsTooLarge: (message = "The image dimensions exceed the allowed maximum.") =>
+    new AppError(ErrorCodes.MEDIA_DIMENSIONS_TOO_LARGE, 400, message),
 
   // ---- Observability & operations (Increment 10) ----
   jobNotRetryable: (message = "This job cannot be retried in its current state.") =>

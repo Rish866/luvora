@@ -63,6 +63,24 @@ export function recordWsError(channel: WsChannelLabel): void {
   }
 }
 
+/** A connection was refused because the user exceeded the per-user cap. */
+export function recordWsConnectionRejected(channel: WsChannelLabel, reason: string): void {
+  try {
+    metrics.incr("ws_connections_rejected_total", { channel, reason });
+  } catch {
+    /* best-effort */
+  }
+}
+
+/** An inbound event was dropped by the per-connection rate throttle. */
+export function recordWsEventRejected(channel: WsChannelLabel): void {
+  try {
+    metrics.incr("ws_events_rejected_total", { channel });
+  } catch {
+    /* best-effort */
+  }
+}
+
 /** Current active connections across both channels (gauge-style snapshot for
  *  health/diagnostics; derived from the live registries, not a counter). */
 export function activeWebsocketConnections(): { chat: number; game: number; total: number } {
