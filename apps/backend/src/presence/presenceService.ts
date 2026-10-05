@@ -1,5 +1,6 @@
 import { PresenceStatus, type PresenceView } from "@luvora/shared";
 import { query } from "../db/pool";
+import { config } from "../config";
 import { Errors } from "../http/errors";
 import { logger } from "../logger";
 import { presenceRegistry } from "./presenceRegistry";
@@ -96,6 +97,45 @@ export function initPresence(): void {
       logger.warn({ err: (err as Error).message }, "presence transition handling failed"),
     );
   });
+  startReaper();
+}
+
+/**
+ * Periodic TTL reaper: reclaims presence for connections that stopped sending
+ * heartbeats (crashed process / dropped socket) so a user is not left ONLINE
+ * forever. Transitions flow through the same `onTransition` listener, so a
+ * reaped user gets last-seen persistence + a `presence.changed` OFFLINE event.
+ *
+ * Not started under test (the suite drives presence deterministically and a
+ * background timer would introduce flakiness); tests exercise reaping by
+ * calling `reapNow()` directly.
+ */
+let reaper: NodeJS.Timeout | null = null;
+function startReaper(): void {
+  if (config.isTest) return;
+  if (reaper) return;
+  const intervalMs = Math.max(1000, config.presence.heartbeatSeconds * 1000);
+  reaper = setInterval(() => {
+    try {
+      presenceRegistry.reapExpired();
+    } catch (err) {
+      logger.warn({ err: (err as Error).message }, "presence reaper failed");
+    }
+  }, intervalMs);
+  reaper.unref();
+}
+
+/** Test/ops helper: run one reap pass synchronously. Returns users set OFFLINE. */
+export function reapNow(now?: number): string[] {
+  return presenceRegistry.reapExpired(now);
+}
+
+/** Stop the reaper (graceful shutdown). */
+export function stopPresence(): void {
+  if (reaper) {
+    clearInterval(reaper);
+    reaper = null;
+  }
 }
 
 /** Authorized presence lookup for the HTTP API. */

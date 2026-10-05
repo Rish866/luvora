@@ -13,6 +13,9 @@ import * as reportRepo from "./reportRepository";
 import * as adminMedia from "./adminMediaService";
 import * as userSafety from "./userSafetyService";
 import * as auditRepo from "./auditRepository";
+import { audit } from "./auditService";
+import * as deviceRepo from "../notifications/deviceRepository";
+import * as deliveryRepo from "../notifications/deliveryRepository";
 import { encodeCursor, decodeCursor } from "./adminCursor";
 
 /**
@@ -285,6 +288,43 @@ adminRouter.post(
       ctx: ctxOf(req),
     });
     ok(res, result);
+  }),
+);
+
+// ======================= DEVICE / DELIVERY DIAGNOSTICS (admin only) ============
+//
+// Admins may inspect a user's registered devices + the latest delivery status
+// for support/safety — but NEVER the raw push token. The DTO exposes only
+// id/platform/provider/fingerprint/active/timestamps + last delivery status.
+// The inspection itself is audited.
+
+adminRouter.get(
+  "/users/:id/devices",
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const { id } = uuidParam("id").parse(req.params);
+    const rows = await deviceRepo.listForUser(id);
+    const devices = await Promise.all(
+      rows.map(async (row) => {
+        const deliveries = await deliveryRepo.listForDevice(row.id);
+        const latest = deliveries[0];
+        return {
+          ...deviceRepo.toView(row), // never includes the raw token
+          lastDeliveryStatus: latest ? latest.status : null,
+          lastDeliveryErrorCode: latest ? latest.last_error_code : null,
+          lastDeliveryAt: latest ? latest.updated_at : null,
+        };
+      }),
+    );
+    await audit({
+      actorUserId: req.userId!,
+      action: "user.devices_inspected",
+      targetType: "USER",
+      targetId: id,
+      metadata: { deviceCount: devices.length },
+      ...ctxOf(req),
+    });
+    ok(res, { devices });
   }),
 );
 

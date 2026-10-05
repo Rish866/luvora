@@ -69,18 +69,39 @@ notificationRouter.get(
   }),
 );
 
-// PUT /api/notifications/preferences  { category, enabled }
+// PUT /api/notifications/preferences
+//   { category, enabled }        -> toggle whether the in-app notification exists
+//   { category, pushEnabled }    -> toggle out-of-band PUSH delivery (Inc. 8)
+// Exactly one of `enabled` / `pushEnabled` must be provided.
 notificationRouter.put(
   "/preferences",
   asyncHandler(async (req, res) => {
     const body = z
-      .object({ category: z.nativeEnum(NotificationCategory), enabled: z.boolean() })
+      .object({
+        category: z.nativeEnum(NotificationCategory),
+        enabled: z.boolean().optional(),
+        pushEnabled: z.boolean().optional(),
+      })
+      .refine(
+        (b) => (b.enabled === undefined) !== (b.pushEnabled === undefined),
+        "Provide exactly one of `enabled` or `pushEnabled`.",
+      )
       .parse(req.body);
-    // Critical categories cannot be disabled.
-    if (!body.enabled && CRITICAL_CATEGORIES.has(body.category)) {
+
+    // SAFETY is critical: neither its in-app existence nor its push delivery may
+    // be disabled, so the user can never silence a safety notice.
+    if (
+      (body.enabled === false || body.pushEnabled === false) &&
+      CRITICAL_CATEGORIES.has(body.category)
+    ) {
       throw Errors.criticalPreference();
     }
-    await service.setPreference(req.userId!, body.category, body.enabled);
+
+    if (body.enabled !== undefined) {
+      await service.setPreference(req.userId!, body.category, body.enabled);
+    } else {
+      await service.setPushPreference(req.userId!, body.category, body.pushEnabled!);
+    }
     const preferences = await service.getPreferences(req.userId!);
     ok(res, { preferences });
   }),

@@ -169,6 +169,16 @@ export async function getOwned(userId: string, id: string): Promise<Notification
   return rows[0] ?? null;
 }
 
+/** Fetch a notification by id (used by the delivery dispatcher to rebuild a
+ *  safe payload on retry). */
+export async function getById(id: string): Promise<NotificationRow | null> {
+  const rows = await query<NotificationRow>(
+    `SELECT * FROM notifications WHERE id = $1`,
+    [id],
+  );
+  return rows[0] ?? null;
+}
+
 /** Delete expired notifications (operational cleanup; idempotent). */
 export async function deleteExpired(): Promise<number> {
   const rows = await query<{ id: string }>(
@@ -217,9 +227,56 @@ export async function upsertPreference(
   );
 }
 
+/** Set the PUSH delivery preference for a category (distinct from whether the
+ *  in-app notification exists). Missing row = default push-enabled. */
+export async function upsertPushPreference(
+  userId: string,
+  category: NotificationCategory,
+  pushEnabled: boolean,
+): Promise<void> {
+  await query(
+    `INSERT INTO notification_preferences (user_id, category, enabled, push_enabled)
+     VALUES ($1, $2, true, $3)
+     ON CONFLICT (user_id, category)
+     DO UPDATE SET push_enabled = EXCLUDED.push_enabled, updated_at = now()`,
+    [userId, category, pushEnabled],
+  );
+}
+
+/** True if PUSH delivery is enabled for the category. Missing row = default
+ *  enabled (lazy default; no init race). */
+export async function isPushEnabled(
+  userId: string,
+  category: NotificationCategory,
+): Promise<boolean> {
+  const rows = await query<{ push_enabled: boolean }>(
+    `SELECT push_enabled FROM notification_preferences WHERE user_id = $1 AND category = $2`,
+    [userId, category],
+  );
+  if (rows.length === 0) return true; // default push-enabled
+  return rows[0].push_enabled;
+}
+
+export async function listPushPreferences(
+  userId: string,
+): Promise<Map<NotificationCategory, boolean>> {
+  const rows = await query<{ category: NotificationCategory; push_enabled: boolean }>(
+    `SELECT category, push_enabled FROM notification_preferences WHERE user_id = $1`,
+    [userId],
+  );
+  const map = new Map<NotificationCategory, boolean>();
+  for (const r of rows) map.set(r.category, r.push_enabled);
+  return map;
+}
+
 export function toPreferenceViews(
   stored: Map<NotificationCategory, boolean>,
+  push: Map<NotificationCategory, boolean>,
   all: NotificationCategory[],
 ): NotificationPreferenceView[] {
-  return all.map((category) => ({ category, enabled: stored.get(category) ?? true }));
+  return all.map((category) => ({
+    category,
+    enabled: stored.get(category) ?? true,
+    pushEnabled: push.get(category) ?? true,
+  }));
 }

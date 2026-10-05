@@ -156,6 +156,20 @@ export const Errors = {
   criticalPreference: (message = "This notification category cannot be disabled.") =>
     new AppError(ErrorCodes.CRITICAL_PREFERENCE, 400, message),
 
+  // ---- Notification delivery + devices (Increment 8) ----
+  /** Opaque: used for both "does not exist" and "not yours" so device ids
+   *  cannot be probed via IDOR. */
+  deviceNotFound: (message = "Device not found.") =>
+    new AppError(ErrorCodes.DEVICE_NOT_FOUND, 404, message),
+  deviceNotAuthorized: (message = "You are not authorized to manage this device.") =>
+    new AppError(ErrorCodes.DEVICE_NOT_AUTHORIZED, 403, message),
+  invalidDeviceToken: (message = "The device token is invalid.") =>
+    new AppError(ErrorCodes.INVALID_DEVICE_TOKEN, 400, message),
+  pushProviderUnavailable: (message = "Push delivery is currently unavailable.") =>
+    new AppError(ErrorCodes.PUSH_PROVIDER_UNAVAILABLE, 503, message),
+  presenceBackendUnavailable: (message = "Presence is currently unavailable.") =>
+    new AppError(ErrorCodes.PRESENCE_BACKEND_UNAVAILABLE, 503, message),
+
   internal: (message = "An unexpected error occurred.") =>
     new AppError(ErrorCodes.INTERNAL, 500, message),
 };

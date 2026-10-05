@@ -18,9 +18,10 @@ This repository contains **Increment 1 (backend foundation)**,
 **Increment 2 (discovery & matching)**, **Increment 3 (private chat +
 WebSockets)**, **Increment 4 (data-driven fantasy engine)**,
 **Increment 5 (secure media, attachments & moderation)**,
-**Increment 6 (admin + safety + moderation operations)**, and
-**Increment 7 (notifications + presence infrastructure)**. All are working,
-tested slices (not mocked screens).
+**Increment 6 (admin + safety + moderation operations)**,
+**Increment 7 (notifications + presence infrastructure)**, and
+**Increment 8 (production notification delivery + distributed presence
+infrastructure)**. All are working, tested slices (not mocked screens).
 
 **Increment 1 — foundation:**
 - ✅ Auth: register / login / refresh / logout / logout-all / `me`
@@ -137,19 +138,57 @@ tested slices (not mocked screens).
 - ✅ Suspension force-closes a user's sockets, which flips them `OFFLINE` through the
       same registry path
 
-- ✅ **261 passing tests** (225 prior + 36 new) against a real PostgreSQL, including
-      notification dedup/expiry/preferences, SAFETY bypass, feed IDOR, presence
+- ✅ Notification dedup/expiry/preferences, SAFETY bypass, feed IDOR, presence
       accounting across channels, last-seen-on-final-close, presence visibility
       privacy, and real-time `notification.created` / `presence.changed` delivery
-      to authorized observers only. **135 live end-to-end smoke checks** (102 prior +
-      33 new) pass against the running server.
+      to authorized observers only.
 
-> **Honesty note (Increment 7).** Presence is **process-local**: with multiple
-> backend instances it would require a shared store / pub-sub (e.g. Redis), which is
-> **not** implemented. There is **no** push-notification delivery — no FCM, no APNs,
-> no web-push — only in-app PostgreSQL notifications plus the optional WebSocket
-> event. A future push provider would plug in behind the existing notification
-> service as a new delivery channel; that abstraction is noted but not built.
+**Increment 8 — production notification delivery + distributed presence infra:**
+- ✅ **Device registration** (`/api/notifications/devices`) — register (idempotent,
+      owner-bound; body `userId` ignored), list, revoke (owner-only, IDOR-safe).
+      Raw push tokens are **never** returned or logged — only a short fingerprint
+      + metadata; uniqueness/dedup use a SHA-256 hash (migration `0008`)
+- ✅ **Per-(notification, device, channel) delivery tracking** with a status
+      machine (`PENDING→SENT→DELIVERED` / `FAILED` / `REVOKED`), **idempotent** via
+      a DB unique index + `ON CONFLICT`, **bounded retry** (max 5) for temporary
+      failures, and **automatic device revocation** on a permanent invalid-token
+      failure
+- ✅ **Push provider abstraction** (`PushProvider`): `TestPushProvider`
+      (deterministic, used in tests + live smoke) and `DisabledPushProvider` (the
+      safe default). `FcmPushProvider` / `ApnsPushProvider` are **interface
+      placeholders** — no SDK, no credentials, no network, no fake delivery
+- ✅ **Minimal push payload** — only `{type, notificationId, category,
+      entityType, entityId}`; never message bodies, consent, media keys,
+      moderation internals, suspension reason, or tokens
+- ✅ **Push preferences** distinct from notification existence — disabling push
+      keeps the in-app notification; **SAFETY** push cannot be disabled
+- ✅ **Distributed presence abstraction** (`PresenceBackend`): the registry is now
+      `LocalPresenceBackend` with per-connection ref-counting **plus heartbeat/TTL
+      reaping** (a crashed process no longer leaves a user ONLINE forever);
+      `DistributedPresenceBackend` is a documented placeholder
+- ✅ **Realtime bus abstraction** (`RealtimeBus`): events are published to a bus
+      and fanned out by a per-process sink; `LocalRealtimeBus` is the default,
+      `DistributedRealtimeBus` a placeholder. Envelopes carry a deterministic
+      `eventId` so duplicate deliveries never double-send or create duplicate DB rows
+- ✅ **Admin device diagnostics** (`GET /api/admin/users/:id/devices`, audited) —
+      metadata + last delivery status only, never the raw token
+- ✅ Mutual-match path hardened with a transaction-scoped advisory lock so
+      concurrent reciprocal likes deterministically yield exactly one match
+
+- ✅ **297 passing tests** (261 prior + 36 new) against a real PostgreSQL,
+      run repeatedly, covering device registration/IDOR/token-privacy, push
+      delivery/dedup/retry/revocation, push preferences + SAFETY bypass, presence
+      TTL/heartbeat, the realtime bus + a two-instance simulation, and the
+      distributed-abstraction contracts. **164 live end-to-end smoke checks**
+      (135 prior + 29 new) pass using the TEST push provider (no real credentials).
+
+> **Honesty note (Increments 7–8).** There is **no** real push delivery — FCM,
+> APNs, and Web Push are interface placeholders only (no SDK, no credentials, no
+> network calls); the TEST/DISABLED providers are the only ones that run.
+> Presence and the realtime bus are still **process-local**: selecting a
+> `distributed` backend degrades to the in-process implementation and logs a
+> warning. **Redis is never a required dependency** and is not used by any test.
+> Wiring real Redis presence/pub-sub and real push SDKs is deliberate future work.
 
 See [`docs/INCREMENTS.md`](docs/INCREMENTS.md) for the roadmap and what is
 **intentionally deferred** to later increments.
@@ -297,23 +336,27 @@ See [`docs/SECURITY.md`](docs/SECURITY.md) for details and known gaps.
 
 ## What is implemented vs. deferred
 
-**Implemented (Increments 1–7, backend):** auth + 18+ age gate; consent + session
+**Implemented (Increments 1–8, backend):** auth + 18+ age gate; consent + session
 state machine; discovery/matching/blocking; private chat (REST + `/ws/chat`);
 the data-driven fantasy engine + scenario library + gameplay (`/ws/game`); secure
 media uploads, chat attachments, and the moderation/safety pipeline; the admin
 control plane — RBAC, safety reports, moderation queue + media moderation, user
-suspension/role management with session revocation, and audit logging; and
-in-app notifications + process-local presence (feed/unread/read-state,
-per-category preferences, dedup, expiry/cleanup, privacy-aware presence, and
-real-time `notification.created` / `presence.changed` WebSocket events).
+suspension/role management with session revocation, and audit logging; in-app
+notifications + presence (feed/unread/read-state, per-category preferences,
+dedup, expiry/cleanup, privacy-aware presence, real-time WebSocket events); and
+the notification **delivery layer** — device registration, per-channel delivery
+tracking with idempotency/bounded-retry/token-revocation, a push-provider
+abstraction, push preferences, a heartbeat/TTL presence model, and
+presence/realtime-bus abstractions for future horizontal scale.
 
 **Intentionally deferred** (later increments): production media providers
 (S3/R2 storage, real malware scanner, real content-safety moderation — the
 interfaces exist, only local/test adapters ship); fantasy-session user media;
-multi-instance WebSocket scaling **and distributed presence** (both process-local
-today — a shared store / pub-sub such as Redis is required for horizontal scale
-and is not implemented); **push-notification delivery** (no FCM / APNs / web-push —
-only in-app notifications ship; a push provider would plug in behind the
-notification service as a future delivery channel); a moderation/admin UI; admin
-MFA; recommendations; payments; production infrastructure; and all
-frontend/Android UI. See [`docs/INCREMENTS.md`](docs/INCREMENTS.md).
+**real push delivery** (FCM / APNs / Web Push are interface placeholders — no
+SDK, no credentials, no network; only the TEST/DISABLED providers run);
+**distributed presence and cross-instance realtime** (the `PresenceBackend` /
+`RealtimeBus` abstractions ship, but the shared-store/pub-sub — e.g. Redis —
+implementations are placeholders that degrade to in-process; Redis is never
+required); a moderation/admin UI; admin MFA; recommendations; payments;
+production infrastructure; and all frontend/Android UI. See
+[`docs/INCREMENTS.md`](docs/INCREMENTS.md).

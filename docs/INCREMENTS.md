@@ -232,13 +232,93 @@ adapters (interfaces exist); fantasy-session user media.
 (distributed) presence needs a shared store / pub-sub (e.g. Redis) and is **not**
 implemented. There is **no** push delivery (no FCM / APNs / web-push); only in-app
 notifications ship. A push provider would be added behind the notification service
-as a new delivery channel (abstraction noted, not built).
+as a new delivery channel (abstraction noted, not built). → **Addressed in
+Increment 8** (the delivery/presence/bus abstractions now exist; the real Redis /
+FCM / APNs adapters remain future work).
 
-## ⏳ Increment 8 — Android client (React Native)
+## ✅ Increment 8 — Notification delivery + distributed presence infrastructure (DONE)
+
+Backend-only. Adds the production-shaped **delivery layer** and the
+**abstractions** needed for horizontal scale, without making Redis/FCM/APNs
+mandatory. PostgreSQL stays authoritative; WebSocket and push are both
+best-effort.
+
+- **Migration `0008_notification_delivery.sql`** (additive, backward-compatible):
+  - `notification_devices` — registered push targets owned by a user (platform
+    `WEB`/`ANDROID`/`IOS`, provider `FCM`/`APNS`/`WEB_PUSH`/`TEST`/`DISABLED`,
+    the raw `token`, a `token_hash`, a short `token_fingerprint`, label,
+    timestamps, `revoked_at`). A **partial unique index** on
+    `(user_id, token_hash) WHERE revoked_at IS NULL` makes registration
+    idempotent and lets a revoked token re-register.
+  - `notification_deliveries` — one row per `(notification, device, channel)`
+    with a status machine (`PENDING→SENT→DELIVERED` / `FAILED` / `REVOKED`),
+    `attempt_count`, sanitized `last_error_code`, `provider_message_id`. A
+    **unique index** on `(notification_id, channel, COALESCE(device_id, …))`
+    guarantees idempotent, race-safe delivery via `ON CONFLICT DO NOTHING`.
+  - `notification_preferences.push_enabled` — a PUSH toggle **distinct** from
+    whether the in-app notification exists.
+- **Device registration API** (`/api/notifications/devices`, auth-scoped,
+  rate-limited): register (idempotent; the caller always owns it — body
+  `userId` is ignored), list (safe metadata only — **never the raw token**),
+  and revoke (owner-only; IDOR → opaque `DEVICE_NOT_FOUND`).
+- **Push provider abstraction** (`PushProvider`): `TestPushProvider`
+  (deterministic, in-process, used by tests + the live smoke run) and
+  `DisabledPushProvider` (the safe default — no delivery). `FcmPushProvider` /
+  `ApnsPushProvider` are **architectural placeholders**: they fail safely with a
+  "not configured" error and contain **no** real SDK integration or credentials.
+- **Delivery dispatcher**: after a notification is persisted, best-effort
+  push to the recipient's active devices (and a recorded REALTIME attempt).
+  **Idempotent** (DB-unique delivery rows), **bounded retry** for temporary
+  failures (max 5 attempts), and **automatic device revocation** on a permanent
+  (invalid-token) failure. Never throws into the caller — a provider outage
+  cannot roll back the notification.
+- **Minimal push payload**: carries only `{type, notificationId, category,
+  entityType, entityId}` — **no** title/body text, message content, consent,
+  media keys, moderation details, suspension reason, or tokens. The recipient
+  re-fetches via the authenticated feed.
+- **Push preferences**: disabling push for a category suppresses PUSH only; the
+  in-app notification is still created. **SAFETY** push cannot be disabled and
+  always delivers.
+- **Distributed presence abstraction** (`PresenceBackend`): the Increment 7
+  registry is refactored into `LocalPresenceBackend` (default) with per-connection
+  ref-counting across both channels **plus a heartbeat/TTL model** so a crashed
+  process no longer leaves a user ONLINE forever (a periodic reaper reclaims
+  stale connections and emits OFFLINE + persists last-seen).
+  `DistributedPresenceBackend` is a documented placeholder that degrades to local
+  until a shared-store client is wired.
+- **Realtime bus abstraction** (`RealtimeBus`): user-scoped events are now
+  published to a bus and fanned out by a per-process sink to the sockets THIS
+  instance holds. `LocalRealtimeBus` (in-process emitter) is the default;
+  `DistributedRealtimeBus` is a documented placeholder for cross-instance
+  pub/sub. Envelopes carry a deterministic `eventId` so duplicate deliveries are
+  dropped and never create duplicate DB notifications.
+- **Cleanup** extended for revoked devices + terminal delivery records
+  (30-day retention); notifications keep their existing retention.
+- **Admin diagnostics**: `GET /api/admin/users/:id/devices` (admin-only,
+  audited) exposes device metadata + last delivery status — **never** the raw
+  token.
+- **Concurrency hardening**: the mutual-match path now takes a transaction-scoped
+  advisory lock on the canonical pair, so concurrent reciprocal likes
+  deterministically yield exactly one match (closing a pre-existing READ
+  COMMITTED visibility race).
+- 36 new tests (9 device + 15 delivery + 10 distributed-abstraction + 2
+  presence/delivery integration). **Total: 297 passing** against real
+  PostgreSQL, run repeatedly. Live smoke: **164/164** (135 prior + 29 new),
+  using the TEST push provider (no real credentials).
+
+**Honesty note / deferred:** **no** real push delivery ships — FCM, APNs, and
+Web Push are interface placeholders only (no SDKs, no credentials, no network
+calls); the TEST/DISABLED providers are the only ones that run. Presence and the
+realtime bus are still **process-local**: `distributed` selections degrade to the
+local implementation and log a warning. **Redis is never a required dependency**
+and is not used by any test. Wiring real Redis presence/pub-sub and real push
+SDKs is future work.
+
+## ⏳ Increment 9 — Android client (React Native)
 
 Onboarding/age gate, the five sections, consent + gameplay UI, push, offline UX.
 
-## ⏳ Increment 9 — Hardening
+## ⏳ Increment 10 — Hardening
 
 Full security test matrix, load testing, OpenAPI/WS docs, deployment runbooks,
 Android release build.

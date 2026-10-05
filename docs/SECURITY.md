@@ -221,15 +221,65 @@
   placeholders and fixed, allow-listed SQL fragments (the keyset/unread clauses);
   all user values pass as bound parameters.
 
+## Notification delivery & presence security (Increment 8)
+- **Device tokens are credentials.** The raw push token is stored only to call
+  the provider; it is **never** returned by any API (user list, registration
+  response, or the admin diagnostics view all expose only a short
+  non-reversible fingerprint + metadata), and it is **never** logged (the only
+  token-adjacent log field is `token_fingerprint`). Uniqueness/dedup use a
+  SHA-256 hash, not the raw value.
+- **Ownership, never client-supplied identity.** Device registration always
+  binds to the authenticated caller; a `userId` in the body is ignored. Listing
+  and revoking are scoped to the owner; an IDOR attempt returns an opaque
+  `404 DEVICE_NOT_FOUND` so device ids cannot be probed. Roles are still read
+  live from the DB, never from client input.
+- **Minimal push payloads.** A push carries only `{type, notificationId,
+  category, entityType, entityId}` — no title/body text, message content,
+  consent answers, media storage keys, moderation details, suspension reason, or
+  tokens (asserted by tests). The recipient re-fetches the real content through
+  the authenticated feed.
+- **Best-effort delivery never weakens persistence or safety.** Push/WebSocket
+  delivery failures never roll back a notification and never throw into the
+  caller. Account-state protections are preserved: the notification service
+  still suppresses notifications for non-ACTIVE recipients (so a suspended user
+  is not pushed to while inactive), while SAFETY notices are created before
+  suspension exactly as in Increment 6/7.
+- **SAFETY push is non-suppressible.** Push for the SAFETY category cannot be
+  disabled (`CRITICAL_PREFERENCE`) and the service bypasses the push-preference
+  check for it — even a directly-inserted disabled row cannot silence it
+  (tested).
+- **Idempotent, race-safe delivery.** Delivery rows are unique per
+  `(notification, device, channel)` via a DB index + `ON CONFLICT DO NOTHING`;
+  concurrent dispatch produces exactly one row (tested). Permanent (invalid
+  token) failures revoke the device and never retry; temporary failures retry
+  under a bounded cap (max 5) — no infinite loops.
+- **Sanitized provider errors.** Only a short, token-free, uppercased error
+  code is persisted (`last_error_code`); full provider responses and credentials
+  are never stored. Provider credentials are read from config/secret manager and
+  never committed.
+- **Presence privacy preserved + crash-safe.** The heartbeat/TTL reaper flips a
+  user OFFLINE when their connection goes stale, but presence visibility is
+  unchanged: only ACTIVE-match, non-blocked observers see it, strangers get a
+  generic `PRESENCE_NOT_AUTHORIZED`, and no IP / device / socket-count /
+  connection-id / backend-instance is ever exposed.
+- **No fake production providers.** `FcmPushProvider`/`ApnsPushProvider` and the
+  distributed presence/bus classes are interface placeholders that fail safe or
+  degrade to the local implementation; they contain no SDK, credentials, or
+  network calls and never pretend to deliver.
+- **Parameterized SQL** throughout the delivery/device repositories (bound `$N`
+  parameters only; no interpolation of user data).
+
 ## Known gaps (planned for later increments)
 - Email/phone verification flow (fields exist; sending not wired).
-- **Push-notification delivery** (FCM / APNs / web-push) is **not** implemented —
-  only in-app PostgreSQL notifications plus the optional WebSocket event ship. A
-  push provider would be added behind the notification service as a new delivery
-  channel (abstraction noted, not built).
-- Multi-instance WebSocket delivery **and distributed presence** (both
-  process-local today; need a shared store / pub-sub such as Redis — deferred to
-  the hardening increment).
+- **Real push delivery** (FCM / APNs / Web Push) — the provider abstraction,
+  device registry, delivery tracking, retry, and token revocation all ship, but
+  the concrete FCM/APNs/Web-Push adapters are placeholders (no SDK, no
+  credentials, no network). Only the TEST/DISABLED providers run today.
+- **Distributed presence and cross-instance realtime** — the `PresenceBackend`
+  and `RealtimeBus` abstractions ship, but the shared-store (e.g. Redis)
+  implementations are placeholders that degrade to the in-process versions.
+  Multi-instance deployment requires wiring those. Redis is never a required
+  dependency and is not used by any test.
 - A moderation/admin UI (this increment is backend/API only).
 - **Production media providers:** real S3/R2 storage adapters, a real malware
   scanner (ClamAV/cloud), and a real content-safety moderation provider — the

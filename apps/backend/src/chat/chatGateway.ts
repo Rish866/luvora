@@ -1,4 +1,5 @@
 import type { IncomingMessage } from "node:http";
+import { randomUUID } from "node:crypto";
 import { WebSocketServer, WebSocket } from "ws";
 import {
   ChatCloseCodes,
@@ -23,12 +24,21 @@ import type { WsChannel, WsDispatcher } from "../ws/wsDispatcher";
 
 interface SocketState {
   userId: string;
+  /** Per-socket id for presence ref-counting across channels. */
+  connectionId: string;
   isAlive: boolean;
   /** Timestamps of recent inbound events for a simple per-connection throttle. */
   recent: number[];
 }
 
-const HEARTBEAT_INTERVAL_MS = 30_000;
+// Ping frequently enough that a healthy socket refreshes its presence TTL well
+// before it lapses (ping interval ≈ half the presence heartbeat, min 5s). A
+// pong refreshes the TTL; several missed pongs within the TTL window trigger a
+// reap. Bounded so a very short configured TTL still pings sanely.
+const HEARTBEAT_INTERVAL_MS = Math.max(
+  5_000,
+  Math.floor((config.presence.heartbeatSeconds * 1000) / 2),
+);
 // Per-connection inbound event throttle (sliding window).
 const WS_RATE_WINDOW_MS = 10_000;
 const WS_RATE_MAX = 50;
@@ -187,21 +197,27 @@ export function attachChatGateway(dispatcher: WsDispatcher): ChatGateway {
   const wss = new WebSocketServer({ noServer: true });
 
   const onConnection: WsChannel["onConnection"] = (socket, _req, userId) => {
-    const state: SocketState = { userId, isAlive: true, recent: [] };
+    const connectionId = `chat:${randomUUID()}`;
+    const state: SocketState = { userId, connectionId, isAlive: true, recent: [] };
     stateBySocket.set(socket, state);
 
     hub.add(userId, socket);
     // Presence: count this socket toward the user's cross-channel presence.
-    presenceRegistry.connect(userId);
+    presenceRegistry.connect(userId, connectionId);
     logger.info({ userId, sockets: hub.socketCount() }, "chat ws established");
 
     send(socket, { type: "connection.ready", userId });
 
     socket.on("pong", () => {
       state.isAlive = true;
+      // A live pong refreshes the presence TTL so a healthy connection is never
+      // reaped as stale.
+      presenceRegistry.heartbeat(userId, connectionId);
     });
 
     socket.on("message", (data) => {
+      // Any inbound activity also counts as a heartbeat for presence TTL.
+      presenceRegistry.heartbeat(userId, connectionId);
       if (!allowEvent(state)) {
         sendError(socket, "RATE_LIMITED", "Too many messages. Slow down.");
         return;
@@ -218,7 +234,7 @@ export function attachChatGateway(dispatcher: WsDispatcher): ChatGateway {
 
     socket.on("close", () => {
       hub.remove(userId, socket);
-      presenceRegistry.disconnect(userId);
+      presenceRegistry.disconnect(userId, connectionId);
       stateBySocket.delete(socket);
       logger.info({ userId, sockets: hub.socketCount() }, "chat ws closed");
       void emitPresenceToPartner; // reserved for subscription-based presence

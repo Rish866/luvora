@@ -768,3 +768,112 @@ Suspending a user force-closes their sockets, which flips them `OFFLINE` through
 the same path. **Limitation:** this is process-local — across multiple backend
 instances, presence would require a shared store / pub-sub (e.g. Redis), which is
 not implemented in this increment.
+
+## Notification delivery & devices (Increment 8)
+
+Builds on Increment 7. PostgreSQL notifications remain authoritative; both the
+WebSocket event and push delivery are **best-effort**. There is **no** real push
+delivery in this increment — FCM/APNs/Web Push are interface placeholders; only
+the TEST (dev/test) and DISABLED (default) providers actually run.
+
+All endpoints require authentication and operate only on the caller's own data.
+
+### Device registration — *auth required, rate-limited*
+
+```
+POST   /api/notifications/devices        { platform, provider, token, label? }
+GET    /api/notifications/devices
+DELETE /api/notifications/devices/:id
+```
+
+- `platform` ∈ `WEB` · `ANDROID` · `IOS`; `provider` ∈ `FCM` · `APNS` ·
+  `WEB_PUSH` · `TEST` · `DISABLED`. `token` is an opaque provider credential
+  (8–4096 chars).
+- **Register** is idempotent: re-registering the same token for the caller
+  updates it in place (one active row). The caller **always** owns the
+  registration — a `userId` in the body is ignored.
+- The response/list DTO exposes only safe metadata — **never the raw token**:
+  ```json
+  {
+    "id": "uuid",
+    "platform": "ANDROID",
+    "provider": "FCM",
+    "tokenFingerprint": "a1b2c3d4e5f6",
+    "label": "Pixel 8",
+    "active": true,
+    "createdAt": "…",
+    "lastSeenAt": "…",
+    "revokedAt": null
+  }
+  ```
+- **Delete** revokes the caller's device. Revoking a device that does not exist
+  or belongs to another user returns `404 DEVICE_NOT_FOUND` (opaque — a device
+  id cannot be probed via IDOR).
+
+### Push preferences
+
+The existing preferences endpoint accepts a `pushEnabled` toggle, **distinct**
+from `enabled` (which controls whether the in-app notification is created):
+
+```
+PUT /api/notifications/preferences   { "category": "MESSAGES", "pushEnabled": false }
+```
+
+Disabling push for a category suppresses **PUSH delivery only** — the in-app
+notification is still created and still appears in the feed. The critical
+**SAFETY** category cannot be disabled for push either (`400 CRITICAL_PREFERENCE`).
+The preferences view now returns both flags per category: `{ category, enabled,
+pushEnabled }`.
+
+### Delivery pipeline & semantics
+
+When a notification is created, the service runs a best-effort pipeline:
+realtime `notification.created` → record the realtime attempt → push to the
+recipient's active devices (honouring the push preference; SAFETY always). It
+never throws, so a provider outage cannot roll back the notification.
+
+- **Minimal push payload** — carries only opaque references, never content:
+  ```json
+  { "type": "MESSAGE_RECEIVED", "notificationId": "uuid",
+    "category": "MESSAGES", "entityType": "conversation", "entityId": "uuid" }
+  ```
+  No title/body text, message content, consent answers, media keys, moderation
+  details, suspension reason, or tokens. The client re-fetches via the
+  authenticated feed.
+- **Idempotent** — delivery rows are unique per `(notification, device,
+  channel)`; reprocessing the same notification never duplicates a delivery.
+- **Retries** — a temporary provider failure (timeout/unavailable) is retried up
+  to 5 attempts by `retryFailedDeliveries()` (a callable a future worker invokes;
+  no cron is introduced). A permanent failure (invalid/unregistered token)
+  revokes the device and is never retried.
+
+### Admin device diagnostics — *admin only, audited*
+
+```
+GET /api/admin/users/:id/devices
+```
+
+Returns each device's safe metadata plus its last delivery status/error/time —
+**never** the raw token. The inspection is recorded in the audit log. Moderators
+have no device-inspection endpoint.
+
+### Presence heartbeat / TTL
+
+Presence now has a heartbeat/TTL model: each WebSocket connection refreshes a
+per-connection TTL on every ping-pong and on inbound activity. A periodic reaper
+reclaims connections whose TTL lapsed (e.g. a crashed process that never sent a
+clean disconnect), flipping the user `OFFLINE`, persisting `last_seen_at`, and
+emitting `presence.changed` to authorized observers — the same privacy rules as
+Increment 7 (matched + not blocked). Configurable via `PRESENCE_HEARTBEAT_SECONDS`
+/ `PRESENCE_TTL_SECONDS`.
+
+### Scaling model & limitations (honest)
+
+Presence (`PresenceBackend`) and the realtime bus (`RealtimeBus`) are factored
+behind interfaces so a distributed implementation (e.g. Redis TTL keys + pub/sub)
+can be dropped in. **Those distributed implementations are not built**: selecting
+`PRESENCE_BACKEND=distributed` or `REALTIME_BUS=distributed` degrades safely to
+the in-process implementation and logs a warning. Redis is never required.
+Likewise, `FcmPushProvider` / `ApnsPushProvider` are placeholders with no SDK or
+credentials and do not deliver. The system is fully functional single-instance
+with in-app + WebSocket notifications and the TEST/DISABLED push providers.

@@ -64,6 +64,39 @@ const schema = z.object({
   // Policy when the scanner returns UNKNOWN: 'quarantine' (safe) or 'allow'.
   MEDIA_UNKNOWN_SCAN_POLICY: z.enum(["quarantine", "allow"]).default("quarantine"),
   MEDIA_SIGNED_URL_TTL_SECONDS: z.coerce.number().int().positive().default(300),
+
+  // ---- Notification delivery + presence (Increment 8) ----
+  // Push delivery master switch. When false, the DisabledPushProvider is used
+  // (no external delivery); in-app notifications + WebSocket are unaffected.
+  NOTIFICATION_PUSH_ENABLED: z
+    .string()
+    .default("false")
+    .transform((v) => v === "true"),
+  // Which provider to use when push is enabled. 'test' is the deterministic
+  // in-process provider; 'fcm'/'apns' are placeholders requiring real SDKs +
+  // credentials (they fail safely until implemented); 'disabled' never delivers.
+  PUSH_PROVIDER: z.enum(["disabled", "test", "fcm", "apns"]).default("disabled"),
+  // Presence backend selection. 'local' is process-local (default). 'distributed'
+  // is an architectural placeholder (requires a shared store such as Redis).
+  PRESENCE_BACKEND: z.enum(["local", "distributed"]).default("local"),
+  // Realtime event bus. 'local' is an in-process emitter (default). 'distributed'
+  // is a placeholder for a cross-instance bus (e.g. Redis pub/sub).
+  REALTIME_BUS: z.enum(["local", "distributed"]).default("local"),
+  // Presence heartbeat/TTL (seconds). A connection refreshes its TTL on each
+  // heartbeat; if no heartbeat arrives within the TTL the entry is considered
+  // stale and the user may be treated as OFFLINE even without a clean disconnect.
+  PRESENCE_HEARTBEAT_SECONDS: z.coerce.number().int().positive().default(30),
+  PRESENCE_TTL_SECONDS: z.coerce.number().int().positive().default(90),
+  // Optional provider credentials (never committed; empty = not configured).
+  FCM_PROJECT_ID: z.string().default(""),
+  FCM_CREDENTIALS_JSON: z.string().default(""),
+  APNS_KEY_ID: z.string().default(""),
+  APNS_TEAM_ID: z.string().default(""),
+  APNS_PRIVATE_KEY: z.string().default(""),
+  // Optional Redis URL for a future distributed presence/bus (empty = local).
+  REDIS_URL: z.string().default(""),
+  // Device registration rate limit (per IP window).
+  DEVICE_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(30),
 });
 
 const parsed = schema.safeParse(process.env);
@@ -115,6 +148,34 @@ export const config = {
     moderationMode: env.MEDIA_MODERATION_MODE,
     unknownScanPolicy: env.MEDIA_UNKNOWN_SCAN_POLICY,
     signedUrlTtlSeconds: env.MEDIA_SIGNED_URL_TTL_SECONDS,
+  },
+  // ---- Notification delivery + presence (Increment 8) ----
+  notifications: {
+    pushEnabled: env.NOTIFICATION_PUSH_ENABLED,
+    // When push is disabled globally, force the disabled provider regardless of
+    // PUSH_PROVIDER so no accidental delivery can occur.
+    pushProvider: env.NOTIFICATION_PUSH_ENABLED ? env.PUSH_PROVIDER : "disabled",
+    deviceRateLimitMax: env.DEVICE_RATE_LIMIT_MAX,
+    fcm: {
+      // "configured" only when BOTH a project id and credentials are present.
+      configured: env.FCM_PROJECT_ID.length > 0 && env.FCM_CREDENTIALS_JSON.length > 0,
+    },
+    apns: {
+      configured:
+        env.APNS_KEY_ID.length > 0 &&
+        env.APNS_TEAM_ID.length > 0 &&
+        env.APNS_PRIVATE_KEY.length > 0,
+    },
+  },
+  presence: {
+    backend: env.PRESENCE_BACKEND,
+    heartbeatSeconds: env.PRESENCE_HEARTBEAT_SECONDS,
+    ttlSeconds: env.PRESENCE_TTL_SECONDS,
+    redisUrl: env.REDIS_URL,
+  },
+  realtime: {
+    bus: env.REALTIME_BUS,
+    redisUrl: env.REDIS_URL,
   },
 } as const;
 

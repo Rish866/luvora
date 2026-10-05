@@ -195,6 +195,33 @@ Expiry convention: non-critical notifications are created with a 90-day
 expire). Expired rows are filtered out of the feed/count by
 `(expires_at IS NULL OR expires_at > now())` and removed by the cleanup job.
 
+## Migration 0008 — notification delivery + devices (Increment 8)
+
+`0008_notification_delivery.sql` adds the out-of-band delivery layer. Additive
+and backward-compatible; the legacy `devices` table (0001, unused) is left
+untouched.
+
+| Table / column | Purpose / notable constraints |
+|----------------|-------------------------------|
+| `notification_devices` | Registered push targets owned by a user. `platform` ∈ `WEB`/`ANDROID`/`IOS`, `provider` ∈ `FCM`/`APNS`/`WEB_PUSH`/`TEST`/`DISABLED` (both `CHECK`-constrained). Stores the raw `token` (a credential — **never** selected into any DTO; the repository's `toView` omits it), a `token_hash` (SHA-256, for uniqueness/dedup) and a short `token_fingerprint` (safe UI display). `revoked_at` nullable; `last_seen_at` updated on registration. FK `ON DELETE CASCADE`. |
+| `notification_deliveries` | One row per `(notification, device, channel)`. `channel` ∈ `REALTIME`/`PUSH`; `status` machine `PENDING→SENT→DELIVERED` \| `FAILED` \| `REVOKED`. `attempt_count`, sanitized `last_error_code` (never a full provider response), `provider_message_id`. FKs `ON DELETE CASCADE` to both the notification and the device. |
+| `notification_preferences.push_enabled` (additive column, default `true`) | PUSH delivery toggle, **distinct** from `enabled` (in-app existence). Disabling push never removes the in-app notification. A missing row still means "default" (both enabled). |
+
+Indexes:
+
+| Index | Purpose |
+|-------|---------|
+| `notification_devices_active_token` **unique** partial on `(user_id, token_hash) WHERE revoked_at IS NULL` | At most one ACTIVE registration per `(user, token)`; backs idempotent upsert registration. A revoked row may coexist with a fresh active one. |
+| `notification_devices_user` on `(user_id, created_at DESC)` | List a user's devices. |
+| `notification_devices_revoked` partial `WHERE revoked_at IS NOT NULL` | Cleanup of long-revoked devices. |
+| `notification_deliveries_unique` **unique** on `(notification_id, channel, COALESCE(device_id, '000…0'::uuid))` | Idempotent, race-safe delivery (one logical delivery per notification/device/channel). `device_id` is `NULL` for REALTIME, coalesced to the all-zero UUID in the key. |
+| `notification_deliveries_notification` / `_device` | Lookups per notification / device. |
+| `notification_deliveries_retry` partial `WHERE status = 'FAILED'` | Supports the bounded retry scan. |
+
+Delivery retention: terminal (`DELIVERED`/`REVOKED`) delivery rows and devices
+revoked longer than 30 days are removed by `cleanupDeliveryRecords`; the
+notification tables keep their own retention.
+
 ## Resetting a dev/test database
 
 Migrations are forward-only; to reset, drop and recreate the database, then

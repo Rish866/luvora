@@ -11,6 +11,7 @@ import {
 import * as repo from "./notificationRepository";
 import * as users from "../users/userRepository";
 import { deliverToUser } from "./realtime";
+import { dispatchPush, recordRealtimeAttempt } from "./deliveryDispatcher";
 import { logger } from "../logger";
 
 /**
@@ -99,15 +100,38 @@ export async function create(
 
   const view = repo.toView(row);
 
-  // Real-time delivery only for a genuinely new notification. We emit AFTER a
-  // standalone insert; when inside a caller transaction, the caller should emit
-  // post-commit (see emit()). To keep this simple and avoid pre-commit
-  // delivery, we only auto-emit when NOT given a client.
+  // Delivery pipeline runs only for a genuinely NEW notification (dedup means a
+  // repeated event does not re-deliver). We run it AFTER a standalone insert;
+  // when inside a caller transaction, the caller should call deliver()
+  // post-commit (see emit/deliver). To avoid pre-commit delivery, we only
+  // auto-deliver when NOT given a client.
   if (created && !client) {
-    emit(input.userId, view);
+    void deliver(input.userId, view, category);
   }
 
   return { notification: view, created };
+}
+
+/**
+ * Run the best-effort delivery pipeline for a persisted notification:
+ *   1. real-time `notification.created` to the recipient's sockets (optimization)
+ *   2. record the realtime delivery attempt
+ *   3. push to the recipient's registered devices (honouring push preference)
+ *
+ * Never throws — PostgreSQL persistence already succeeded and must not be
+ * affected by any delivery failure. Call this AFTER commit when `create` was
+ * used with a transaction client.
+ */
+export async function deliver(
+  userId: string,
+  notification: NotificationView,
+  category?: NotificationCategory,
+): Promise<void> {
+  emit(userId, notification);
+  await recordRealtimeAttempt(notification.id).catch(() => undefined);
+  const cat = category ?? NOTIFICATION_CATEGORY[notification.type];
+  const pushAllowed = await isPushAllowed(userId, cat).catch(() => false);
+  await dispatchPush(userId, notification, pushAllowed).catch(() => undefined);
 }
 
 /** Deliver a `notification.created` event to the recipient's sockets. Call
@@ -121,11 +145,24 @@ export function emit(userId: string, notification: NotificationView): void {
   }
 }
 
+/** Whether PUSH delivery is permitted for this (user, category). Critical
+ *  SAFETY notifications always push; others honour the push preference. */
+async function isPushAllowed(
+  userId: string,
+  category: NotificationCategory,
+): Promise<boolean> {
+  if (CRITICAL_CATEGORIES.has(category)) return true;
+  return repo.isPushEnabled(userId, category);
+}
+
 // ---- Preferences ----
 
 export async function getPreferences(userId: string) {
-  const stored = await repo.listPreferences(userId);
-  return repo.toPreferenceViews(stored, ALL_PREFERENCE_CATEGORIES);
+  const [stored, push] = await Promise.all([
+    repo.listPreferences(userId),
+    repo.listPushPreferences(userId),
+  ]);
+  return repo.toPreferenceViews(stored, push, ALL_PREFERENCE_CATEGORIES);
 }
 
 export async function setPreference(
@@ -134,4 +171,14 @@ export async function setPreference(
   enabled: boolean,
 ): Promise<void> {
   await repo.upsertPreference(userId, category, enabled);
+}
+
+/** Set the PUSH delivery preference for a category. SAFETY cannot be disabled
+ *  (guarded in the route, same as the in-app preference). */
+export async function setPushPreference(
+  userId: string,
+  category: NotificationCategory,
+  pushEnabled: boolean,
+): Promise<void> {
+  await repo.upsertPushPreference(userId, category, pushEnabled);
 }

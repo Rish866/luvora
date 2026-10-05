@@ -70,7 +70,11 @@ export interface NotificationView {
 
 export interface NotificationPreferenceView {
   category: NotificationCategory;
+  /** Whether the in-app notification is created for this category at all. */
   enabled: boolean;
+  /** Whether out-of-band PUSH delivery is attempted (distinct from `enabled`;
+   *  Increment 8). Disabling push never suppresses the in-app notification. */
+  pushEnabled: boolean;
 }
 
 // ---- Presence ----

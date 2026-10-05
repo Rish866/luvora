@@ -195,6 +195,23 @@ export async function likeAndMaybeMatch(input: {
       throw new BlockedInteractionError();
     }
 
+    // Canonical pair ordering (user_a < user_b) — used for the advisory lock AND
+    // the match row so both reciprocal likes agree on the same key/row.
+    const [low, high] = actorId < targetId ? [actorId, targetId] : [targetId, actorId];
+
+    // Serialize the reciprocal-check + match-insert critical section for THIS
+    // pair with a transaction-scoped advisory lock. Under READ COMMITTED two
+    // concurrent reciprocal likes could otherwise each fail to see the other's
+    // not-yet-committed LIKE and BOTH skip match creation (resulting in zero
+    // matches). The lock makes the outcome deterministic: whichever transaction
+    // commits its LIKE first, the second observes it and creates the match. The
+    // key is a stable hash of the canonical pair (two 32-bit ints for
+    // pg_advisory_xact_lock(int4, int4)).
+    await client.query(`SELECT pg_advisory_xact_lock($1, $2)`, [
+      pairLockKey(low),
+      pairLockKey(high),
+    ]);
+
     // Upsert the LIKE decision.
     await client.query(
       `INSERT INTO likes (liker_id, likee_id, is_pass)
@@ -215,8 +232,7 @@ export async function likeAndMaybeMatch(input: {
       return { matchId: null, created: false };
     }
 
-    // Canonical pair ordering satisfies the matches_order CHECK (user_a<user_b).
-    const [low, high] = actorId < targetId ? [actorId, targetId] : [targetId, actorId];
+    // (canonical pair `low`/`high` computed above, used for the match row)
 
     // Race-safe insert: ON CONFLICT absorbs a concurrent duplicate. `created`
     // is true only for the insert that actually produced the row, so a caller
@@ -246,4 +262,14 @@ export class BlockedInteractionError extends Error {
     super("Blocked interaction");
     this.name = "BlockedInteractionError";
   }
+}
+
+/** Derive a stable signed 32-bit int from a UUID for pg_advisory_xact_lock.
+ *  Collisions only cause harmless extra serialization between unrelated pairs,
+ *  never incorrect matching. */
+function pairLockKey(userId: string): number {
+  const hex = userId.replace(/-/g, "").slice(0, 8);
+  // Parse as unsigned 32-bit, then map into signed int4 range.
+  const u = parseInt(hex, 16) >>> 0;
+  return u | 0;
 }

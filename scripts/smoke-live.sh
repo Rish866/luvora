@@ -26,6 +26,14 @@ export PORT="4100"
 # exercised by its own dedicated test). Rate limiting itself is covered elsewhere.
 export RATE_LIMIT_MAX="100000"
 export AUTH_RATE_LIMIT_MAX="100000"
+# Increment 8: enable push delivery with the deterministic TEST provider (no
+# external network, no real credentials) so delivery can be exercised live.
+export NOTIFICATION_PUSH_ENABLED="true"
+export PUSH_PROVIDER="test"
+export DEVICE_RATE_LIMIT_MAX="100000"
+# Short presence TTL so heartbeat/TTL behaviour is observable in the smoke run.
+export PRESENCE_HEARTBEAT_SECONDS="1"
+export PRESENCE_TTL_SECONDS="2"
 
 node -r ts-node/register src/db/migrate.ts up >/dev/null 2>&1
 # Seed the published scenario library so the gameplay smoke flow has content.
@@ -461,6 +469,106 @@ check "suspension emits SAFETY notification" '"type":"SAFETY_ACTION"' "$VSAFE"
 # SAFETY notification must not leak the moderator id or the reason.
 if echo "$VSAFE" | grep -q "$UNADM"; then echo "FAIL: SAFETY notification leaks moderator id"; FAIL=$((FAIL+1)); else echo "PASS: SAFETY notification hides moderator id"; PASS=$((PASS+1)); fi
 if echo "$VSAFE" | grep -qi 'harassment'; then echo "FAIL: SAFETY notification leaks reason"; FAIL=$((FAIL+1)); else echo "PASS: SAFETY notification hides reason detail"; PASS=$((PASS+1)); fi
+
+# ---- Increment 8: notification delivery + devices + distributed presence ----
+# Small node-pg helpers to inspect delivery/device state (server runs out of
+# process, so the TestPushProvider's in-memory record is observed via the DB).
+pgscalar() { # args: SQL (returns a single value as text)
+  node -e '
+    const { Client } = require("pg");
+    (async () => {
+      const c = new Client({ connectionString: process.env.DATABASE_URL });
+      await c.connect();
+      const r = await c.query(process.argv[1]);
+      process.stdout.write(String(r.rows[0] ? Object.values(r.rows[0])[0] : ""));
+      await c.end();
+    })().catch(e => { console.error(e.message); process.exit(1); });
+  ' "$1"
+}
+
+# Fresh matched pair + a stranger.
+DA=$(reg "da.smoke@example.com" "DelivA"); TDA=$(tok "$DA"); UDA=$(uid "$DA")
+DB_=$(reg "db.smoke@example.com" "DelivB"); TDB=$(tok "$DB_"); UDB=$(uid "$DB_")
+DS=$(reg "ds.smoke@example.com" "DelivStranger"); TDS=$(tok "$DS")
+json -X POST $B/api/discovery/$UDB/like -H "Authorization: Bearer $TDA" >/dev/null
+DMATCHJSON=$(json -X POST $B/api/discovery/$UDA/like -H "Authorization: Bearer $TDB")
+DMATCH=$(echo "$DMATCHJSON" | sed -n 's/.*"matchId":"\([^"]*\)".*/\1/p')
+check "delivery match formed" 'UUID_OK' "$(echo "$DMATCH" | grep -Eq '^[0-9a-f-]{36}$' && echo UUID_OK || echo none)"
+
+# Device registration: auth required, idempotent, no raw token leak.
+check "device register requires auth 401" '401' "$(code -X POST $B/api/notifications/devices)"
+DEVJSON=$(json -X POST $B/api/notifications/devices -H "Authorization: Bearer $TDB" -H 'Content-Type: application/json' -d '{"platform":"ANDROID","provider":"FCM","token":"smoke-tok-ok-aaaa"}')
+check "device registered" '"active":true' "$DEVJSON"
+if echo "$DEVJSON" | grep -q 'smoke-tok-ok-aaaa'; then echo "FAIL: device response leaks raw token"; FAIL=$((FAIL+1)); else echo "PASS: device response hides raw token"; PASS=$((PASS+1)); fi
+DEVID=$(echo "$DEVJSON" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+# Idempotent re-register -> still one active device.
+json -X POST $B/api/notifications/devices -H "Authorization: Bearer $TDB" -H 'Content-Type: application/json' -d '{"platform":"ANDROID","provider":"FCM","token":"smoke-tok-ok-aaaa"}' >/dev/null
+check "device registration idempotent" '1' "$(pgscalar "SELECT count(*)::int FROM notification_devices WHERE user_id='$UDB' AND revoked_at IS NULL")"
+# Invalid platform/provider/token rejected.
+check "device invalid platform 400" '400' "$(code -X POST $B/api/notifications/devices -H "Authorization: Bearer $TDB" -H 'Content-Type: application/json' -d '{"platform":"WINDOWS","provider":"FCM","token":"abcdefgh"}')"
+check "device malformed token 400" '400' "$(code -X POST $B/api/notifications/devices -H "Authorization: Bearer $TDB" -H 'Content-Type: application/json' -d '{"platform":"IOS","provider":"APNS","token":"x"}')"
+# List: safe metadata only, no raw token.
+DEVLIST=$(json $B/api/notifications/devices -H "Authorization: Bearer $TDB")
+check "device list ok" '"tokenFingerprint"' "$DEVLIST"
+if echo "$DEVLIST" | grep -q 'smoke-tok-ok-aaaa'; then echo "FAIL: device list leaks raw token"; FAIL=$((FAIL+1)); else echo "PASS: device list hides raw token"; PASS=$((PASS+1)); fi
+# IDOR: stranger cannot revoke B's device.
+check "device revoke IDOR rejected" 'DEVICE_NOT_FOUND' "$(json -X DELETE $B/api/notifications/devices/$DEVID -H "Authorization: Bearer $TDS")"
+
+# Push delivery via the TEST provider: a message to B creates a DELIVERED PUSH row.
+json -X POST $B/api/matches/$DMATCH/messages -H "Authorization: Bearer $TDA" -H 'Content-Type: application/json' -d '{"body":"delivery smoke body"}' >/dev/null
+sleep 1
+check "push delivery recorded DELIVERED" '1' "$(pgscalar "SELECT count(*)::int FROM notification_deliveries nd JOIN notifications n ON n.id=nd.notification_id WHERE n.user_id='$UDB' AND nd.channel='PUSH' AND nd.status='DELIVERED'")"
+check "realtime delivery recorded" '1' "$(pgscalar "SELECT CASE WHEN count(*) >= 1 THEN 1 ELSE 0 END FROM notification_deliveries nd JOIN notifications n ON n.id=nd.notification_id WHERE n.user_id='$UDB' AND nd.channel='REALTIME' AND nd.status='DELIVERED'")"
+# Delivery dedup: still exactly one PUSH row for that notification.
+check "push delivery deduped (1 row)" '1' "$(pgscalar "SELECT max(c)::int FROM (SELECT count(*) c FROM notification_deliveries nd JOIN notifications n ON n.id=nd.notification_id WHERE n.user_id='$UDB' AND nd.channel='PUSH' GROUP BY nd.notification_id) t")"
+# Push payload privacy: the notification body is minimal (no message text).
+check "notification body is generic (no leak)" '0' "$(pgscalar "SELECT count(*)::int FROM notifications WHERE user_id='$UDB' AND body LIKE '%delivery smoke body%'")"
+
+# Invalid-token revocation: register a device whose token the TEST provider
+# rejects as PERMANENT, then dispatch -> device auto-revoked.
+json -X POST $B/api/notifications/devices -H "Authorization: Bearer $TDB" -H 'Content-Type: application/json' -d '{"platform":"IOS","provider":"APNS","token":"smoke-invalid-token-bbbb"}' >/dev/null
+json -X POST $B/api/matches/$DMATCH/messages -H "Authorization: Bearer $TDA" -H 'Content-Type: application/json' -d '{"body":"second body"}' >/dev/null
+sleep 1
+# The invalid-token device (provider APNS, the only APNS device for B) must be
+# auto-revoked after the dispatch; its delivery row is REVOKED.
+check "invalid token device auto-revoked" '1' "$(pgscalar "SELECT count(*)::int FROM notification_devices WHERE user_id='$UDB' AND provider='APNS' AND revoked_at IS NOT NULL")"
+check "invalid token delivery marked REVOKED" '1' "$(pgscalar "SELECT CASE WHEN count(*) >= 1 THEN 1 ELSE 0 END FROM notification_deliveries nd JOIN notification_devices d ON d.id=nd.device_id WHERE d.user_id='$UDB' AND d.provider='APNS' AND nd.status='REVOKED'")"
+
+# Push preference: disabling push for MESSAGES suppresses PUSH but keeps in-app.
+json -X PUT $B/api/notifications/preferences -H "Authorization: Bearer $TDB" -H 'Content-Type: application/json' -d '{"category":"MESSAGES","pushEnabled":false}' >/dev/null
+BEFORE_PUSH=$(pgscalar "SELECT count(*)::int FROM notification_deliveries nd JOIN notifications n ON n.id=nd.notification_id WHERE n.user_id='$UDB' AND nd.channel='PUSH'")
+BEFORE_INAPP=$(pgscalar "SELECT count(*)::int FROM notifications WHERE user_id='$UDB' AND type='MESSAGE_RECEIVED'")
+json -X POST $B/api/matches/$DMATCH/messages -H "Authorization: Bearer $TDA" -H 'Content-Type: application/json' -d '{"body":"third body"}' >/dev/null
+sleep 1
+AFTER_PUSH=$(pgscalar "SELECT count(*)::int FROM notification_deliveries nd JOIN notifications n ON n.id=nd.notification_id WHERE n.user_id='$UDB' AND nd.channel='PUSH'")
+AFTER_INAPP=$(pgscalar "SELECT count(*)::int FROM notifications WHERE user_id='$UDB' AND type='MESSAGE_RECEIVED'")
+if [ "$AFTER_PUSH" = "$BEFORE_PUSH" ]; then echo "PASS: push suppressed when pushEnabled=false"; PASS=$((PASS+1)); else echo "FAIL: push not suppressed ($BEFORE_PUSH -> $AFTER_PUSH)"; FAIL=$((FAIL+1)); fi
+if [ "$AFTER_INAPP" -gt "$BEFORE_INAPP" ]; then echo "PASS: in-app notification still created when push disabled"; PASS=$((PASS+1)); else echo "FAIL: in-app notification missing when push disabled"; FAIL=$((FAIL+1)); fi
+# SAFETY push cannot be disabled.
+check "cannot disable SAFETY push" 'CRITICAL_PREFERENCE' "$(json -X PUT $B/api/notifications/preferences -H "Authorization: Bearer $TDB" -H 'Content-Type: application/json' -d '{"category":"SAFETY","pushEnabled":false}')"
+# Preferences expose pushEnabled.
+check "preferences expose pushEnabled" '"pushEnabled"' "$(json $B/api/notifications/preferences -H "Authorization: Bearer $TDB")"
+
+# Presence: unauthorized/blocked rejected (reconfirm under Increment 8).
+check "presence stranger rejected (inc8)" 'PRESENCE_NOT_AUTHORIZED' "$(json $B/api/users/$UDA/presence -H "Authorization: Bearer $TDS")"
+
+# Admin device diagnostics: never exposes the raw token.
+DADM=$(reg "dadm.smoke@example.com" "DelivAdmin"); UDADM=$(uid "$DADM")
+promote_role "$UDADM" "ADMIN"
+DADMLOGIN=$(json -X POST $B/api/auth/login -H 'Content-Type: application/json' -d '{"email":"dadm.smoke@example.com","password":"Passw0rd!x"}')
+TDADM=$(tok "$DADMLOGIN")
+ADMDEV=$(json $B/api/admin/users/$UDB/devices -H "Authorization: Bearer $TDADM")
+check "admin device diagnostics ok" '"tokenFingerprint"' "$ADMDEV"
+if echo "$ADMDEV" | grep -q 'smoke-tok-ok-aaaa'; then echo "FAIL: admin device view leaks raw token"; FAIL=$((FAIL+1)); else echo "PASS: admin device view hides raw token"; PASS=$((PASS+1)); fi
+check "normal user denied admin device view" '403' "$(code $B/api/admin/users/$UDB/devices -H "Authorization: Bearer $TDB")"
+
+# Real WS flow: notification.created delivery + presence heartbeat.
+D8OUT=$(WS_PORT="$PORT" WS_BASE="$B" WS_TA="$TDA" WS_TB="$TDB" WS_UA="$UDA" WS_UB="$UDB" WS_MATCH="$DMATCH" node "$(dirname "$0")/delivery-smoke-client.js" 2>&1)
+echo "$D8OUT" | sed 's/^/[deliv] /'
+for key in D8_DEVICE_REGISTERED D8_DEVICE_NO_TOKEN_LEAK D8_NOTIF_EVENT D8_NOTIF_NO_BODY D8_PRESENCE_HEARTBEAT_ONLINE; do
+  if echo "$D8OUT" | grep -q "$key=ok"; then echo "PASS: deliv $key"; PASS=$((PASS+1));
+  else echo "FAIL: deliv $key"; FAIL=$((FAIL+1)); fi
+done
 
 echo "----"
 echo "LIVE SMOKE: $PASS passed, $FAIL failed"

@@ -13,8 +13,10 @@ import { mediaRouter } from "./media/mediaRoutes";
 import { adminRouter } from "./admin/adminRoutes";
 import { reportRouter } from "./admin/reportRoutes";
 import { notificationRouter } from "./notifications/notificationRoutes";
+import { deviceRouter } from "./notifications/deviceRoutes";
 import { presenceRouter } from "./presence/presenceRoutes";
 import { initPresence } from "./presence/presenceService";
+import { attachRealtimeSink } from "./notifications/realtime";
 import { errorHandler } from "./http/errorHandler";
 import { ok } from "./http/respond";
 import { Errors } from "./http/errors";
@@ -25,6 +27,9 @@ import { pool } from "./db/pool";
 export function createApp(): Express {
   // Wire presence transitions (last-seen persistence + presence.changed events).
   initPresence();
+  // Subscribe this process to the realtime bus so published notification/
+  // presence events are fanned out to local sockets (Increment 8).
+  attachRealtimeSink();
 
   const app = express();
 
@@ -64,6 +69,10 @@ export function createApp(): Express {
   app.use("/api/media", mediaRouter);
   app.use("/api/reports", reportRouter);
   app.use("/api/admin", adminRouter);
+  // Device registration is nested under notifications; mount it BEFORE the
+  // notification router so /api/notifications/devices resolves here (and is not
+  // captured by the notification router's /:id routes).
+  app.use("/api/notifications/devices", deviceRouter);
   app.use("/api/notifications", notificationRouter);
   // Presence lookups live under /api/users/:userId/presence (coexists with the
   // block routes already mounted at /api/users).

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { WebSocketServer, WebSocket } from "ws";
 import { type ServerGameEvent } from "@luvora/shared";
 import { logger } from "../logger";
@@ -21,11 +22,16 @@ import type { WsChannel, WsDispatcher } from "../ws/wsDispatcher";
 
 interface SocketState {
   userId: string;
+  connectionId: string;
   isAlive: boolean;
   recent: number[];
 }
 
-const HEARTBEAT_INTERVAL_MS = 30_000;
+// Ping interval tied to the presence heartbeat (see chatGateway for rationale).
+const HEARTBEAT_INTERVAL_MS = Math.max(
+  5_000,
+  Math.floor((config.presence.heartbeatSeconds * 1000) / 2),
+);
 const WS_RATE_WINDOW_MS = 10_000;
 const WS_RATE_MAX = 50;
 
@@ -135,19 +141,22 @@ export function attachGameGateway(dispatcher: WsDispatcher): GameGateway {
   const wss = new WebSocketServer({ noServer: true });
 
   const onConnection: WsChannel["onConnection"] = (socket, _req, userId) => {
-    const state: SocketState = { userId, isAlive: true, recent: [] };
+    const connectionId = `game:${randomUUID()}`;
+    const state: SocketState = { userId, connectionId, isAlive: true, recent: [] };
     stateBySocket.set(socket, state);
     gameHub.add(userId, socket);
-    presenceRegistry.connect(userId);
+    presenceRegistry.connect(userId, connectionId);
     logger.info({ userId, sockets: gameHub.socketCount() }, "game ws established");
 
     send(socket, { type: "game.ready", userId });
 
     socket.on("pong", () => {
       state.isAlive = true;
+      presenceRegistry.heartbeat(userId, connectionId);
     });
 
     socket.on("message", (data) => {
+      presenceRegistry.heartbeat(userId, connectionId);
       if (!allowEvent(state)) {
         sendError(socket, "RATE_LIMITED", "Too many actions. Slow down.");
         return;
@@ -164,7 +173,7 @@ export function attachGameGateway(dispatcher: WsDispatcher): GameGateway {
 
     socket.on("close", () => {
       gameHub.remove(userId, socket);
-      presenceRegistry.disconnect(userId);
+      presenceRegistry.disconnect(userId, connectionId);
       stateBySocket.delete(socket);
       logger.info({ userId, sockets: gameHub.socketCount() }, "game ws closed");
     });
