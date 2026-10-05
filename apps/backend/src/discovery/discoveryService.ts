@@ -3,13 +3,15 @@ import {
   type DiscoveryActionResult,
   type DiscoveryCandidate,
   type MatchSummary,
+  type MatchListResponse,
 } from "@luvora/shared";
 import { Errors } from "../http/errors";
 import * as users from "../users/userRepository";
 import * as repo from "./discoveryRepository";
 import * as blocks from "./blockRepository";
 import * as matches from "./matchRepository";
-import { toCandidate, toMatchSummary } from "./discoverySerializer";
+import * as chatRepo from "../chat/chatRepository";
+import { toCandidate, toMatchSummary, type MatchInboxMeta } from "./discoverySerializer";
 import {
   decodeCursor,
   encodeCursor,
@@ -188,9 +190,47 @@ export async function unblock(
   await blocks.removeBlock({ blockerId, blockedId });
 }
 
-export async function listMatches(viewerId: string): Promise<MatchSummary[]> {
+/** Map an InboxMetaRow (keyed by match) to the serializer's meta shape. */
+function toInboxMeta(row: chatRepo.InboxMetaRow): MatchInboxMeta {
+  return {
+    conversationId: row.conversation_id,
+    unreadCount: row.unread_count,
+    lastMessage: row.last_message_id
+      ? {
+          id: row.last_message_id,
+          body: row.last_message_body ?? "",
+          senderId: row.last_message_sender_id ?? "",
+          createdAt: row.last_message_created_at ?? "",
+          hasAttachments: Boolean(row.last_message_has_attachments),
+        }
+      : null,
+  };
+}
+
+/** The inbox: the viewer's ACTIVE matches enriched with conversation id, last
+ *  message, and unread count, plus a total unread across all of them. The
+ *  per-match metadata is fetched in ONE batch query (no N+1). */
+export async function listMatches(viewerId: string): Promise<MatchListResponse> {
   const rows = await matches.listMatchesForUser(viewerId);
-  return rows.map(toMatchSummary);
+  const matchIds = rows.map((r) => r.match_id);
+  // Ensure every listed match has its (lazily-created) conversation so each
+  // inbox row carries a stable conversationId. Idempotent + race-safe.
+  await chatRepo.ensureConversationsForMatches(matchIds);
+  const metaRows = await chatRepo.getInboxMetaForMatches({ viewerId, matchIds });
+  const byMatch = new Map(metaRows.map((m) => [m.match_id, m]));
+
+  const summaries = rows.map((row) => {
+    const meta = byMatch.get(row.match_id);
+    return toMatchSummary(
+      row,
+      meta
+        ? toInboxMeta(meta)
+        : { conversationId: "", unreadCount: 0, lastMessage: null },
+    );
+  });
+
+  const totalUnreadCount = await chatRepo.totalUnreadForUser(viewerId);
+  return { matches: summaries, totalUnreadCount };
 }
 
 export async function getMatch(
@@ -212,5 +252,12 @@ export async function getMatch(
     // Participant, but the match is not ACTIVE (e.g. BLOCKED) — treat as gone.
     throw Errors.matchNotFound();
   }
-  return toMatchSummary(detail);
+  // Enrich with inbox metadata (conversation id, last message, unread) so a
+  // single match detail is consistent with the inbox list.
+  await chatRepo.ensureConversationsForMatches([matchId]);
+  const metaRows = await chatRepo.getInboxMetaForMatches({ viewerId, matchIds: [matchId] });
+  const meta = metaRows[0]
+    ? toInboxMeta(metaRows[0])
+    : { conversationId: "", unreadCount: 0, lastMessage: null };
+  return toMatchSummary(detail, meta);
 }

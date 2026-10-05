@@ -7,6 +7,7 @@ import { discoveryRouter } from "./discovery/discoveryRoutes";
 import { matchRouter } from "./discovery/matchRoutes";
 import { userBlockRouter } from "./discovery/blockRoutes";
 import { chatRouter } from "./chat/chatRoutes";
+import { conversationRouter } from "./chat/conversationRoutes";
 import { scenarioRouter } from "./scenario/scenarioRoutes";
 import { mediaRouter } from "./media/mediaRoutes";
 import { adminRouter } from "./admin/adminRoutes";
@@ -82,6 +83,7 @@ export function createApp(): Express {
   // so /api/matches/:matchId/messages resolves to the chat router.
   app.use("/api/matches/:matchId/messages", chatRouter);
   app.use("/api/matches", matchRouter);
+  app.use("/api/conversations", conversationRouter);
   app.use("/api/users", userBlockRouter);
   app.use("/api/scenarios", scenarioRouter);
   app.use("/api/media", mediaRouter);

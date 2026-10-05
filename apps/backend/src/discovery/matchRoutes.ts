@@ -9,12 +9,13 @@ import { matchIdParamSchema } from "./discoverySchemas";
 export const matchRouter = Router();
 matchRouter.use(requireAuth);
 
-// GET /api/matches
+// GET /api/matches — the inbox: matches enriched with conversation id, last
+// message, and unread count, plus a total unread across all matches.
 matchRouter.get(
   "/",
   asyncHandler(async (req, res) => {
-    const matches = await service.listMatches(req.userId!);
-    ok(res, { matches });
+    const { matches, totalUnreadCount } = await service.listMatches(req.userId!);
+    ok(res, { matches, totalUnreadCount });
   }),
 );
 

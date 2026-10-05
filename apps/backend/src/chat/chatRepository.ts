@@ -47,6 +47,19 @@ export async function getOrCreateConversationForMatch(
   });
 }
 
+/** Ensure a conversation row exists for each given match (batch, race-safe).
+ *  Idempotent via UNIQUE(match_id) + ON CONFLICT. Used by the inbox so every
+ *  match row carries a stable conversation id. */
+export async function ensureConversationsForMatches(matchIds: string[]): Promise<void> {
+  if (matchIds.length === 0) return;
+  await query(
+    `INSERT INTO conversations (match_id)
+       SELECT unnest($1::uuid[])
+     ON CONFLICT (match_id) DO NOTHING`,
+    [matchIds],
+  );
+}
+
 export async function getConversationById(
   conversationId: string,
 ): Promise<ConversationRow | null> {
@@ -303,4 +316,185 @@ export async function setReadMarker(input: {
                    updated_at = now()`,
     [input.conversationId, input.userId, input.lastReadMessageId],
   );
+}
+
+// ---- Inbox contract (Increment 15) ----
+
+/** The id + created_at of the most recent message in a conversation (any
+ *  sender), or null when the conversation has no messages. */
+export async function latestMessageId(
+  conversationId: string,
+): Promise<{ id: string; created_at: string } | null> {
+  const rows = await query<{ id: string; created_at: string }>(
+    `SELECT id, created_at FROM messages
+      WHERE conversation_id = $1
+      ORDER BY created_at DESC, id DESC
+      LIMIT 1`,
+    [conversationId],
+  );
+  return rows[0] ?? null;
+}
+
+/**
+ * Advance a user's read marker to the newest message in the conversation
+ * (idempotent). "Reading" a conversation clears unread for that user. Marking a
+ * conversation with no messages is a safe no-op. Returns the message id the
+ * marker now points at (or null if there were no messages).
+ */
+export async function markConversationRead(input: {
+  conversationId: string;
+  userId: string;
+}): Promise<{ lastReadMessageId: string | null }> {
+  return withTransaction(async (client) => {
+    const latest = await client.query<{ id: string }>(
+      `SELECT id FROM messages
+        WHERE conversation_id = $1
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1`,
+      [input.conversationId],
+    );
+    const lastId = latest.rows[0]?.id ?? null;
+    if (!lastId) {
+      // No messages yet: ensure a read-state row exists (marker null) so the
+      // user's "read" intent is recorded; unread is already 0.
+      await client.query(
+        `INSERT INTO conversation_read_state (conversation_id, user_id, last_read_message_id)
+         VALUES ($1, $2, NULL)
+         ON CONFLICT (conversation_id, user_id) DO NOTHING`,
+        [input.conversationId, input.userId],
+      );
+      return { lastReadMessageId: null };
+    }
+    await client.query(
+      `INSERT INTO conversation_read_state (conversation_id, user_id, last_read_message_id)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (conversation_id, user_id)
+       DO UPDATE SET last_read_message_id = EXCLUDED.last_read_message_id,
+                     updated_at = now()`,
+      [input.conversationId, input.userId, lastId],
+    );
+    return { lastReadMessageId: lastId };
+  });
+}
+
+/**
+ * Unread count for a single conversation + viewer. Unread = messages sent by
+ * the OTHER participant that are newer than the viewer's read marker. The
+ * marker references a message; we compare on (created_at, id) against that
+ * message. When there is no marker, all partner messages are unread.
+ */
+export async function unreadCountForConversation(input: {
+  conversationId: string;
+  viewerId: string;
+}): Promise<number> {
+  const rows = await query<{ n: number }>(
+    `SELECT count(*)::int AS n
+       FROM messages m
+       LEFT JOIN conversation_read_state rs
+         ON rs.conversation_id = m.conversation_id AND rs.user_id = $2
+       LEFT JOIN messages marker ON marker.id = rs.last_read_message_id
+      WHERE m.conversation_id = $1
+        AND m.sender_id <> $2
+        AND (
+          marker.id IS NULL
+          OR (m.created_at, m.id) > (marker.created_at, marker.id)
+        )`,
+    [input.conversationId, input.viewerId],
+  );
+  return rows[0]?.n ?? 0;
+}
+
+export interface InboxMetaRow {
+  conversation_id: string;
+  match_id: string;
+  unread_count: number;
+  last_message_id: string | null;
+  last_message_body: string | null;
+  last_message_sender_id: string | null;
+  last_message_created_at: string | null;
+  last_message_has_attachments: boolean | null;
+}
+
+/**
+ * Batch inbox metadata for a set of matches/conversations for one viewer: the
+ * last message (any sender) + the viewer's unread count, computed in ONE query
+ * (no N+1). Conversations are matched by match_id so this composes with the
+ * existing match list. Matches with no conversation/messages yield unread 0 and
+ * a null last message.
+ */
+export async function getInboxMetaForMatches(input: {
+  viewerId: string;
+  matchIds: string[];
+}): Promise<InboxMetaRow[]> {
+  if (input.matchIds.length === 0) return [];
+  return query<InboxMetaRow>(
+    `SELECT
+        c.id         AS conversation_id,
+        c.match_id   AS match_id,
+        COALESCE(uc.n, 0)::int AS unread_count,
+        lm.id        AS last_message_id,
+        lm.body      AS last_message_body,
+        lm.sender_id AS last_message_sender_id,
+        lm.created_at::text AS last_message_created_at,
+        lm.has_attachments  AS last_message_has_attachments
+       FROM conversations c
+       -- Most recent message in the conversation (any sender).
+       LEFT JOIN LATERAL (
+         SELECT id, body, sender_id, created_at,
+                EXISTS (SELECT 1 FROM message_attachments a WHERE a.message_id = messages.id)
+                  AS has_attachments
+           FROM messages
+          WHERE conversation_id = c.id
+          ORDER BY created_at DESC, id DESC
+          LIMIT 1
+       ) lm ON true
+       -- Viewer's unread count: partner messages newer than their read marker.
+       LEFT JOIN LATERAL (
+         SELECT count(*)::int AS n
+           FROM messages m
+           LEFT JOIN conversation_read_state rs
+             ON rs.conversation_id = c.id AND rs.user_id = $1
+           LEFT JOIN messages marker ON marker.id = rs.last_read_message_id
+          WHERE m.conversation_id = c.id
+            AND m.sender_id <> $1
+            AND (
+              marker.id IS NULL
+              OR (m.created_at, m.id) > (marker.created_at, marker.id)
+            )
+       ) uc ON true
+      WHERE c.match_id = ANY($2::uuid[])`,
+    [input.viewerId, input.matchIds],
+  );
+}
+
+/**
+ * Total unread across ALL of the viewer's ACTIVE matches: sum of partner
+ * messages newer than the viewer's per-conversation read marker. Computed from
+ * existing message/read state only (no counter table). Scoped to ACTIVE matches
+ * with no block, mirroring chat visibility.
+ */
+export async function totalUnreadForUser(viewerId: string): Promise<number> {
+  const rows = await query<{ n: number }>(
+    `SELECT count(*)::int AS n
+       FROM messages m
+       JOIN conversations c ON c.id = m.conversation_id
+       JOIN matches mt ON mt.id = c.match_id
+       LEFT JOIN conversation_read_state rs
+         ON rs.conversation_id = c.id AND rs.user_id = $1
+       LEFT JOIN messages marker ON marker.id = rs.last_read_message_id
+      WHERE (mt.user_a = $1 OR mt.user_b = $1)
+        AND mt.state = 'ACTIVE'
+        AND m.sender_id <> $1
+        AND NOT EXISTS (
+          SELECT 1 FROM blocks b
+           WHERE (b.blocker_id = mt.user_a AND b.blocked_id = mt.user_b)
+              OR (b.blocker_id = mt.user_b AND b.blocked_id = mt.user_a)
+        )
+        AND (
+          marker.id IS NULL
+          OR (m.created_at, m.id) > (marker.created_at, marker.id)
+        )`,
+    [viewerId],
+  );
+  return rows[0]?.n ?? 0;
 }

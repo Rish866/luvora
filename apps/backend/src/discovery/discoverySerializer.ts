@@ -52,7 +52,20 @@ export interface MatchListRow {
   other_photo_has_thumbnail: boolean | null;
 }
 
-export function toMatchSummary(row: MatchListRow): MatchSummary {
+/** Inbox metadata for a match (last message + unread), from chatRepository. */
+export interface MatchInboxMeta {
+  conversationId: string;
+  unreadCount: number;
+  lastMessage: {
+    id: string;
+    body: string;
+    senderId: string;
+    createdAt: string;
+    hasAttachments: boolean;
+  } | null;
+}
+
+export function toMatchSummary(row: MatchListRow, meta: MatchInboxMeta): MatchSummary {
   return {
     matchId: row.match_id,
     createdAt: row.created_at,
@@ -63,5 +76,18 @@ export function toMatchSummary(row: MatchListRow): MatchSummary {
         ? toDiscoveryPhoto(row.other_photo_media_id, row.other_photo_has_thumbnail)
         : null,
     },
+    conversationId: meta.conversationId,
+    unreadCount: meta.unreadCount,
+    lastMessage: meta.lastMessage
+      ? {
+          id: meta.lastMessage.id,
+          // Attachment-only messages have an empty body; expose "" (the inbox
+          // uses hasAttachments to render a placeholder). Never leak internals.
+          text: meta.lastMessage.body,
+          senderId: meta.lastMessage.senderId,
+          createdAt: meta.lastMessage.createdAt,
+          hasAttachments: meta.lastMessage.hasAttachments,
+        }
+      : null,
   };
 }

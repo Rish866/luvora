@@ -543,8 +543,19 @@ describe("privacy", () => {
       expect(serialized).not.toContain(forbidden);
     }
     const m = res.body.data.matches[0];
-    expect(new Set(Object.keys(m))).toEqual(new Set(["matchId", "user", "createdAt"]));
+    // Increment 15: the match summary is now the inbox row and additionally
+    // carries conversationId + lastMessage + unreadCount. The leakage
+    // assertions above remain the real safety guard.
+    expect(new Set(Object.keys(m))).toEqual(
+      new Set(["matchId", "user", "createdAt", "conversationId", "lastMessage", "unreadCount"]),
+    );
     expect(new Set(Object.keys(m.user))).toEqual(new Set(["id", "displayName", "photo"]));
+    // No messages yet in this test -> null preview, zero unread.
+    expect(m.lastMessage).toBeNull();
+    expect(m.unreadCount).toBe(0);
+    expect(typeof m.conversationId).toBe("string");
+    // The list response also carries a total unread.
+    expect(res.body.data.totalUnreadCount).toBe(0);
   });
 
   it("age is hidden when the candidate disables age visibility", async () => {

@@ -246,3 +246,61 @@ export async function authorizeEphemeral(
 ): Promise<ChatContext> {
   return authorizeByConversation(authenticatedUserId, conversationId);
 }
+
+// ---- Inbox contract (Increment 15) ----
+
+export interface ReadResult {
+  conversationId: string;
+  /** The message the caller's read marker now points at (null if no messages). */
+  lastReadMessageId: string | null;
+  /** The caller's unread count after reading (always 0 on success). */
+  unreadCount: number;
+  /** The other participant, so the caller/gateway can emit a read receipt. */
+  partnerId: string;
+}
+
+/**
+ * REST read-receipt: mark the WHOLE conversation read for the caller, advancing
+ * their read marker to the newest message. Reuses the SAME read-state model and
+ * authorization as the WebSocket `message.read` handler, so REST and WS never
+ * diverge. Idempotent: repeated calls are safe and leave unread at 0.
+ *
+ * Authorization: the caller must be an eligible participant (ACTIVE match, no
+ * block) — enforced by authorizeByConversation. A user can therefore never mark
+ * another user's conversation read.
+ */
+export async function readConversation(input: {
+  authenticatedUserId: string;
+  conversationId: string;
+}): Promise<ReadResult> {
+  const context = await authorizeByConversation(
+    input.authenticatedUserId,
+    input.conversationId,
+  );
+  const { lastReadMessageId } = await chatRepo.markConversationRead({
+    conversationId: context.conversationId,
+    userId: input.authenticatedUserId,
+  });
+  return {
+    conversationId: context.conversationId,
+    lastReadMessageId,
+    unreadCount: 0,
+    partnerId: context.partnerId,
+  };
+}
+
+/** The caller's unread count for a single conversation (authorized). */
+export async function conversationUnreadCount(input: {
+  authenticatedUserId: string;
+  conversationId: string;
+}): Promise<{ conversationId: string; unreadCount: number }> {
+  const context = await authorizeByConversation(
+    input.authenticatedUserId,
+    input.conversationId,
+  );
+  const unreadCount = await chatRepo.unreadCountForConversation({
+    conversationId: context.conversationId,
+    viewerId: input.authenticatedUserId,
+  });
+  return { conversationId: context.conversationId, unreadCount };
+}

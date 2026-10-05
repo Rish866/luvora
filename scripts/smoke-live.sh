@@ -346,6 +346,27 @@ check "http send not spoofable" "\"senderId\":\"$UG\"" "$SENT"
 check "empty message rejected" 'MESSAGE_EMPTY' "$(json -X POST $B/api/matches/$CMATCH/messages -H "Authorization: Bearer $TG" -H 'Content-Type: application/json' -d '{"body":"   "}')"
 check "history now has message" 'Hello over HTTP' "$(json $B/api/matches/$CMATCH/messages -H "Authorization: Bearer $TG")"
 
+# ---- Increment 15: messaging inbox contract ----
+# G has sent one message in $CMATCH; from H's inbox that is 1 unread with a
+# last-message preview. H reads via REST -> unread drops to 0.
+HINBOX=$(json $B/api/matches -H "Authorization: Bearer $TH")
+check "inbox returns totalUnreadCount" '"totalUnreadCount"' "$HINBOX"
+check "inbox row has conversationId" '"conversationId"' "$HINBOX"
+check "inbox row has lastMessage preview" '"text":"Hello over HTTP 👋"' "$HINBOX"
+check "inbox row has unreadCount 1" '"unreadCount":1' "$HINBOX"
+# Resolve H's conversation id. H has exactly one match ($CMATCH), so the first
+# conversationId in the inbox payload is the right one.
+HCONV=$(echo "$HINBOX" | sed -n 's/.*"conversationId":"\([^"]*\)".*/\1/p' | head -1)
+# Per-conversation unread endpoint agrees.
+check "conversation unread-count = 1" '"unreadCount":1' "$(json "$B/api/conversations/$HCONV/unread-count" -H "Authorization: Bearer $TH")"
+# A non-participant cannot read the conversation (opaque).
+check "inbox read IDOR rejected" 'CHAT_NOT_AUTHORIZED' "$(json -X POST "$B/api/conversations/$HCONV/read" -H "Authorization: Bearer $TO")"
+# H marks the conversation read -> unread 0.
+check "mark conversation read ok" '"unreadCount":0' "$(json -X POST "$B/api/conversations/$HCONV/read" -H "Authorization: Bearer $TH")"
+check "conversation unread-count now 0" '"unreadCount":0' "$(json "$B/api/conversations/$HCONV/unread-count" -H "Authorization: Bearer $TH")"
+# H's inbox now shows the match with zero unread (H has exactly one match).
+check "inbox unreadCount back to 0" '"unreadCount":0' "$(json $B/api/matches -H "Authorization: Bearer $TH")"
+
 # Real WebSocket flow via a tiny node ws client.
 WSOUT=$(WS_PORT="$PORT" WS_TG="$TG" WS_TH="$TH" WS_TI="$TI" WS_MATCH="$CMATCH" WS_BASE="$B" node "$(dirname "$0")/ws-smoke-client.js" 2>&1)
 echo "$WSOUT" | sed 's/^/[ws] /'
