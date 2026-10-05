@@ -1,0 +1,26 @@
+# Development PostgreSQL for the Luvora platform.
+# Usage (from repo root): `docker compose -f docker/docker-compose.yml up -d`
+#
+# In a build sandbox without a Docker daemon, an ephemeral native PostgreSQL is
+# used for verification instead (see apps/backend/scripts/verify.ts and
+# `npm run verify`). The connection string format is identical either way.
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: luvora_pg
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: luvora_dev
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d luvora_dev"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:

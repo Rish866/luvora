@@ -1,0 +1,39 @@
+# Dependencies
+node_modules/
+**/node_modules/
+
+# Build output
+dist/
+build/
+**/dist/
+**/build/
+*.tsbuildinfo
+
+# Env & secrets — NEVER commit real secrets
+.env
+.env.*
+# ...but always allow the committed example templates (any depth).
+!.env.example
+!**/.env.example
+
+# Logs
+*.log
+logs/
+npm-debug.log*
+
+# Test / coverage
+coverage/
+.nyc_output/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Local Postgres data (sandbox native PG)
+scripts/.pgdata/
+/home/pgrunner/pgdata/
+
+# Kiro workspace config
+.kiro/
