@@ -206,3 +206,12 @@ metrics.registerCounter("ws_connections_rejected_total", "WebSocket connections 
 metrics.registerCounter("ws_events_rejected_total", "WebSocket events rejected by reason");
 metrics.registerCounter("media_rejected_total", "Media uploads rejected by reason");
 metrics.registerCounter("oversized_requests_total", "Requests rejected for exceeding size/URL limits");
+
+// Distributed abuse backend (Increment 12). Bounded labels only: backend ∈
+// {memory,redis}, op ∈ {check,blockedFor,block,reset}, policy ∈ {open,closed},
+// scope = a fixed abuse scope name. Never a key/IP/user/token.
+metrics.registerCounter("abuse_backend_requests_total", "Abuse backend operations by backend/op");
+metrics.registerCounter("abuse_backend_errors_total", "Abuse backend errors by backend/op");
+metrics.registerCounter("abuse_backend_fallbacks_total", "Abuse backend fail-policy fallbacks by policy");
+metrics.registerCounter("abuse_redis_rejections_total", "Requests rejected by the distributed (redis) abuse backend, by scope");
+metrics.registerHistogram("abuse_redis_latency_ms", "Abuse Redis round-trip latency in ms");

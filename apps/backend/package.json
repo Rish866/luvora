@@ -14,7 +14,8 @@
     "migrate:down": "node -r ts-node/register src/db/migrate.ts down",
     "seed": "node -r ts-node/register src/db/seed.ts",
     "test": "vitest run",
-    "verify": "node -r ts-node/register scripts/verify.ts"
+    "verify": "node -r ts-node/register scripts/verify.ts",
+    "verify:redis": "VERIFY_WITH_REDIS=1 node -r ts-node/register scripts/verify.ts"
   },
   "dependencies": {
     "@luvora/shared": "*",
@@ -23,13 +24,14 @@
     "dotenv": "^16.4.5",
     "express": "^4.21.1",
     "express-rate-limit": "^7.4.1",
-    "file-type": "^16.5.4",
+    "file-type": "^21.3.1",
     "helmet": "^8.0.0",
+    "ioredis": "^5.4.1",
     "jsonwebtoken": "^9.0.2",
     "pg": "^8.13.1",
     "pino": "^9.5.0",
     "pino-http": "^10.3.0",
-    "sharp": "^0.33.5",
+    "sharp": "^0.35.5",
     "ws": "^8.22.0",
     "zod": "^3.23.8"
   },

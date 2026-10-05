@@ -123,7 +123,7 @@ export async function login(
   // throttled from repeated failures, reject BEFORE touching the password hash
   // — this also removes the bcrypt cost as an amplification vector. Temporary,
   // not a permanent lockout.
-  const gate = checkLoginAllowed(ctx.ip, input.email);
+  const gate = await checkLoginAllowed(ctx.ip, input.email);
   if (!gate.allowed) {
     await recordSecurityEvent({
       eventType: SecurityEventType.LOGIN_THROTTLED,
@@ -158,7 +158,7 @@ export async function login(
   await assertAccountActive(user.id);
 
   // Successful authentication clears the failure counters for both dimensions.
-  clearLoginFailures(ctx.ip, input.email);
+  await clearLoginFailures(ctx.ip, input.email);
 
   const t = issueTokens(user.id);
   await sessions.createAuthSession({

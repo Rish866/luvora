@@ -1028,6 +1028,7 @@ POST /api/admin/jobs/:id/retry   { reason? }   # requeue a DEAD job
 POST /api/admin/jobs/:id/cancel  { reason? }   # cancel a queued job
 GET  /api/admin/operational-events?eventType=&severity=&limit=&cursor=
 GET  /api/admin/security-events?eventType=&category=&severity=&limit=&cursor=
+GET  /api/admin/abuse-backend
 ```
 
 - **Security events** (Increment 11, admin only) are the durable record of
@@ -1036,6 +1037,13 @@ GET  /api/admin/security-events?eventType=&category=&severity=&limit=&cursor=
   `eventType`/`category`/`severity`. The client source is exposed ONLY as a
   salted fingerprint — the raw IP is never stored or returned — so this endpoint
   cannot be used to deanonymise or track users. Non-admins get `403`.
+
+- **Abuse backend diagnostic** (Increment 12, admin only) returns
+  `{ backend, status, failPolicy }` — e.g. `{"backend":"redis","status":"ok",
+  "failPolicy":"closed"}` — for the distributed abuse backend. It NEVER exposes
+  the Redis URL, host, credentials, or any key; only bounded status strings.
+  Non-admins get `403`. `/ready` also includes an `abuseBackend` sub-check
+  (`disabled` with the memory backend, `ok`/`error` with Redis).
 
 - **Retry** requeues a **DEAD** job back to `PENDING` (attempts reset, lease/
   error cleared, immediately available). SUCCEEDED/RUNNING jobs are refused

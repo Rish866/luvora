@@ -50,6 +50,12 @@ export const AbuseRules = {
   prefWrite: { limit: 60, windowMs: 60_000 } as AbuseRule,
 } as const;
 
+/**
+ * Async over the shared AbuseGuard. The guard fingerprints the raw IP/user id
+ * (HMAC) before it reaches the backend, so no raw PII is persisted — this is
+ * essential for the distributed (Redis) backend. Errors from the guard are
+ * already handled internally per the fail policy; a decision is always returned.
+ */
 export function abuseLimit(opts: AbuseGuardOptions): RequestHandler {
   const by = opts.by ?? ["ip"];
   return (req: Request, res: Response, next: NextFunction): void => {
@@ -57,20 +63,22 @@ export function abuseLimit(opts: AbuseGuardOptions): RequestHandler {
     if (by.includes("ip")) keys.push({ dim: "ip", key: clientIp(req) });
     if (by.includes("user") && req.userId) keys.push({ dim: "user", key: req.userId });
 
-    for (const { dim, key } of keys) {
-      const decision = abuseGuard.hit(`${opts.scope}:${dim}`, key, opts.rule);
-      if (!decision.allowed) {
-        res.setHeader("Retry-After", String(decision.retryAfterSeconds));
-        try {
-          metrics.incr("rate_limit_hits_total", { scope: opts.scope, dimension: dim });
-        } catch {
-          /* telemetry best-effort */
+    void (async () => {
+      for (const { dim, key } of keys) {
+        const decision = await abuseGuard.hit(`${opts.scope}:${dim}`, key, opts.rule);
+        if (!decision.allowed) {
+          res.setHeader("Retry-After", String(decision.retryAfterSeconds));
+          try {
+            metrics.incr("rate_limit_hits_total", { scope: opts.scope, dimension: dim });
+          } catch {
+            /* telemetry best-effort */
+          }
+          log.warn({ scope: opts.scope, dimension: dim }, "rate_limit.throttled");
+          next(Errors.rateLimited());
+          return;
         }
-        log.warn({ scope: opts.scope, dimension: dim }, "rate_limit.throttled");
-        next(Errors.rateLimited());
-        return;
       }
-    }
-    next();
+      next();
+    })().catch(next);
   };
 }

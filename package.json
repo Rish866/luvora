@@ -12,6 +12,7 @@
     "typecheck": "npm run -w @luvora/shared typecheck && npm run -w @luvora/backend typecheck",
     "test": "npm run -w @luvora/backend test",
     "verify": "npm run -w @luvora/backend verify",
+    "verify:redis": "npm run -w @luvora/backend verify:redis",
     "worker": "npm run -w @luvora/backend worker"
   },
   "engines": {

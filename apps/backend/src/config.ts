@@ -60,6 +60,29 @@ const schema = z.object({
   LOGIN_THROTTLE_SECONDS: z.coerce.number().int().min(1).max(86_400).default(300),
   // Max distinct abuse-guard keys held in memory (bounded; LRU-evicted).
   ABUSE_GUARD_MAX_KEYS: z.coerce.number().int().min(1000).max(5_000_000).default(100_000),
+  // ---- Distributed abuse backend (Increment 12) ----
+  // Which backend coordinates abuse/rate-limit state. 'memory' is process-local
+  // (default; fine for dev/test/single-instance). 'redis' shares state across
+  // instances via REDIS_URL (atomic Lua). Production with >1 instance should use
+  // 'redis' — process-local limits are NOT globally enforced.
+  ABUSE_BACKEND: z.enum(["memory", "redis"]).default("memory"),
+  // Namespace prefix for all abuse keys in Redis (keeps the keyspace isolated;
+  // `clear()` only ever touches keys under this prefix, never FLUSHALL).
+  REDIS_KEY_PREFIX: z.string().default("luvora"),
+  // Round-trip timeout for a single abuse Redis operation (ms). Kept small so a
+  // slow/stalled Redis degrades per the fail policy rather than hanging requests.
+  ABUSE_REDIS_TIMEOUT_MS: z.coerce.number().int().min(5).max(10_000).default(100),
+  // Behaviour when the Redis abuse backend is unavailable/errors:
+  //  'closed' -> deny security-critical throttled checks (fail CLOSED; safest).
+  //  'open'   -> allow (fail OPEN; availability over strict enforcement).
+  // Default 'closed': an abuse control that silently stops protecting is worse
+  // than a brief denial. Production MUST NOT fail open for login (enforced).
+  ABUSE_FAIL_POLICY: z.enum(["open", "closed"]).default("closed"),
+  // Secret used to HMAC-fingerprint identifiers (IP/email/user) before they are
+  // used in Redis keys — so raw PII never lands in Redis. Empty => derived from
+  // the JWT access secret (see below). In production a dedicated secret is
+  // recommended and must be strong.
+  ABUSE_FINGERPRINT_SECRET: z.string().default(""),
   // Request-input hard limits.
   JSON_BODY_LIMIT_BYTES: z.coerce.number().int().min(1024).max(10 * 1024 * 1024).default(1024 * 1024),
   MAX_URL_LENGTH: z.coerce.number().int().min(256).max(16_384).default(2048),
@@ -187,6 +210,8 @@ const schema = z.object({
   // Timeouts for the DB probe used by health/readiness (ms).
   HEALTH_DB_TIMEOUT_MS: z.coerce.number().int().min(100).max(30_000).default(2000),
   READINESS_DB_TIMEOUT_MS: z.coerce.number().int().min(100).max(30_000).default(2000),
+  // Timeout for the Redis readiness PING when the Redis abuse backend is used.
+  READINESS_REDIS_TIMEOUT_MS: z.coerce.number().int().min(50).max(30_000).default(1000),
   // Queue-pressure thresholds (claimable depth / oldest pending age seconds).
   JOB_QUEUE_WARNING_DEPTH: z.coerce.number().int().min(0).default(100),
   JOB_QUEUE_CRITICAL_DEPTH: z.coerce.number().int().min(0).default(1000),
@@ -258,6 +283,24 @@ if (env.NODE_ENV === "production") {
   if (env.DEVELOPER_MODE) {
     problems.push("DEVELOPER_MODE must be false in production");
   }
+  // ---- Distributed abuse backend (Increment 12) ----
+  if (env.ABUSE_BACKEND === "redis") {
+    if (env.REDIS_URL.trim().length === 0) {
+      problems.push("REDIS_URL must be set when ABUSE_BACKEND=redis in production");
+    }
+    // Never silently downgrade distributed abuse control to process-local, and
+    // never fail OPEN on the login/brute-force path in production.
+    if (env.ABUSE_FAIL_POLICY === "open") {
+      problems.push(
+        "ABUSE_FAIL_POLICY must be 'closed' in production when ABUSE_BACKEND=redis (do not fail open on security throttles)",
+      );
+    }
+    // If a dedicated fingerprint secret is supplied it must be strong; if empty
+    // it falls back to JWT_ACCESS_SECRET (already validated above).
+    if (env.ABUSE_FINGERPRINT_SECRET.length > 0) {
+      weakSecret("ABUSE_FINGERPRINT_SECRET", env.ABUSE_FINGERPRINT_SECRET);
+    }
+  }
   if (problems.length > 0) {
     // eslint-disable-next-line no-console
     console.error(
@@ -292,6 +335,21 @@ export const config = {
     trustProxyHops: env.TRUST_PROXY_HOPS,
     abuseGuardEnabled: env.ABUSE_GUARD_ENABLED,
     abuseGuardMaxKeys: env.ABUSE_GUARD_MAX_KEYS,
+    // ---- Distributed abuse backend (Increment 12) ----
+    abuse: {
+      backend: env.ABUSE_BACKEND,
+      redisUrl: env.REDIS_URL,
+      redisKeyPrefix: env.REDIS_KEY_PREFIX,
+      redisTimeoutMs: env.ABUSE_REDIS_TIMEOUT_MS,
+      failPolicy: env.ABUSE_FAIL_POLICY,
+      // Resolved fingerprint secret: a dedicated value if set, else derived from
+      // the JWT access secret so a fingerprint is never computed with an empty
+      // key. Never logged; only ever used as an HMAC key.
+      fingerprintSecret:
+        env.ABUSE_FINGERPRINT_SECRET.length > 0
+          ? env.ABUSE_FINGERPRINT_SECRET
+          : env.JWT_ACCESS_SECRET,
+    },
     login: {
       maxFailures: env.LOGIN_MAX_FAILURES,
       failureWindowSeconds: env.LOGIN_FAILURE_WINDOW_SECONDS,
@@ -384,6 +442,7 @@ export const config = {
     metricsRequireAuth: env.METRICS_REQUIRE_AUTH,
     healthDbTimeoutMs: env.HEALTH_DB_TIMEOUT_MS,
     readinessDbTimeoutMs: env.READINESS_DB_TIMEOUT_MS,
+    readinessRedisTimeoutMs: env.READINESS_REDIS_TIMEOUT_MS,
     operationalEventRetentionDays: env.OPERATIONAL_EVENT_RETENTION_DAYS,
     securityEventRetentionDays: env.SECURITY_EVENT_RETENTION_DAYS,
   },

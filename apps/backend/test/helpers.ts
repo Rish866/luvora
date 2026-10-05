@@ -16,8 +16,9 @@ export async function resetDb(): Promise<void> {
              devices, auth_sessions, users
     RESTART IDENTITY CASCADE;
   `);
-  // Clear process-local abuse/brute-force counters so each test starts clean.
-  abuseGuard.clear();
+  // Clear abuse/brute-force counters so each test starts clean. With the Redis
+  // backend this clears only keys under the configured namespace.
+  await abuseGuard.clear();
 }
 
 export interface RegisteredUser {

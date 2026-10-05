@@ -432,3 +432,53 @@
   `scripts/restore-db.sh` (credentials only via `DATABASE_URL`); and the
   `THREAT_MODEL`, `DEPLOYMENT`, `DISASTER_RECOVERY`, and
   `PRODUCTION_SECURITY_CHECKLIST` docs.
+
+---
+
+## Distributed abuse control & dependency remediation (Increment 12)
+
+### Distributed abuse backend
+- The abuse abstraction now has two interchangeable backends behind one async
+  `AbuseBackend` interface: `InMemoryAbuseBackend` (process-local, default) and
+  `RedisAbuseBackend` (distributed). Selected by `ABUSE_BACKEND`. Application
+  code depends only on `AbuseGuard` → `AbuseBackend`, never on Redis directly.
+- **Atomicity:** the Redis backend performs check-and-increment in a single
+  server-side Lua script, so concurrent requests across multiple instances
+  cannot race past the limit. Proven by tests that fire 20 concurrent requests
+  across two independent clients/processes against a shared Redis and observe
+  **exactly** the limit allowed.
+- **Login brute force is now distributed:** with `ABUSE_BACKEND=redis`, the
+  per-IP and per-account failure limits are enforced across ALL instances — an
+  attacker alternating requests between instances cannot bypass them. Verified
+  by a two-instance test and an end-to-end HTTP smoke.
+- **Key privacy:** the guard HMAC-fingerprints every identifier (IP / email /
+  user id) BEFORE it becomes a backend key, so no raw PII is ever stored in
+  Redis. Keys are namespaced + length-bounded; the fingerprint secret and the
+  Redis URL are never logged.
+- **Fail policy:** `ABUSE_FAIL_POLICY=closed` (default, required in production)
+  denies security-critical checks when Redis is unavailable and flips `/ready`
+  to 503 — the app never silently downgrades distributed protection to
+  process-local. `open` trades enforcement for availability and is forbidden in
+  production with the Redis backend. A probe failure never causes a permanent
+  lockout.
+- **Honest limitation:** WebSocket per-connection *event* throttling and
+  per-user *connection* caps remain process-local by design — routing every
+  high-frequency ephemeral WS event through Redis would add a network round-trip
+  per message for little security gain. The security-significant surfaces
+  (login, registration, discovery/chat/invite actions, reports, devices) use the
+  shared abstraction and are distributed when Redis is configured.
+
+### Dependency security remediation
+- `sharp` upgraded `0.33.5 → 0.35.5` (patched libvips/libheif CVEs) and
+  `file-type` `16.5.4 → 21.3.4` (fixes the ASF-parser infinite-loop advisory).
+  `file-type` v21 is ESM-only and is loaded via a dynamic import from the
+  CommonJS build (works on the Node 22 runtime via `require(esm)`).
+- **`npm audit --omit=dev` → 0 vulnerabilities** (the production image installs
+  only prod deps). The remaining `npm audit` findings are all in dev-only
+  tooling (vitest/esbuild/vite/ts-node-dev) that is never shipped in the image.
+- The media pipeline's accepted formats are unchanged (JPEG/PNG/WebP only); the
+  upgrade did NOT enable HEIF/AVIF. All media security tests (dual-MIME
+  detection, pixel caps, EXIF stripping, thumbnails, malformed rejection) pass.
+
+See `docs/REDIS_OPERATIONS.md` for the operator guide (topology, security,
+failure behaviour, monitoring, capacity, DR interaction).

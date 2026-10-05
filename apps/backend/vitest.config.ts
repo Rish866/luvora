@@ -9,6 +9,9 @@ export default defineConfig({
   },
   test: {
     include: ["test/**/*.test.ts"],
+    // Global setup: initializes the distributed abuse backend when configured
+    // (ABUSE_BACKEND=redis) so the real app path is exercised over Redis.
+    setupFiles: ["test/setup.ts"],
     // Integration tests share one Postgres database and TRUNCATE between tests,
     // so they must not run in parallel across files.
     fileParallelism: false,

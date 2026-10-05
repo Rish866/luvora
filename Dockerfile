@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # =============================================================================
-# Luvora backend — production image (Increment 11).
+# Luvora backend — production image (Increment 11; deps hardened Increment 12).
 #
 # Multi-stage build:
 #   1. "build"   installs ALL workspace deps and compiles shared + backend to JS.
@@ -15,6 +15,12 @@
 # Node signals: server.ts installs SIGTERM/SIGINT handlers for graceful
 # shutdown, so the container stops cleanly without --init. We still default
 # NODE_ENV=production (which engages the config fail-fast guard).
+#
+# NODE_VERSION 22 is REQUIRED (not just preferred): the media pipeline depends
+# on file-type v21 (ESM-only; the advisory fix) loaded via dynamic import from
+# CommonJS, which relies on Node 22's built-in require(esm) support. The runtime
+# deps also include sharp 0.35.5 (patched libvips/libheif) and ioredis (the
+# distributed abuse backend client).
 # =============================================================================
 
 ARG NODE_VERSION=22

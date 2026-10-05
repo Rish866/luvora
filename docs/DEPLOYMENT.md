@@ -4,8 +4,11 @@ How to build, configure, and run the Luvora backend in production. The topology
 is deliberately simple: a stateless **API** process and a separate **worker**
 process, both built from the same image, sharing one PostgreSQL database.
 
-> No Redis/Kafka/Prometheus-server is required. Rate limiting and metrics are
-> **process-local** (see Scaling & limitations below).
+> No Kafka/Prometheus-server is required. Metrics are process-local. Rate
+> limiting / abuse control is process-local by default, but can be made
+> **distributed across instances by configuring Redis** (`ABUSE_BACKEND=redis`)
+> — strongly recommended for any multi-instance production deployment. See
+> `docs/REDIS_OPERATIONS.md` and Scaling & limitations below.
 
 ## 1. Build the image
 
@@ -65,6 +68,11 @@ See `apps/backend/.env.example` for the full list. Highlights:
 - **HSTS**: `HSTS_ENABLED=true` only when TLS is terminated in front and you
   intend browsers to pin HTTPS (`HSTS_MAX_AGE_SECONDS`).
 - **Abuse control**: `ABUSE_GUARD_ENABLED` (default on), `ABUSE_GUARD_MAX_KEYS`.
+- **Distributed abuse backend** (Increment 12): `ABUSE_BACKEND=redis` for
+  multi-instance deployments, with `REDIS_URL` (required), `REDIS_KEY_PREFIX`,
+  `ABUSE_REDIS_TIMEOUT_MS`, `ABUSE_FAIL_POLICY=closed` (required in prod), and a
+  strong `ABUSE_FINGERPRINT_SECRET`. Full operator guide:
+  `docs/REDIS_OPERATIONS.md`. Default `memory` is process-local.
 - **Login throttle**: `LOGIN_MAX_FAILURES`, `LOGIN_FAILURE_WINDOW_SECONDS`,
   `LOGIN_THROTTLE_SECONDS`.
 - **Request limits**: `JSON_BODY_LIMIT_BYTES`, `MAX_URL_LENGTH`.
@@ -108,11 +116,16 @@ and `scripts/backup-db.sh` / `scripts/restore-db.sh`.
 ## 8. Scaling & honest limitations
 
 - The API is stateless and horizontally scalable behind a load balancer.
-- **Rate limiting / abuse control and metrics are process-local.** With N API
-  instances, each enforces its own limits and reports its own metrics; they are
-  NOT aggregated or globally enforced. For cluster-wide throttling you must add
-  a shared backend (e.g. Redis) — the `AbuseBackend` seam marks where.
+- **Abuse control** is distributed across instances when `ABUSE_BACKEND=redis`
+  (atomic, shared counters/blocks). With the default `memory` backend — or any
+  single-instance deployment — it is process-local: each instance enforces its
+  own limits, which is NOT global enforcement. Choose `redis` for multi-instance
+  production (`docs/REDIS_OPERATIONS.md`).
+- **Metrics are still process-local** — with N instances each reports its own
+  values; a scrape/aggregation layer would combine them.
 - Volumetric DDoS must be absorbed at the edge (CDN/WAF/LB); application limits
   are not a substitute.
+- WebSocket per-connection event throttles and per-user connection caps are
+  process-local by design (high-frequency ephemeral events).
 - External push (FCM/APNs/WebPush) and distributed presence/realtime are
   unimplemented placeholders. Job execution is at-least-once.

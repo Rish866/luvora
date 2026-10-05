@@ -9,13 +9,29 @@
  *
  * The application code is identical in both cases; only DATABASE_URL differs.
  */
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 
 const PG_BIN = "/usr/bin";
 const RUNNER_USER = "pgrunner";
+// When set, also boot an ephemeral Redis and run the suite with the distributed
+// (Redis) abuse backend active end-to-end (`npm run verify:redis`).
+const WITH_REDIS = process.env.VERIFY_WITH_REDIS === "1";
+const REDIS_CANDIDATES = ["redis6-server", "redis-server", "/usr/bin/redis6-server", "/usr/bin/redis-server"];
+
+function findRedisBin(): string | null {
+  for (const bin of REDIS_CANDIDATES) {
+    try {
+      if (spawnSync(bin, ["--version"], { stdio: "ignore" }).status === 0) return bin;
+    } catch {
+      /* next */
+    }
+  }
+  return null;
+}
 
 function sh(cmd: string, opts: { user?: string } = {}): { code: number; out: string } {
   const full = opts.user ? ["su", "-", opts.user, "-c", cmd] : ["bash", "-c", cmd];
@@ -28,7 +44,9 @@ function ensureRunnerUser(): void {
   if (!exists) spawnSync("useradd", ["-m", RUNNER_USER]);
 }
 
-function main(): void {
+let redisProcHandle: ChildProcess | null = null;
+
+async function main(): Promise<void> {
   const haveInitdb = fs.existsSync(path.join(PG_BIN, "initdb"));
   if (!haveInitdb) {
     console.error(
@@ -80,6 +98,13 @@ function main(): void {
   }
 
   const cleanup = () => {
+    if (redisProcHandle) {
+      try {
+        redisProcHandle.kill("SIGKILL");
+      } catch {
+        /* ignore */
+      }
+    }
     sh(`${PG_BIN}/pg_ctl -D '${data}' -m immediate stop`, { user: RUNNER_USER });
     try {
       fs.rmSync(dir, { recursive: true, force: true });
@@ -94,6 +119,55 @@ function main(): void {
     // Connection string uses the Unix socket (host = dir, no password/TCP).
     const databaseUrl = `postgres://app@/luvora_test?host=${encodeURIComponent(dir)}`;
 
+    // Optionally boot an ephemeral Redis for the distributed abuse backend.
+    let redisProc: ChildProcess | null = null;
+    let redisUrl = "";
+    if (WITH_REDIS) {
+      const redisBin = findRedisBin();
+      if (!redisBin) {
+        console.error("[verify] VERIFY_WITH_REDIS=1 but no redis-server binary found.");
+        cleanup();
+        process.exit(1);
+      }
+      const redisPort = await new Promise<number>((resolve) => {
+        const s = net.createServer();
+        s.listen(0, "127.0.0.1", () => {
+          const a = s.address();
+          const p = typeof a === "object" && a ? a.port : 0;
+          s.close(() => resolve(p));
+        });
+      });
+      const redisDir = fs.mkdtempSync(path.join(os.tmpdir(), "rvredis-"));
+      console.log("[verify] starting ephemeral Redis...");
+      redisProc = spawn(
+        redisBin,
+        ["--port", String(redisPort), "--bind", "127.0.0.1", "--save", "", "--appendonly", "no", "--dir", redisDir],
+        { stdio: "ignore" },
+      );
+      redisProcHandle = redisProc;
+      redisUrl = `redis://127.0.0.1:${redisPort}`;
+      // Wait for the port.
+      let up = false;
+      for (let i = 0; i < 50; i++) {
+        up = await new Promise<boolean>((resolve) => {
+          const sock = net.connect(redisPort, "127.0.0.1");
+          sock.on("connect", () => {
+            sock.end();
+            resolve(true);
+          });
+          sock.on("error", () => resolve(false));
+        });
+        if (up) break;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      if (!up) {
+        console.error("[verify] ephemeral Redis did not start");
+        redisProc.kill("SIGKILL");
+        cleanup();
+        process.exit(1);
+      }
+    }
+
     const env = {
       ...process.env,
       NODE_ENV: "test",
@@ -101,6 +175,17 @@ function main(): void {
       JWT_ACCESS_SECRET: "test-access-secret-at-least-16-chars",
       JWT_REFRESH_SECRET: "test-refresh-secret-at-least-16-chars",
       BCRYPT_ROUNDS: "4", // fast hashing for tests
+      // Distributed abuse backend: when running `verify:redis`, point the whole
+      // suite (including the real HTTP login flow) at the ephemeral Redis.
+      ...(WITH_REDIS
+        ? {
+            ABUSE_BACKEND: "redis",
+            REDIS_URL: redisUrl,
+            REDIS_KEY_PREFIX: "luvoratest",
+            ABUSE_FINGERPRINT_SECRET: "verify-redis-fingerprint-secret-32chars-xx",
+            ABUSE_FAIL_POLICY: "closed",
+          }
+        : {}),
       // Known CORS allowlist so the CORS hardening tests are deterministic.
       CORS_ALLOWED_ORIGINS: "https://app.luvora.test,https://admin.luvora.test",
       // Request-limit knobs. JSON body stays at the 1MB default (so existing
@@ -150,4 +235,7 @@ function main(): void {
   }
 }
 
-main();
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});

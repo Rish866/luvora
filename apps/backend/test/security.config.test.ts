@@ -114,4 +114,67 @@ describe.skipIf(!built)("config: production fail-fast", () => {
     });
     expect(status).toBe(0);
   });
+
+  // ---- Distributed abuse backend (Increment 12) ----
+
+  it("boots with ABUSE_BACKEND=redis + a valid REDIS_URL + fail-closed", () => {
+    const { status } = loadConfig(
+      baseProdEnv({
+        ABUSE_BACKEND: "redis",
+        REDIS_URL: "redis://redis.internal:6379",
+        ABUSE_FAIL_POLICY: "closed",
+      }),
+    );
+    expect(status).toBe(0);
+  });
+
+  it("refuses ABUSE_BACKEND=redis without a REDIS_URL", () => {
+    const { status, stderr } = loadConfig(
+      baseProdEnv({ ABUSE_BACKEND: "redis", REDIS_URL: "" }),
+    );
+    expect(status).not.toBe(0);
+    expect(stderr).toMatch(/REDIS_URL/);
+  });
+
+  it("refuses ABUSE_FAIL_POLICY=open with the redis backend in production", () => {
+    const { status, stderr } = loadConfig(
+      baseProdEnv({
+        ABUSE_BACKEND: "redis",
+        REDIS_URL: "redis://redis.internal:6379",
+        ABUSE_FAIL_POLICY: "open",
+      }),
+    );
+    expect(status).not.toBe(0);
+    expect(stderr).toMatch(/ABUSE_FAIL_POLICY/);
+  });
+
+  it("refuses a weak dedicated ABUSE_FINGERPRINT_SECRET when redis is used", () => {
+    const { status, stderr } = loadConfig(
+      baseProdEnv({
+        ABUSE_BACKEND: "redis",
+        REDIS_URL: "redis://redis.internal:6379",
+        ABUSE_FINGERPRINT_SECRET: "too-short",
+      }),
+    );
+    expect(status).not.toBe(0);
+    expect(stderr).toMatch(/ABUSE_FINGERPRINT_SECRET/);
+    // Never echoes the secret value.
+    expect(stderr).not.toContain("too-short");
+  });
+
+  it("accepts a strong dedicated ABUSE_FINGERPRINT_SECRET", () => {
+    const { status } = loadConfig(
+      baseProdEnv({
+        ABUSE_BACKEND: "redis",
+        REDIS_URL: "redis://redis.internal:6379",
+        ABUSE_FINGERPRINT_SECRET: "f".repeat(40),
+      }),
+    );
+    expect(status).toBe(0);
+  });
+
+  it("defaults to the memory backend (no redis requirement)", () => {
+    const { status } = loadConfig(baseProdEnv());
+    expect(status).toBe(0);
+  });
 });
