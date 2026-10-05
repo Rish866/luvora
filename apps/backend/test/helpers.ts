@@ -87,3 +87,45 @@ export async function insertDecision(
     [likerId, likeeId, isPass],
   );
 }
+
+/**
+ * Drive two users through the full invite -> accept -> consent flow until the
+ * session is PLAYING, agreeing to the given consent categories (both say YES to
+ * all of them). Returns the session id. Uses the real API via supertest.
+ */
+export async function createPlayingSession(
+  app: Express,
+  a: RegisteredUser,
+  b: RegisteredUser,
+  matchId: string,
+  consentCategories: string[] = ["flirting", "teasing", "roleplay", "mystery"],
+): Promise<string> {
+  const invite = await request(app)
+    .post("/api/sessions/invite")
+    .set(...auth(a.accessToken))
+    .send({ matchId, scenarioId: "placeholder", scenarioVersion: "v1" });
+  if (invite.status !== 201) {
+    throw new Error(`invite failed: ${invite.status} ${JSON.stringify(invite.body)}`);
+  }
+  const sessionId = invite.body.data.sessionId;
+
+  const accept = await request(app)
+    .post(`/api/sessions/${sessionId}/accept`)
+    .set(...auth(b.accessToken))
+    .send();
+  if (accept.status !== 200) {
+    throw new Error(`accept failed: ${accept.status} ${JSON.stringify(accept.body)}`);
+  }
+
+  const responses = consentCategories.map((category) => ({ category, response: "YES" }));
+  for (const user of [a, b]) {
+    const r = await request(app)
+      .post(`/api/sessions/${sessionId}/consent`)
+      .set(...auth(user.accessToken))
+      .send({ responses, agreeToParticipate: true });
+    if (r.status !== 200) {
+      throw new Error(`consent failed: ${r.status} ${JSON.stringify(r.body)}`);
+    }
+  }
+  return sessionId;
+}

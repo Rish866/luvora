@@ -72,10 +72,45 @@
 - **Parameterized SQL** throughout the chat module; cursors are opaque and
   always passed as parameters.
 
+## Fantasy engine security (Increment 4)
+- **Server-authoritative gameplay:** clients submit only a `choiceId` (intent).
+  The server resolves the next node, turn, and completion from the DB; request
+  fields like `nextNodeId`/`turnNumber`/`scenarioVersionId` are never read, so a
+  tampering client cannot jump to an arbitrary node or ending (tested).
+- **Immutable versions:** a session pins one `scenario_version_id`; publishing a
+  new version never mutates a running session. Referenced content is protected
+  by `ON DELETE RESTRICT`.
+- **Participant authorization (IDOR):** every gameplay endpoint and WS event is
+  authorized against the session's match participants; a non-participant gets
+  the generic `GAME_NOT_AUTHORIZED`. Knowing a session/scenario/choice id is
+  never sufficient.
+- **Choice integrity:** a submitted choice must belong to the session's CURRENT
+  node (re-checked under the row lock) — choices from other nodes/scenarios/
+  sessions are rejected (`INVALID_CHOICE`).
+- **Consent re-evaluation:** consent requirements are re-checked at choice time
+  using the ONE shared resolver (`resolveCompatibleCategories`). A choice is
+  allowed only if every required category is in the mutual allow-list; the
+  partner's individual responses are never exposed (only a per-choice
+  `available` boolean).
+- **Transactional, concurrency-safe, idempotent:** choice processing runs in a
+  transaction with `SELECT … FOR UPDATE` + an optimistic `state_version` guard,
+  so concurrent submissions advance the session exactly one turn. A
+  `client_action_id` (UNIQUE per session+user) makes retries idempotent — no
+  double-advance (tested, incl. concurrent duplicates).
+- **Persist-then-broadcast:** game state is committed before any WS broadcast,
+  which targets only the two participants (never global).
+- **Reconnect:** `GET /api/sessions/:id/state` and `game.subscribe` return
+  authoritative DB state, so clients recover without replaying events.
+- **Input validation:** scenario/session/choice/action ids are UUID-validated;
+  malformed WS frames and unknown event types return structured errors without
+  crashing. All SQL parameterized; dynamic fragments are `$N` placeholders only.
+
 ## Known gaps (planned for later increments)
 - Email/phone verification flow (fields exist; sending not wired).
 - Multi-instance WebSocket presence/delivery (process-local today; needs shared
   pub/sub such as Redis — deferred to the hardening increment).
+- Scenario authoring/admin tooling (the data model + versioning support it; the
+  admin API/RBAC arrives in a later increment).
 - Media signed-URL authorization + moderation pipeline.
 - Admin RBAC + audit logging.
 - Full automated security test matrix and load testing.

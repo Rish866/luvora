@@ -14,3 +14,4 @@ export * from "./api";
 export * from "./stateMachine";
 export * from "./discovery";
 export * from "./chat";
+export * from "./scenario";

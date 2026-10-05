@@ -1,6 +1,7 @@
 import { pool, withTransaction } from "./pool";
 import { hashPassword } from "../auth/password";
 import { logger } from "../logger";
+import { seedScenarios } from "./scenarioSeed";
 
 /**
  * Development seed data. Creates demo adult users and an active match so the
@@ -53,6 +54,9 @@ async function seed(): Promise<void> {
       [a, b],
     );
   });
+
+  // Seed the published scenario library (idempotent).
+  await seedScenarios();
 
   logger.info("seed complete");
 }

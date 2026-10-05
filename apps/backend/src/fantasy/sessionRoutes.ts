@@ -7,6 +7,8 @@ import { Errors } from "../http/errors";
 import { query } from "../db/pool";
 import * as repo from "./sessionRepository";
 import * as service from "./sessionService";
+import * as gameplay from "./gameplayService";
+import { gameHub } from "./gameConnectionRegistry";
 
 export const sessionRouter = Router();
 sessionRouter.use(requireAuth);
@@ -94,5 +96,77 @@ sessionRouter.post(
   asyncHandler(async (req, res) => {
     const session = await service.leaveSession(req.params.id, req.userId!);
     ok(res, { sessionId: session.id, state: session.state });
+  }),
+);
+
+// ---- Increment 4: data-driven gameplay ----
+
+const sessionIdParam = z.object({ id: z.string().uuid() });
+const choiceIdParam = z.object({ id: z.string().uuid(), choiceId: z.string().uuid() });
+
+/** Authoritative gameplay state (reconnect-safe; DB-sourced). */
+sessionRouter.get(
+  "/:id/state",
+  asyncHandler(async (req, res) => {
+    const { id } = sessionIdParam.parse(req.params);
+    const state = await gameplay.getState(id, req.userId!);
+    ok(res, { state });
+  }),
+);
+
+/** Broadcast a game state change to both participants of a session. */
+async function broadcastGameState(
+  sessionId: string,
+  event: Parameters<typeof gameHub.broadcastToUsers>[1],
+): Promise<void> {
+  const s = await repo.getSession(sessionId);
+  if (s) gameHub.broadcastToUsers([s.initiator_id, s.invitee_id], event);
+}
+
+/** Select a published scenario for a consented (PLAYING) session. */
+sessionRouter.post(
+  "/:id/scenario",
+  asyncHandler(async (req, res) => {
+    const { id } = sessionIdParam.parse(req.params);
+    const { scenarioId } = gameplay.selectScenarioSchema.parse(req.body);
+    const state = await gameplay.selectScenario(id, req.userId!, scenarioId);
+    await broadcastGameState(id, { type: "game.state.changed", state });
+    ok(res, { state }, 201);
+  }),
+);
+
+/** Submit a choice (by id). Idempotent via clientActionId. */
+sessionRouter.post(
+  "/:id/choices/:choiceId",
+  asyncHandler(async (req, res) => {
+    const { id, choiceId } = choiceIdParam.parse(req.params);
+    const { clientActionId } = gameplay.chooseSchema.parse(req.body);
+    const result = await gameplay.choose(id, req.userId!, choiceId, clientActionId);
+    // Persist-then-broadcast to both participants.
+    const event = result.completed
+      ? ({ type: "game.completed", state: result.state } as const)
+      : ({ type: "game.state.changed", state: result.state } as const);
+    gameHub.broadcastToUsers(result.participants, event);
+    ok(res, { state: result.state });
+  }),
+);
+
+sessionRouter.post(
+  "/:id/pause",
+  asyncHandler(async (req, res) => {
+    const { id } = sessionIdParam.parse(req.params);
+    const state = await gameplay.pause(id, req.userId!);
+    await broadcastGameState(id, { type: "game.state.changed", state });
+    ok(res, { state });
+  }),
+);
+
+sessionRouter.post(
+  "/:id/resume",
+  asyncHandler(async (req, res) => {
+    const { id } = sessionIdParam.parse(req.params);
+    const state = await gameplay.resume(id, req.userId!);
+    await broadcastGameState(id, { type: "game.state.changed", state });
+    ok(res, { state });
   }),
 );

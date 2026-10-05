@@ -3,13 +3,17 @@ import type { AddressInfo } from "node:net";
 import { WebSocket } from "ws";
 import type { Express } from "express";
 import { createApp } from "../src/app";
+import { attachWsDispatcher, type WsDispatcher } from "../src/ws/wsDispatcher";
 import { attachChatGateway, type ChatGateway } from "../src/chat/chatGateway";
+import { attachGameGateway, type GameGateway } from "../src/fantasy/gameGateway";
 
-/** Boot a real HTTP server + chat gateway on an ephemeral port for WS tests. */
+/** Boot a real HTTP server + both WS channels on an ephemeral port for tests. */
 export interface LiveServer {
   app: Express;
   server: Server;
+  dispatcher: WsDispatcher;
   gateway: ChatGateway;
+  gameGateway: GameGateway;
   port: number;
   close: () => Promise<void>;
 }
@@ -19,15 +23,21 @@ export async function startLiveServer(): Promise<LiveServer> {
   const server = await new Promise<Server>((resolve) => {
     const s = app.listen(0, () => resolve(s));
   });
-  const gateway = attachChatGateway(server);
+  const dispatcher = attachWsDispatcher(server);
+  const gateway = attachChatGateway(dispatcher);
+  const gameGateway = attachGameGateway(dispatcher);
   const port = (server.address() as AddressInfo).port;
   return {
     app,
     server,
+    dispatcher,
     gateway,
+    gameGateway,
     port,
     close: async () => {
       await gateway.close();
+      await gameGateway.close();
+      await dispatcher.closeAll();
       await new Promise<void>((resolve) => server.close(() => resolve()));
     },
   };
@@ -63,9 +73,9 @@ const waitersBySocket = new WeakMap<WebSocket, Waiter[]>();
 export function openSocket(
   port: number,
   token: string | null,
-  opts: { viaQuery?: boolean } = {},
+  opts: { viaQuery?: boolean; path?: string } = {},
 ): Promise<WebSocket> {
-  const base = `ws://127.0.0.1:${port}/ws/chat`;
+  const base = `ws://127.0.0.1:${port}${opts.path ?? "/ws/chat"}`;
   const url = token && opts.viaQuery ? `${base}?access_token=${encodeURIComponent(token)}` : base;
   const headers =
     token && !opts.viaQuery ? { Authorization: `Bearer ${token}` } : undefined;

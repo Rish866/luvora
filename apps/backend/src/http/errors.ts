@@ -70,6 +70,31 @@ export const Errors = {
   invalidWebSocketMessage: (message = "Invalid WebSocket message.") =>
     new AppError(ErrorCodes.INVALID_WEBSOCKET_MESSAGE, 400, message),
 
+  // ---- Fantasy engine (Increment 4) ----
+  scenarioNotFound: (message = "Scenario not found.") =>
+    new AppError(ErrorCodes.SCENARIO_NOT_FOUND, 404, message),
+  scenarioNotPublished: (message = "Scenario is not published.") =>
+    new AppError(ErrorCodes.SCENARIO_NOT_PUBLISHED, 409, message),
+  scenarioNotAvailable: (message = "Scenario is not available for this session.") =>
+    new AppError(ErrorCodes.SCENARIO_NOT_AVAILABLE, 409, message),
+  sessionNotReady: (message = "This session is not ready for scenario selection.") =>
+    new AppError(ErrorCodes.SESSION_NOT_READY, 409, message),
+  sessionNotPlaying: (message = "This session is not currently in play.") =>
+    new AppError(ErrorCodes.SESSION_NOT_PLAYING, 409, message),
+  /** Generic gameplay authorization failure (non-participant). */
+  gameNotAuthorized: (message = "You are not authorized to play this session.") =>
+    new AppError(ErrorCodes.GAME_NOT_AUTHORIZED, 403, message),
+  invalidChoice: (message = "That choice is not valid for the current node.") =>
+    new AppError(ErrorCodes.INVALID_CHOICE, 400, message),
+  choiceNotAvailable: (message = "That choice is not currently available.") =>
+    new AppError(ErrorCodes.CHOICE_NOT_AVAILABLE, 403, message),
+  consentRequired: (message = "This action requires consent that has not been mutually agreed.") =>
+    new AppError(ErrorCodes.CONSENT_REQUIRED, 403, message),
+  gameStateConflict: (message = "The game state changed; please retry with the latest state.") =>
+    new AppError(ErrorCodes.GAME_STATE_CONFLICT, 409, message),
+  gameAlreadyCompleted: (message = "This session has already completed.") =>
+    new AppError(ErrorCodes.GAME_ALREADY_COMPLETED, 409, message),
+
   internal: (message = "An unexpected error occurred.") =>
     new AppError(ErrorCodes.INTERNAL, 500, message),
 };

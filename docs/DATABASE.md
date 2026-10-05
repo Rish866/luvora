@@ -87,6 +87,41 @@ Indexes / constraints:
 
 Presence and typing are ephemeral and are **not** persisted.
 
+## Migration 0004 — fantasy engine + scenario library (Increment 4)
+
+`0004_fantasy_engine.sql` adds the data-driven scenario engine and extends
+`fantasy_sessions` with gameplay state. Content is data; scenario versions are
+immutable once a session references them.
+
+| Table | Purpose / notable constraints |
+|-------|-------------------------------|
+| `scenarios` | Authoring parent. `UNIQUE(lower(slug))`; `status ∈ {DRAFT,PUBLISHED,ARCHIVED}`; only PUBLISHED is user-visible. |
+| `scenario_versions` | Immutable snapshot. `UNIQUE(scenario_id, version)`; `start_node_id` FK → nodes; FK → scenarios `ON DELETE RESTRICT`. |
+| `scenario_nodes` | One step. `node_type ∈ {START,NARRATIVE,CHOICE,ENDING}`; `UNIQUE(scenario_version_id, node_key)`. |
+| `scenario_choices` | `UNIQUE(node_id, choice_key)`; `next_node_id` FK → nodes `ON DELETE RESTRICT` (server-resolved destination; clients never supply it). |
+| `scenario_choice_requirements` | `(choice_id, consent_category)` PK — consent categories a choice requires. |
+| `session_actions` | Idempotency ledger. `UNIQUE(session_id, user_id, client_action_id)` — a retried action returns the same result, no double-advance. |
+
+`fantasy_sessions` additive columns: `scenario_version_id` (FK → versions, RESTRICT),
+`current_node_id` (FK → nodes, RESTRICT), `turn_number`, `state_version`
+(optimistic-concurrency token), `started_at`, `completed_at`.
+
+**Deletion safety:** every column a running session can reference
+(`scenario_version_id`, `current_node_id`, choice `next_node_id`, version
+`start_node_id`) uses `ON DELETE RESTRICT`, so content a session depends on
+cannot be deleted out from under it. `session_actions` is `ON DELETE CASCADE`
+from the session (child side).
+
+Indexes: `scenarios_slug_unique`, `scenarios_status`, `scenario_versions_scenario`,
+partial `scenario_versions_published`, `scenario_nodes_version`,
+`scenario_choices_node`, `fantasy_sessions_scenario_version`,
+`fantasy_sessions_current_node`, `session_actions_session`.
+
+### Seeding
+`apps/backend/src/db/scenarioSeed.ts` seeds ~5 safe, non-graphic PUBLISHED demo
+scenarios (linear, branching, consent-gated, multiple endings) idempotently
+(keyed on slug + version). It is invoked by `seed` and runnable standalone.
+
 ## Resetting a dev/test database
 
 Migrations are forward-only; to reset, drop and recreate the database, then

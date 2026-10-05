@@ -13,6 +13,13 @@ export interface SessionRow {
   seq: string;
   created_at: string;
   updated_at: string;
+  // Gameplay state (Increment 4).
+  scenario_version_id: string | null;
+  current_node_id: string | null;
+  turn_number: number;
+  state_version: number;
+  started_at: string | null;
+  completed_at: string | null;
 }
 
 export interface PlayerRow {

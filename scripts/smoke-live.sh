@@ -28,6 +28,8 @@ export RATE_LIMIT_MAX="100000"
 export AUTH_RATE_LIMIT_MAX="100000"
 
 node -r ts-node/register src/db/migrate.ts up >/dev/null 2>&1
+# Seed the published scenario library so the gameplay smoke flow has content.
+node -r ts-node/register src/db/scenarioSeed.ts >/dev/null 2>&1
 
 # Start the actual server.
 node -r ts-node/register src/server.ts > "$DIR/server.log" 2>&1 &
@@ -254,6 +256,61 @@ done
 # Block enforcement over chat: G blocks H, then H's HTTP send is rejected.
 json -X POST $B/api/users/$UH/block -H "Authorization: Bearer $TG" >/dev/null
 check "chat send rejected after block" 'CHAT_NOT_AUTHORIZED' "$(json -X POST $B/api/matches/$CMATCH/messages -H "Authorization: Bearer $TH" -H 'Content-Type: application/json' -d '{"body":"after block"}')"
+
+# ---- Increment 4: scenario library + data-driven gameplay (HTTP + WebSocket) ----
+# Fresh matched + consented pair.
+GU1=$(reg "ga.smoke@example.com" "GameA"); TGA=$(tok "$GU1"); UGA=$(uid "$GU1")
+GU2=$(reg "gb.smoke@example.com" "GameB"); TGB=$(tok "$GU2"); UGB=$(uid "$GU2")
+GOUT=$(reg "gc.smoke@example.com" "GameC"); TGC=$(tok "$GOUT")
+json -X POST $B/api/discovery/$UGB/like -H "Authorization: Bearer $TGA" >/dev/null
+GMATCHJSON=$(json -X POST $B/api/discovery/$UGA/like -H "Authorization: Bearer $TGB")
+GMATCH=$(echo "$GMATCHJSON" | sed -n 's/.*"matchId":"\([^"]*\)".*/\1/p')
+# invite -> accept -> consent (both YES to flirting + roleplay) -> PLAYING
+GINV=$(json -X POST $B/api/sessions/invite -H "Authorization: Bearer $TGA" -H 'Content-Type: application/json' -d "{\"matchId\":\"$GMATCH\",\"scenarioId\":\"x\",\"scenarioVersion\":\"v1\"}")
+GSID=$(echo "$GINV" | sed -n 's/.*"sessionId":"\([^"]*\)".*/\1/p')
+json -X POST $B/api/sessions/$GSID/accept -H "Authorization: Bearer $TGB" >/dev/null
+CONSENT='{"responses":[{"category":"flirting","response":"YES"},{"category":"roleplay","response":"YES"},{"category":"mystery","response":"YES"}],"agreeToParticipate":true}'
+json -X POST $B/api/sessions/$GSID/consent -H "Authorization: Bearer $TGA" -H 'Content-Type: application/json' -d "$CONSENT" >/dev/null
+GPLAY=$(json -X POST $B/api/sessions/$GSID/consent -H "Authorization: Bearer $TGB" -H 'Content-Type: application/json' -d "$CONSENT")
+check "session is PLAYING after consent" '"state":"PLAYING"' "$GPLAY"
+
+# Scenario library lists published scenarios.
+LIB=$(json "$B/api/scenarios?limit=50" -H "Authorization: Bearer $TGA")
+check "scenario library lists published" 'the-midnight-masquerade' "$LIB"
+check "scenario library requires auth 401" '401' "$(code $B/api/scenarios)"
+# Resolve the masquerade scenario id from the library JSON.
+SCID=$(echo "$LIB" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const j=JSON.parse(s);const m=j.data.scenarios.find(x=>x.slug==="the-midnight-masquerade");process.stdout.write(m.id);})')
+check "resolved scenario id" 'UUID_OK' "$(echo "$SCID" | grep -Eq '^[0-9a-f-]{36}$' && echo UUID_OK || echo none)"
+
+# Select scenario -> START node.
+SEL=$(json -X POST $B/api/sessions/$GSID/scenario -H "Authorization: Bearer $TGA" -H 'Content-Type: application/json' -d "{\"scenarioId\":\"$SCID\"}")
+check "scenario selected -> START node" '"type":"START"' "$SEL"
+# Extract the take_hand choice id.
+CHID=$(echo "$SEL" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const j=JSON.parse(s);const c=j.data.state.node.choices.find(x=>x.key==="take_hand");process.stdout.write(c.id);})')
+
+# IDOR: outsider cannot view/select/choose.
+check "game state IDOR rejected" 'GAME_NOT_AUTHORIZED' "$(json $B/api/sessions/$GSID/state -H "Authorization: Bearer $TGC")"
+# Invalid choice id rejected.
+check "invalid choice rejected" 'INVALID_CHOICE' "$(json -X POST $B/api/sessions/$GSID/choices/00000000-0000-0000-0000-000000000000 -H "Authorization: Bearer $TGA" -H 'Content-Type: application/json' -d '{"clientActionId":"11111111-1111-4111-8111-111111111111"}')"
+
+# Submit a valid choice; verify advance + persistence; duplicate is idempotent.
+CA1="22222222-2222-4222-8222-222222222222"
+CH1=$(json -X POST $B/api/sessions/$GSID/choices/$CHID -H "Authorization: Bearer $TGA" -H 'Content-Type: application/json' -d "{\"clientActionId\":\"$CA1\"}")
+check "choice advances to dance" '"key":"dance"' "$CH1"
+check "turn advanced to 1" '"turnNumber":1' "$CH1"
+CH1DUP=$(json -X POST $B/api/sessions/$GSID/choices/$CHID -H "Authorization: Bearer $TGA" -H 'Content-Type: application/json' -d "{\"clientActionId\":\"$CA1\"}")
+check "duplicate action idempotent (still turn 1)" '"turnNumber":1' "$CH1DUP"
+
+# GET state reflects persisted authoritative state (reconnect).
+check "reconnect state is authoritative" '"key":"dance"' "$(json $B/api/sessions/$GSID/state -H "Authorization: Bearer $TGB")"
+
+# Real WebSocket gameplay flow.
+WSG=$(WS_PORT="$PORT" WS_TA="$TGA" WS_TB="$TGB" WS_SID="$GSID" node "$(dirname "$0")/game-ws-smoke-client.js" 2>&1)
+echo "$WSG" | sed 's/^/[gamews] /'
+for key in GW_READY_A GW_READY_B GW_SUBSCRIBE_STATE GW_CHOOSE_BROADCAST_A GW_CHOOSE_BROADCAST_B GW_PERSISTED; do
+  if echo "$WSG" | grep -q "$key=ok"; then echo "PASS: gamews $key"; PASS=$((PASS+1));
+  else echo "FAIL: gamews $key"; FAIL=$((FAIL+1)); fi
+done
 
 echo "----"
 echo "LIVE SMOKE: $PASS passed, $FAIL failed"

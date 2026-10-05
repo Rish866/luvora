@@ -359,3 +359,101 @@ authenticated connection identity.
 WebSocket presence/delivery state is **process-local**. A multi-instance
 deployment would need a shared pub/sub (e.g. Redis); that is deferred to a later
 hardening increment.
+
+---
+
+## Scenario library & data-driven gameplay (Increment 4)
+
+Luvora's fantasy engine is **data-driven** (scenario content lives in the
+database, not in code) and **server-authoritative**: the client submits intent
+(a choice id), never state. Scenario **versions are immutable** — a running
+session pins one `scenario_version_id` and is unaffected if a newer version is
+later published.
+
+New error codes: `SCENARIO_NOT_FOUND` (404), `SCENARIO_NOT_PUBLISHED` (409),
+`SCENARIO_NOT_AVAILABLE` (409), `SESSION_NOT_READY` (409), `SESSION_NOT_PLAYING`
+(409), `GAME_NOT_AUTHORIZED` (403), `INVALID_CHOICE` (400), `CHOICE_NOT_AVAILABLE`
+(403), `CONSENT_REQUIRED` (403), `GAME_STATE_CONFLICT` (409),
+`GAME_ALREADY_COMPLETED` (409).
+
+### Scenario library — `*auth required*`
+
+#### `GET /api/scenarios?limit=&cursor=`
+Lists **published** scenarios only (keyset pagination over `(created_at, id)`,
+opaque cursor). Draft/archived scenarios and internal authoring data are never
+exposed.
+```jsonc
+{ "success": true, "data": { "scenarios": [
+  { "id": "UUID", "slug": "the-midnight-masquerade", "title": "…",
+    "description": "…", "category": "romance", "coverImageUrl": null,
+    "tags": ["masquerade"], "estimatedMinutes": 10 } ], "nextCursor": null } }
+```
+
+#### `GET /api/scenarios/:scenarioId`
+Returns one published scenario summary. `404 SCENARIO_NOT_FOUND` for unknown or
+non-published scenarios.
+
+### Gameplay — `*auth required, participant-only*`
+
+All endpoints below authorize via the session's match participants; a
+non-participant always receives `403 GAME_NOT_AUTHORIZED`. The server derives
+`currentNodeId`, `turnNumber`, `scenarioVersionId`, and `sessionState` — any
+such fields in a request body are ignored.
+
+#### `POST /api/sessions/:id/scenario`
+Body: `{ "scenarioId": "UUID" }`. Selects the latest **published** version of a
+scenario for a session that is already `PLAYING` (i.e. both players consented).
+Pins the version + start node. Idempotent (a second select returns current
+state). Errors: `409 SESSION_NOT_READY` (not yet PLAYING),
+`404 SCENARIO_NOT_FOUND`, `409 SCENARIO_NOT_AVAILABLE`.
+Returns `201 { state: GameState }`.
+
+#### `GET /api/sessions/:id/state`
+Authoritative, DB-sourced game state (reconnect-safe):
+```jsonc
+{ "success": true, "data": { "state": {
+  "sessionId": "UUID", "sessionState": "PLAYING",
+  "scenarioVersionId": "UUID", "turnNumber": 1, "stateVersion": 2,
+  "completed": false,
+  "node": { "id": "UUID", "key": "dance", "type": "CHOICE", "title": "…",
+    "content": "…", "isEnding": false,
+    "choices": [ { "id": "UUID", "key": "flirt", "label": "…", "description": "…",
+      "available": true, "requires": ["flirting"] } ] } } } }
+```
+`available` reflects whether every required consent category is in the **mutual**
+allow-list — it never exposes the partner's individual YES/MAYBE/NO.
+
+#### `POST /api/sessions/:id/choices/:choiceId`
+Body: `{ "clientActionId": "UUID" }`. Submits a choice. The server validates the
+choice belongs to the current node, re-evaluates consent requirements, advances
+to the server-resolved next node in a transaction (optimistic `state_version` +
+`SELECT … FOR UPDATE`), and — if the destination is an ENDING — marks the
+session `COMPLETED`. Idempotent per `clientActionId`. Errors: `400 INVALID_CHOICE`,
+`403 CONSENT_REQUIRED`, `409 GAME_STATE_CONFLICT`, `409 GAME_ALREADY_COMPLETED`,
+`409 SESSION_NOT_PLAYING`. Returns `{ state: GameState }`.
+
+#### `POST /api/sessions/:id/pause` · `POST /api/sessions/:id/resume`
+Toggle `PLAYING ↔ PAUSED` using the existing session state machine.
+
+### Gameplay WebSocket (`/ws/game`)
+Same HTTP port as `/ws/chat`; one shared dispatcher authenticates the handshake
+(access token via header or `?access_token`) and routes by path. Unauthenticated
+or unknown-path upgrades are rejected.
+
+Client → server:
+```jsonc
+{ "type": "game.subscribe", "sessionId": "UUID" }
+{ "type": "game.choose", "sessionId": "UUID", "choiceId": "UUID", "clientActionId": "UUID" }
+```
+Server → client:
+```jsonc
+{ "type": "game.ready", "userId": "UUID" }
+{ "type": "game.state", "state": { /* GameState */ } }          // on subscribe
+{ "type": "game.state.changed", "state": { /* GameState */ } }  // after a choice
+{ "type": "game.completed", "state": { /* GameState */ } }      // ending reached
+{ "type": "game.error", "code": "…", "message": "…", "clientActionId": "…?" }
+```
+`game.choose` runs the same authoritative engine as the REST endpoint
+(persist-then-broadcast); the resulting state is delivered to **both**
+participants' sockets only. `game.subscribe` returns authoritative DB state, so a
+reconnecting client recovers without replaying missed events.

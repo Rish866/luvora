@@ -14,9 +14,10 @@ non-graphic and non-explicit.
 
 ## Implementation status
 
-This repository contains **Increment 1 (backend foundation)** and
-**Increment 2 (discovery & matching)**, and **Increment 3 (private chat +
-WebSockets)**. All are working, tested slices (not mocked screens).
+This repository contains **Increment 1 (backend foundation)**,
+**Increment 2 (discovery & matching)**, **Increment 3 (private chat +
+WebSockets)**, and **Increment 4 (data-driven fantasy engine)**. All are
+working, tested slices (not mocked screens).
 
 **Increment 1 — foundation:**
 - ✅ Auth: register / login / refresh / logout / logout-all / `me`
@@ -55,9 +56,24 @@ WebSockets)**. All are working, tested slices (not mocked screens).
       heartbeat + registry cleanup; graceful shutdown
 - ✅ Discriminated-union protocol types in `packages/shared`
 
-- ✅ **108 passing tests** (27 + 45 + 36) against a real PostgreSQL, including
-      real WebSocket connections, a conversation-creation race, idempotency
-      races, block enforcement over live sockets, IDOR, and privacy assertions.
+**Increment 4 — data-driven fantasy engine:**
+- ✅ Data-driven scenario library (`scenarios → versions → nodes → choices →
+      requirements`); content is data, not code; **immutable versions** pinned per session
+- ✅ Scenario library API (`GET /api/scenarios[/:id]`) — published-only, paginated
+- ✅ Server-authoritative gameplay (`POST /api/sessions/:id/scenario`,
+      `GET /api/sessions/:id/state`, `POST /api/sessions/:id/choices/:choiceId`,
+      pause/resume) — client submits only a choice id; server resolves node/turn/ending
+- ✅ **Consent re-evaluated at choice time** (shared resolver); partner responses never exposed
+- ✅ **Transactional + optimistic-concurrency + idempotent** turns
+      (`SELECT … FOR UPDATE` + `state_version` + `clientActionId`)
+- ✅ **Gameplay WebSocket** `/ws/game` on the same port (shared dispatcher, coexists
+      with `/ws/chat`): `game.subscribe`/`game.state`, `game.choose` →
+      `game.state.changed`/`game.completed`; persist-then-broadcast; reconnect-safe
+- ✅ ~5 seeded non-graphic demo scenarios (branching, consent-gated, multiple endings)
+
+- ✅ **140 passing tests** (27 + 45 + 36 + 32) against a real PostgreSQL, including
+      branching/endings, consent gating, idempotency + concurrency races, choice
+      tampering, and IDOR; plus real `/ws/chat` and `/ws/game` WebSocket flows.
 
 See [`docs/INCREMENTS.md`](docs/INCREMENTS.md) for the roadmap and what is
 **intentionally deferred** to later increments.

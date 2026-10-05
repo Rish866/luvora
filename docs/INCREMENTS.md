@@ -79,10 +79,36 @@ before the next is added. Below is the plan and current status.
 - 36 new tests (19 chat REST + 17 real WebSocket). **Total: 108 passing**
   against real PostgreSQL. Live smoke: 58/58 (incl. a real two-socket WS flow).
 
-## ⏳ Increment 4 — Data-driven fantasy engine
+## ✅ Increment 4 — Data-driven fantasy engine (DONE)
 
-JSON scenario schema + validator, 5 non-graphic scenarios, branching engine,
-relationship progression, two-player simultaneous-choice resolution over WS.
+- **Data-driven scenario library** (migration `0004_fantasy_engine.sql`):
+  `scenarios → scenario_versions → scenario_nodes → scenario_choices →
+  scenario_choice_requirements`. Content is data, not code.
+- **Immutable scenario versions:** a session pins one `scenario_version_id`;
+  publishing a new version never mutates a running session. Referenced content
+  is `ON DELETE RESTRICT`.
+- **Scenario library API** (`GET /api/scenarios`, `GET /api/scenarios/:id`):
+  published-only, keyset-paginated, draft/authoring data never exposed.
+- **Server-authoritative gameplay** on `fantasy_sessions` (extended with
+  `scenario_version_id`, `current_node_id`, `turn_number`, `state_version`,
+  `started_at`, `completed_at`): select scenario → START node → choose → branch
+  → ending → COMPLETED. Clients submit only a choice id; the server resolves the
+  next node, turn, and completion.
+- **Consent re-evaluation at choice time** via the single shared resolver;
+  per-choice `available` only — partner responses never exposed.
+- **Transactional, concurrency-safe, idempotent:** `SELECT … FOR UPDATE` +
+  optimistic `state_version` so concurrent submissions advance exactly one turn;
+  `session_actions` + `client_action_id` make retries idempotent.
+- **Gameplay WebSocket** `/ws/game` on the same port via a shared upgrade
+  dispatcher (coexists with `/ws/chat`): `game.ready`, `game.subscribe` →
+  `game.state`, `game.choose` → `game.state.changed` / `game.completed`,
+  `game.error`. Persist-then-broadcast to both participants; `subscribe` returns
+  authoritative DB state (reconnect-safe).
+- ~5 seeded non-graphic demo scenarios (linear, branching, consent-gated,
+  multiple endings) seeded idempotently.
+- 32 new tests (23 engine + 9 game WS) incl. branching, endings, consent gating,
+  idempotency, concurrency, and IDOR. **Total: 140 passing** against real
+  PostgreSQL. Live smoke: 75/75 (incl. a real `/ws/game` two-socket flow).
 
 ## ⏳ Increment 5 — Media + moderation
 

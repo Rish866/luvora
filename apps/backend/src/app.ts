@@ -8,6 +8,7 @@ import { discoveryRouter } from "./discovery/discoveryRoutes";
 import { matchRouter } from "./discovery/matchRoutes";
 import { userBlockRouter } from "./discovery/blockRoutes";
 import { chatRouter } from "./chat/chatRoutes";
+import { scenarioRouter } from "./scenario/scenarioRoutes";
 import { errorHandler } from "./http/errorHandler";
 import { ok } from "./http/respond";
 import { Errors } from "./http/errors";
@@ -50,6 +51,7 @@ export function createApp(): Express {
   app.use("/api/matches/:matchId/messages", chatRouter);
   app.use("/api/matches", matchRouter);
   app.use("/api/users", userBlockRouter);
+  app.use("/api/scenarios", scenarioRouter);
 
   // 404 for unknown routes.
   app.use((_req, _res, next) => next(Errors.notFound("Route not found.")));

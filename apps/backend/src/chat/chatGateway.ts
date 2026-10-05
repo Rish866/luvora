@@ -1,4 +1,4 @@
-import type { Server as HttpServer, IncomingMessage } from "node:http";
+import type { IncomingMessage } from "node:http";
 import { WebSocketServer, WebSocket } from "ws";
 import {
   ChatCloseCodes,
@@ -6,12 +6,11 @@ import {
 } from "@luvora/shared";
 import { logger } from "../logger";
 import { config } from "../config";
-import { verifyAccessToken } from "../auth/tokens";
-import * as users from "../users/userRepository";
 import { AppError, Errors } from "../http/errors";
 import { hub } from "./connectionRegistry";
 import { clientChatEventSchema } from "./chatEventSchemas";
 import * as chat from "./chatService";
+import type { WsChannel, WsDispatcher } from "../ws/wsDispatcher";
 
 /**
  * WebSocket chat gateway. Runs on the SAME HTTP server as the REST API (shared
@@ -34,36 +33,6 @@ const WS_RATE_MAX = 50;
 
 // Associate per-socket state without leaking it into the registry.
 const stateBySocket = new WeakMap<WebSocket, SocketState>();
-
-/** Extract and verify the bearer token from the upgrade request. Supports the
- *  `Authorization: Bearer <token>` header and, for browser WebSocket clients
- *  that cannot set headers, an `access_token` query parameter. Tokens are never
- *  logged. Returns the authenticated userId or null. */
-async function authenticateUpgrade(req: IncomingMessage): Promise<string | null> {
-  let token: string | undefined;
-  const header = req.headers["authorization"];
-  if (typeof header === "string" && header.startsWith("Bearer ")) {
-    token = header.slice("Bearer ".length).trim();
-  }
-  if (!token && req.url) {
-    try {
-      const url = new URL(req.url, "http://localhost");
-      token = url.searchParams.get("access_token") ?? undefined;
-    } catch {
-      /* ignore malformed url */
-    }
-  }
-  if (!token) return null;
-
-  try {
-    const claims = verifyAccessToken(token);
-    const user = await users.findById(claims.sub);
-    if (!user || user.is_disabled) return null;
-    return claims.sub;
-  } catch {
-    return null;
-  }
-}
 
 function send(socket: WebSocket, event: ServerChatEvent): void {
   try {
@@ -198,53 +167,18 @@ export interface ChatGateway {
   close(): Promise<void>;
 }
 
-/** Attach the WebSocket chat gateway to an existing HTTP server. */
-export function attachChatGateway(httpServer: HttpServer): ChatGateway {
-  // noServer: we handle the upgrade ourselves so we can authenticate first.
+/** Register the chat channel ("/ws/chat") on the shared WS dispatcher. */
+export function attachChatGateway(dispatcher: WsDispatcher): ChatGateway {
   const wss = new WebSocketServer({ noServer: true });
 
-  httpServer.on("upgrade", (req, socket, head) => {
-    // Only handle the chat path; leave other upgrades alone.
-    const pathname = (() => {
-      try {
-        return new URL(req.url ?? "", "http://localhost").pathname;
-      } catch {
-        return "";
-      }
-    })();
-    if (pathname !== "/ws/chat") {
-      socket.destroy();
-      return;
-    }
-
-    void authenticateUpgrade(req).then((userId) => {
-      if (!userId) {
-        // Reject the handshake outright for unauthenticated upgrades.
-        socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
-        socket.destroy();
-        return;
-      }
-      wss.handleUpgrade(req, socket, head, (ws) => {
-        wss.emit("connection", ws, req, userId);
-      });
-    });
-  });
-
-  wss.on("connection", (socket: WebSocket, _req: IncomingMessage, userId: string) => {
+  const onConnection: WsChannel["onConnection"] = (socket, _req, userId) => {
     const state: SocketState = { userId, isAlive: true, recent: [] };
     stateBySocket.set(socket, state);
 
-    const wasOffline = hub.add(userId, socket);
-    logger.info({ userId, sockets: hub.socketCount() }, "ws connection established");
+    hub.add(userId, socket);
+    logger.info({ userId, sockets: hub.socketCount() }, "chat ws established");
 
     send(socket, { type: "connection.ready", userId });
-
-    // Presence: if this is the user's first socket, we would emit "online" to
-    // active conversation partners. Presence is conversation-scoped and
-    // partner-only; without a subscription model we keep it minimal here and
-    // rely on the partner querying presence lazily. (Online transition is
-    // tracked via wasOffline for future subscription support.)
-    void wasOffline;
 
     socket.on("pong", () => {
       state.isAlive = true;
@@ -266,22 +200,21 @@ export function attachChatGateway(httpServer: HttpServer): ChatGateway {
     });
 
     socket.on("close", () => {
-      const nowOffline = hub.remove(userId, socket);
+      hub.remove(userId, socket);
       stateBySocket.delete(socket);
-      logger.info({ userId, sockets: hub.socketCount() }, "ws connection closed");
-      void nowOffline;
+      logger.info({ userId, sockets: hub.socketCount() }, "chat ws closed");
       void emitPresenceToPartner; // reserved for subscription-based presence
     });
 
     socket.on("error", (err) => {
-      logger.warn({ err: err.message }, "ws connection error");
+      logger.warn({ err: err.message }, "chat ws error");
       try {
         socket.close(ChatCloseCodes.INTERNAL);
       } catch {
         /* ignore */
       }
     });
-  });
+  };
 
   // Heartbeat: terminate sockets that stop responding to pings.
   const heartbeat = setInterval(() => {
@@ -305,6 +238,8 @@ export function attachChatGateway(httpServer: HttpServer): ChatGateway {
     }
   }, HEARTBEAT_INTERVAL_MS);
   heartbeat.unref();
+
+  dispatcher.register({ path: "/ws/chat", wss, onConnection });
 
   return {
     wss,
