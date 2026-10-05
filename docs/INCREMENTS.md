@@ -314,11 +314,73 @@ local implementation and log a warning. **Redis is never a required dependency**
 and is not used by any test. Wiring real Redis presence/pub-sub and real push
 SDKs is future work.
 
-## ⏳ Increment 9 — Android client (React Native)
+## ✅ Increment 9 — Reliable background jobs + worker infrastructure (DONE)
+
+Backend-only. Replaces fragile fire-and-forget async work (Increment 8's
+`void deliver(...)` / manual retry calls) with a durable, PostgreSQL-backed job
+queue + worker. No Redis / BullMQ / Kafka / RabbitMQ / Prisma.
+
+- **Migration `0009_background_jobs.sql`** (additive): a `background_jobs` table
+  with an explicit status machine (`PENDING / RUNNING / RETRY_WAIT / SUCCEEDED /
+  DEAD / CANCELLED`, CHECK-constrained), `payload jsonb` (server-controlled,
+  ids/flags only), `idempotency_key`, `priority`, `attempt_count` / `max_attempts`,
+  `available_at`, lease (`leased_until` + `worker_id`), sanitized error metadata,
+  and `failed_at` / `completed_at`. Indexes: a partial unique idempotency index
+  on `(job_type, idempotency_key)` for non-terminal jobs, a partial claimable
+  index `(priority, available_at)`, a running-lease index for reclaim, plus
+  type/status/created and terminal-retention indexes.
+- **Durable queue semantics**: `claimNext` uses `FOR UPDATE SKIP LOCKED` so
+  concurrent workers never claim the same row; the claim commits BEFORE any
+  external work (no transaction held across a provider call). Jobs hold a
+  **lease**; an expired lease is reclaimed (RUNNING→RETRY_WAIT, attempt_count
+  preserved) so a crashed worker never leaves a job stuck. **At-least-once**
+  execution — handlers are idempotent.
+- **Retry/backoff**: temporary failures retry with exponential backoff + full
+  jitter, clamped to `[base, max]`, bounded by `max_attempts`; permanent failures
+  dead-letter immediately. No retry storms, no infinite loops.
+- **Handler registry** (no giant switch): `NotificationPushDeliveryHandler`,
+  `NotificationCleanupHandler`, `PresenceReconciliationHandler`,
+  `BackgroundJobCleanupHandler` — each independently testable.
+- **Worker runtime** (`npm run worker`, runs independently of the API):
+  bounded-concurrency polling, lease heartbeats for long jobs, success / retry /
+  dead-letter recording, a periodic stale-lease reaper, structured logs
+  (`job.claimed` / `job.succeeded` / `job.retry_scheduled` / `job.dead` /
+  `job.reclaimed` / `worker.started|stopping|stopped`), lightweight in-process
+  metrics, and **graceful shutdown** (stop claiming → finish in-flight within a
+  grace period → remaining leases expire and are reclaimed).
+- **Transactional outbox**: a notification INSERT and its
+  `NOTIFICATION_PUSH_DELIVERY` job commit in the SAME transaction, so a committed
+  notification is never left without its delivery job. SAFETY delivery is
+  enqueued at high priority. The notification API never fails because push is
+  unavailable; push now happens in the worker, reusing the Increment 8 delivery
+  pipeline (whose `notification_deliveries` unique constraint keeps delivery
+  idempotent — a replayed job does not double-send a device that already
+  succeeded).
+- **Cleanup / reconciliation jobs** run without an HTTP request: expired
+  non-critical notifications (never SAFETY), terminal delivery records +
+  long-revoked devices, stale presence TTL reconciliation (multi-connection
+  semantics preserved), and background-job retention.
+- **Admin diagnostics** (ADMIN-only, no raw payloads): `GET /api/admin/jobs`
+  (filter + paginate), `GET /api/admin/jobs/:id`, `GET /api/admin/jobs/metrics`,
+  `GET /api/admin/jobs/worker` — payloads shown only as a redacted summary.
+- 61 new tests (repository/concurrency/crash-recovery, worker lifecycle +
+  multi-worker + graceful shutdown, notification outbox integration, maintenance
+  handlers, admin + security). **Total: 358 passing** against real PostgreSQL,
+  across 3 consecutive clean runs. Live smoke: **182/182** (incl. a real
+  separate worker process), 3 consecutive clean runs.
+
+**Honesty note / deferred:** execution is **at-least-once**, not exactly-once —
+a job may run more than once (handlers are idempotent); an external push provider
+could still receive a duplicate request if a crash occurs after provider
+acceptance but before DB acknowledgement. No Redis / BullMQ / Kafka. Distributed
+workers are supported only to the extent PostgreSQL row-locking allows (same DB).
+Real FCM/APNs delivery remains a placeholder (TEST/DISABLED providers only).
+
+## ⏳ Increment 10 — Android client (React Native)
 
 Onboarding/age gate, the five sections, consent + gameplay UI, push, offline UX.
 
-## ⏳ Increment 10 — Hardening
+## ⏳ Increment 11 — Hardening
 
 Full security test matrix, load testing, OpenAPI/WS docs, deployment runbooks,
 Android release build.

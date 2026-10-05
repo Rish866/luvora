@@ -97,6 +97,31 @@ const schema = z.object({
   REDIS_URL: z.string().default(""),
   // Device registration rate limit (per IP window).
   DEVICE_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(30),
+
+  // ---- Background jobs + worker (Increment 9) ----
+  // Whether THIS process runs the embedded worker loop. The API server does not
+  // require a worker; `npm run worker` runs a dedicated worker process.
+  JOB_WORKER_ENABLED: z
+    .string()
+    .default("false")
+    .transform((v) => v === "true"),
+  JOB_WORKER_CONCURRENCY: z.coerce.number().int().min(1).max(100).default(5),
+  JOB_POLL_INTERVAL_MS: z.coerce.number().int().min(50).max(60_000).default(500),
+  JOB_LEASE_SECONDS: z.coerce.number().int().min(5).max(3600).default(60),
+  JOB_LEASE_HEARTBEAT_SECONDS: z.coerce.number().int().min(1).max(1800).default(20),
+  JOB_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(50).default(5),
+  JOB_RETRY_BASE_DELAY_MS: z.coerce.number().int().min(1).max(600_000).default(1000),
+  JOB_RETRY_MAX_DELAY_MS: z.coerce.number().int().min(1).max(3_600_000).default(60_000),
+  JOB_RETRY_JITTER: z
+    .string()
+    .default("true")
+    .transform((v) => v === "true"),
+  JOB_RECLAIM_INTERVAL_SECONDS: z.coerce.number().int().min(1).max(3600).default(30),
+  JOB_SHUTDOWN_GRACE_MS: z.coerce.number().int().min(0).max(120_000).default(15_000),
+  JOB_SUCCESS_RETENTION_DAYS: z.coerce.number().int().min(1).max(365).default(7),
+  JOB_DEAD_RETENTION_DAYS: z.coerce.number().int().min(1).max(3650).default(30),
+  // Safety valve: refuse to enqueue if the queue is this deep (0 = unbounded).
+  JOB_MAX_QUEUE_DEPTH: z.coerce.number().int().min(0).default(0),
 });
 
 const parsed = schema.safeParse(process.env);
@@ -176,6 +201,22 @@ export const config = {
   realtime: {
     bus: env.REALTIME_BUS,
     redisUrl: env.REDIS_URL,
+  },
+  jobs: {
+    workerEnabled: env.JOB_WORKER_ENABLED,
+    concurrency: env.JOB_WORKER_CONCURRENCY,
+    pollIntervalMs: env.JOB_POLL_INTERVAL_MS,
+    leaseSeconds: env.JOB_LEASE_SECONDS,
+    leaseHeartbeatSeconds: env.JOB_LEASE_HEARTBEAT_SECONDS,
+    maxAttempts: env.JOB_MAX_ATTEMPTS,
+    retryBaseDelayMs: env.JOB_RETRY_BASE_DELAY_MS,
+    retryMaxDelayMs: env.JOB_RETRY_MAX_DELAY_MS,
+    retryJitter: env.JOB_RETRY_JITTER,
+    reclaimIntervalSeconds: env.JOB_RECLAIM_INTERVAL_SECONDS,
+    shutdownGraceMs: env.JOB_SHUTDOWN_GRACE_MS,
+    successRetentionDays: env.JOB_SUCCESS_RETENTION_DAYS,
+    deadRetentionDays: env.JOB_DEAD_RETENTION_DAYS,
+    maxQueueDepth: env.JOB_MAX_QUEUE_DEPTH,
   },
 } as const;
 

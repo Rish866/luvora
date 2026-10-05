@@ -16,6 +16,9 @@ import * as auditRepo from "./auditRepository";
 import { audit } from "./auditService";
 import * as deviceRepo from "../notifications/deviceRepository";
 import * as deliveryRepo from "../notifications/deliveryRepository";
+import * as jobRepo from "../jobs/jobRepository";
+import * as jobService from "../jobs/jobService";
+import { JobStatus, JobType } from "@luvora/shared";
 import { encodeCursor, decodeCursor } from "./adminCursor";
 
 /**
@@ -325,6 +328,75 @@ adminRouter.get(
       ...ctxOf(req),
     });
     ok(res, { devices });
+  }),
+);
+
+// ======================= BACKGROUND JOB DIAGNOSTICS (admin only) ===============
+//
+// Admins may inspect the durable job queue for operations/safety: list jobs
+// (filterable, paginated), view one job, see dead-letter jobs, and read queue
+// metrics. Responses expose only a REDACTED payload summary (ids/flags) — never
+// the raw payload or any secret. Read-only; no client can enqueue/cancel here.
+
+const jobListQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(100).default(50),
+  cursor: z.string().min(1).optional(),
+  status: z.nativeEnum(JobStatus).optional(),
+  jobType: z.nativeEnum(JobType).optional(),
+});
+
+adminRouter.get(
+  "/jobs",
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const q = jobListQuerySchema.parse(req.query);
+    let before = null as ReturnType<typeof decodeCursor>;
+    if (q.cursor) {
+      before = decodeCursor(q.cursor);
+      if (!before) throw Errors.invalidCursor();
+    }
+    const rows = await jobRepo.listJobs({
+      status: q.status,
+      jobType: q.jobType,
+      limit: q.limit,
+      before,
+    });
+    const nextCursor =
+      rows.length === q.limit
+        ? encodeCursor({ createdAt: rows[rows.length - 1].created_at, id: rows[rows.length - 1].id })
+        : null;
+    ok(res, { jobs: rows.map(jobService.toView), nextCursor });
+  }),
+);
+
+adminRouter.get(
+  "/jobs/metrics",
+  requireAdmin,
+  asyncHandler(async (_req, res) => {
+    const snapshot = await jobService.metricsSnapshot();
+    ok(res, snapshot);
+  }),
+);
+
+// Worker health for THIS process (null when no embedded worker runs here — the
+// API is still healthy without a worker). Never exposed unauthenticated.
+adminRouter.get(
+  "/jobs/worker",
+  requireAdmin,
+  asyncHandler(async (_req, res) => {
+    const { getWorkerHealth } = await import("../jobs/workerRegistry");
+    ok(res, { worker: getWorkerHealth() });
+  }),
+);
+
+adminRouter.get(
+  "/jobs/:id",
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const { id } = uuidParam("id").parse(req.params);
+    const row = await jobRepo.getById(id);
+    if (!row) throw Errors.jobNotFound();
+    ok(res, { job: jobService.toView(row) });
   }),
 );
 

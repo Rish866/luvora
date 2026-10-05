@@ -877,3 +877,82 @@ the in-process implementation and logs a warning. Redis is never required.
 Likewise, `FcmPushProvider` / `ApnsPushProvider` are placeholders with no SDK or
 credentials and do not deliver. The system is fully functional single-instance
 with in-app + WebSocket notifications and the TEST/DISABLED push providers.
+
+## Background jobs & worker (Increment 9)
+
+Asynchronous work (notification push delivery, cleanup, presence reconciliation)
+runs on a durable, PostgreSQL-backed job queue processed by a worker — no Redis
+or external broker. PostgreSQL is the source of truth for job state; execution
+is **at-least-once** (handlers are idempotent). There is no client API to
+enqueue jobs; only trusted server code enqueues.
+
+### Running the worker
+
+The worker runs independently of the API server:
+
+```
+npm run worker        # dedicated worker process (recommended)
+```
+
+The API server does NOT require a worker — the queue persists in PostgreSQL.
+Optionally, set `JOB_WORKER_ENABLED=true` to also run an embedded worker inside
+the API process (off by default; the normal API behaviour is unchanged).
+
+### Delivery flow (notification → durable job → worker → provider)
+
+```
+domain event → notificationService
+             → persist notification + enqueue NOTIFICATION_PUSH_DELIVERY
+               (SAME transaction — outbox)                → API responds
+                                                            │
+worker: claim (FOR UPDATE SKIP LOCKED) → handler → deliveryService
+      → PushProvider → notification_deliveries (idempotent)
+      → success | retry (backoff) | dead-letter
+```
+
+A notification is never left without its enqueued delivery job (they commit
+together). The notification API succeeds even when the push provider is down —
+the job retries later. SAFETY delivery jobs are enqueued at high priority.
+
+### Retry / lease / dead-letter semantics
+
+- **Lease:** a claimed job is `RUNNING` with a `leased_until`; the worker
+  heartbeats to extend it. If a worker crashes, the lease expires and another
+  worker reclaims the job (attempt count preserved) — nothing stays stuck.
+- **Retry:** temporary failures → `RETRY_WAIT` with exponential backoff + jitter,
+  bounded by `max_attempts` (default 5).
+- **Permanent failure / exhausted attempts:** `DEAD` (dead-letter), retained for
+  inspection; never retried further.
+- A permanently invalid push token revokes its device (via the delivery
+  pipeline); the delivery job itself then succeeds (nothing left to deliver).
+
+### Admin diagnostics — *admin only, read-only*
+
+```
+GET /api/admin/jobs?status=&jobType=&limit=&cursor=
+GET /api/admin/jobs/:id
+GET /api/admin/jobs/metrics
+GET /api/admin/jobs/worker
+```
+
+- Keyset-paginated job list, filterable by status / type. A missing job id
+  returns `JOB_NOT_FOUND`.
+- Each job DTO exposes only a **redacted `payloadSummary`** (safe scalar keys —
+  ids/flags); the raw payload is never returned, and keys that look sensitive
+  (token/password/secret/etc.) are dropped.
+- `metrics` returns queue counts by status and type plus in-process counters
+  (`jobs_enqueued` / `_claimed` / `_succeeded` / `_retried` / `_dead` /
+  `_reclaimed`) and average execution durations.
+- `worker` returns the health of the embedded worker in THIS process
+  (`{ workerId, running, stopping, concurrency, activeJobs, lastPollAt,
+  lastSuccessAt, lastErrorCode }`) or `null` when none runs here.
+- Normal users and moderators get `403`; unauthenticated get `401`.
+
+### Honest limitations
+
+Execution is at-least-once, not exactly-once; a job may run more than once, so
+handlers are idempotent. An external push provider could still receive a
+duplicate request if a crash occurs after provider acceptance but before the DB
+records success — Luvora does not claim exactly-once external push delivery.
+Multiple workers scale only as far as PostgreSQL row-locking against the same
+database allows; there is no Redis/broker and no cross-datacentre coordination.

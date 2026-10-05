@@ -222,6 +222,31 @@ Delivery retention: terminal (`DELIVERED`/`REVOKED`) delivery rows and devices
 revoked longer than 30 days are removed by `cleanupDeliveryRecords`; the
 notification tables keep their own retention.
 
+## Migration 0009 — background jobs (Increment 9)
+
+`0009_background_jobs.sql` adds a durable, PostgreSQL-backed job queue. Additive
+and backward-compatible; no prior migration is modified.
+
+| Table / column | Purpose / notable constraints |
+|----------------|-------------------------------|
+| `background_jobs` | Durable queue. `status` is `CHECK`-constrained to `PENDING / RUNNING / RETRY_WAIT / SUCCEEDED / DEAD / CANCELLED`. `payload jsonb` is **server-controlled** (ids/flags only — never credentials, tokens, bodies, consent, or media keys). `idempotency_key` (nullable), `priority` (lower = higher), `attempt_count` / `max_attempts` (CHECK ≥), `available_at` (earliest claim time, drives delay + backoff), lease (`leased_until` + `worker_id`), sanitized `last_error_code` / `last_error_message`, `failed_at` / `completed_at`. `set_updated_at` trigger maintains `updated_at` (so retention keys off the stable `completed_at`/`failed_at`). |
+
+Indexes:
+
+| Index | Purpose |
+|-------|---------|
+| `background_jobs_idempotency` **unique** partial on `(job_type, idempotency_key) WHERE idempotency_key IS NOT NULL AND status IN ('PENDING','RUNNING','RETRY_WAIT')` | At most one NON-terminal job per `(type, key)`; terminal jobs excluded so a periodic job can re-enqueue later. NULL keys may duplicate. |
+| `background_jobs_claimable` partial on `(priority ASC, available_at ASC) WHERE status IN ('PENDING','RETRY_WAIT')` | The worker's claim query (highest priority / oldest first) without a full scan. |
+| `background_jobs_running_lease` partial on `(leased_until) WHERE status='RUNNING'` | Stale-lease reclaim. |
+| `background_jobs_type_status`, `background_jobs_status_created` | Admin filters / diagnostics. |
+| `background_jobs_terminal_updated` partial `WHERE status IN ('SUCCEEDED','DEAD','CANCELLED')` | Terminal-job retention cleanup. |
+
+Claiming uses `FOR UPDATE SKIP LOCKED` so concurrent workers get disjoint rows;
+the claim transaction commits before any external work runs. Retention:
+`SUCCEEDED`/`CANCELLED` jobs are deleted after `JOB_SUCCESS_RETENTION_DAYS`
+(default 7), `DEAD` after `JOB_DEAD_RETENTION_DAYS` (default 30), keyed on the
+stable terminal timestamp — never deleting active jobs or audit logs.
+
 ## Resetting a dev/test database
 
 Migrations are forward-only; to reset, drop and recreate the database, then

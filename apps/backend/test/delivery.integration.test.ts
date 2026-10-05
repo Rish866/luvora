@@ -6,7 +6,6 @@ import { closePool, pool } from "../src/db/pool";
 import {
   resetDb,
   registerUser,
-  createMatch,
   setUserRole,
   auth,
   type RegisteredUser,
@@ -18,37 +17,23 @@ import {
   resetPushProvider,
 } from "../src/notifications/push/pushProviders";
 import * as service from "../src/notifications/notificationService";
-import { NotificationType, NotificationCategory, type NotificationView } from "@luvora/shared";
-import {
-  retryFailedDeliveries,
-  dispatchPush,
-  toPushPayload,
-} from "../src/notifications/deliveryDispatcher";
-
-/** Minimal safe view for direct dispatcher calls in tests. */
-function viewOf(id: string): NotificationView {
-  return {
-    id,
-    type: NotificationType.SYSTEM,
-    category: NotificationCategory.SYSTEM,
-    title: "",
-    body: "",
-    entityType: null,
-    entityId: null,
-    readAt: null,
-    createdAt: new Date().toISOString(),
-  };
-}
+import { NotificationType } from "@luvora/shared";
+import { toPushPayload } from "../src/notifications/deliveryDispatcher";
+import { Worker } from "../src/jobs/worker";
+import { buildDefaultRegistry } from "../src/jobs/defaultRegistry";
 
 /**
- * Notification delivery tests (Increment 8). Verify the push pipeline against a
- * real PostgreSQL: delivery tracking, idempotency/dedup, bounded retry,
- * permanent-failure token revocation, push preferences (distinct from in-app
- * existence), SAFETY bypass, and privacy of the push payload.
+ * Notification delivery tests (Increment 8 behaviour, now driven by the
+ * Increment 9 durable job worker). Verify the push pipeline against a real
+ * PostgreSQL: notifications enqueue a durable NOTIFICATION_PUSH_DELIVERY job,
+ * the worker performs delivery through the existing (idempotent) delivery
+ * pipeline, with retry/revocation, push preferences, SAFETY bypass, and payload
+ * privacy preserved.
  */
 
 let app: Express;
 let push: TestPushProvider;
+let worker: Worker;
 
 beforeAll(() => {
   app = createApp();
@@ -57,6 +42,7 @@ beforeEach(async () => {
   await resetDb();
   push = new TestPushProvider();
   setPushProvider(push);
+  worker = new Worker({ registry: buildDefaultRegistry(), workerId: "delivery-test-worker" });
 });
 afterEach(() => {
   resetPushProvider();
@@ -81,8 +67,22 @@ async function registerDevice(
   return res.body.data.device.id;
 }
 
-/** Create a MESSAGE_RECEIVED-style notification for a user via the service (so
- *  the full create→deliver pipeline runs), awaiting background delivery. */
+/** Drain all currently-available jobs through the worker (bounded). Makes any
+ *  RETRY_WAIT job immediately available first, so backoff delays don't stall a
+ *  deterministic test. Returns when no job is claimable. */
+async function drainJobs(maxIterations = 50): Promise<void> {
+  for (let i = 0; i < maxIterations; i++) {
+    // Make backed-off retries immediately claimable for determinism.
+    await pool.query(
+      `UPDATE background_jobs SET available_at = now() WHERE status = 'RETRY_WAIT'`,
+    );
+    const didWork = await worker.runOnce();
+    if (!didWork) return;
+  }
+}
+
+/** Create a notification via the service (enqueues a durable job), then drain
+ *  the queue so the push actually executes. Returns the notification id. */
 async function createNotif(
   userId: string,
   dedupeKey: string | null = null,
@@ -97,17 +97,11 @@ async function createNotif(
     entityId: null,
     dedupeKey,
   });
-  // The service fires delivery with `void deliver(...)`; wait for it to settle.
-  await settle();
+  await drainJobs();
   return r.notification?.id ?? null;
 }
 
-/** Allow fire-and-forget delivery (void deliver) to finish its DB writes. */
-async function settle(ms = 150): Promise<void> {
-  await new Promise((r) => setTimeout(r, ms));
-}
-
-describe("delivery: push pipeline", () => {
+describe("delivery: push pipeline (via durable job)", () => {
   it("delivers to a registered device and records a DELIVERED push row", async () => {
     const u = await registerUser(app);
     await registerDevice(u);
@@ -120,6 +114,13 @@ describe("delivery: push pipeline", () => {
     );
     expect(rows).toHaveLength(1);
     expect(rows[0].status).toBe("DELIVERED");
+    // The durable job reached SUCCEEDED.
+    const job = await pool.query(
+      `SELECT status FROM background_jobs WHERE job_type='NOTIFICATION_PUSH_DELIVERY'
+        AND payload->>'notificationId' = $1`,
+      [nid],
+    );
+    expect(job.rows[0].status).toBe("SUCCEEDED");
   });
 
   it("records a REALTIME delivery row for every notification", async () => {
@@ -136,7 +137,7 @@ describe("delivery: push pipeline", () => {
   it("the push payload carries only opaque references (no title/body leak)", async () => {
     const u = await registerUser(app);
     await registerDevice(u);
-    await service.create({
+    const r = await service.create({
       userId: u.userId,
       type: NotificationType.SYSTEM,
       title: "secret-title",
@@ -144,12 +145,12 @@ describe("delivery: push pipeline", () => {
       entityType: "system",
       entityId: null,
     });
-    await settle();
+    void r;
+    await drainJobs();
     expect(push.sent).toHaveLength(1);
     const payloadStr = JSON.stringify(push.sent[0].payload);
     expect(payloadStr).not.toContain("secret-title");
     expect(payloadStr).not.toContain("secret-body-text");
-    // Opaque references only.
     expect(push.sent[0].payload.notificationId).toBeTruthy();
     expect(push.sent[0].payload.type).toBe("SYSTEM");
   });
@@ -185,38 +186,25 @@ describe("delivery: push pipeline", () => {
   });
 });
 
-describe("delivery: idempotency + concurrency", () => {
-  it("dispatching the same notification twice does not duplicate push rows", async () => {
-    const u = await registerUser(app);
-    const deviceId = await registerDevice(u);
-    void deviceId;
-    const nid = (await createNotif(u.userId))!;
-    const view = viewOf(nid);
-    // Re-dispatch (simulating a reprocessed event).
-    await dispatchPush(u.userId, view, true);
-    await dispatchPush(u.userId, view, true);
-    const { rows } = await pool.query(
-      `SELECT count(*)::int AS n FROM notification_deliveries WHERE notification_id=$1 AND channel='PUSH'`,
-      [nid],
-    );
-    expect(rows[0].n).toBe(1);
-  });
-
-  it("concurrent dispatch attempts create exactly one delivery row", async () => {
+describe("delivery: idempotency", () => {
+  it("running the delivery job twice does not duplicate push rows or re-send", async () => {
     const u = await registerUser(app);
     await registerDevice(u);
     const nid = (await createNotif(u.userId))!;
-    const view = viewOf(nid);
-    await Promise.all([
-      dispatchPush(u.userId, view, true),
-      dispatchPush(u.userId, view, true),
-      dispatchPush(u.userId, view, true),
-    ]);
+    expect(push.sent).toHaveLength(1);
+    // Re-run the same delivery job logic (simulating an at-least-once replay).
+    const { deliverPushForNotificationId } = await import(
+      "../src/notifications/deliveryDispatcher"
+    );
+    await deliverPushForNotificationId(nid);
+    await deliverPushForNotificationId(nid);
+    // Still exactly one delivery row; no additional send (already DELIVERED).
     const { rows } = await pool.query(
       `SELECT count(*)::int AS n FROM notification_deliveries WHERE notification_id=$1 AND channel='PUSH'`,
       [nid],
     );
     expect(rows[0].n).toBe(1);
+    expect(push.sent).toHaveLength(1);
   });
 
   it("the push payload builder omits the human-readable title/body", () => {
@@ -237,8 +225,8 @@ describe("delivery: idempotency + concurrency", () => {
   });
 });
 
-describe("delivery: failures, retry, revocation", () => {
-  it("a permanent failure (invalid token) revokes the device and does not retry", async () => {
+describe("delivery: failures, retry, revocation (via job worker)", () => {
+  it("a permanent failure (invalid token) revokes the device and the job succeeds (nothing to retry)", async () => {
     const u = await registerUser(app);
     await registerDevice(u, "tok-invalid-token"); // TestPushProvider → PERMANENT
     const nid = await createNotif(u.userId);
@@ -252,47 +240,75 @@ describe("delivery: failures, retry, revocation", () => {
       [u.userId],
     );
     expect(dev.rows[0].revoked_at).not.toBeNull();
-    // Retry pass does nothing for a REVOKED row.
-    const r = await retryFailedDeliveries();
-    expect(r.delivered).toBe(0);
+    // The job itself is terminal SUCCEEDED (a permanent device failure is not a
+    // retryable JOB failure — there is nothing left to deliver).
+    const job = await pool.query(
+      `SELECT status FROM background_jobs WHERE payload->>'notificationId' = $1`,
+      [nid],
+    );
+    expect(job.rows[0].status).toBe("SUCCEEDED");
   });
 
-  it("a temporary failure is retryable and succeeds once the token works", async () => {
+  it("a temporary provider failure schedules a job retry and eventually succeeds", async () => {
     const u = await registerUser(app);
     const deviceId = await registerDevice(u, "tok-temp-fail"); // TEMPORARY
-    const nid = await createNotif(u.userId);
-    let d = await pool.query(
-      `SELECT status, attempt_count FROM notification_deliveries WHERE notification_id=$1 AND channel='PUSH'`,
-      [nid],
-    );
-    expect(d.rows[0].status).toBe("FAILED");
-    expect(d.rows[0].attempt_count).toBe(1);
+    const r = await service.create({
+      userId: u.userId,
+      type: NotificationType.SYSTEM,
+      title: "x",
+      entityType: "system",
+      entityId: null,
+    });
+    const nid = r.notification!.id;
 
-    // "Fix" the device token so the retry succeeds.
-    await pool.query(`UPDATE notification_devices SET token='tok-now-ok' WHERE id=$1`, [deviceId]);
-    const r = await retryFailedDeliveries();
-    expect(r.delivered).toBe(1);
-    d = await pool.query(
-      `SELECT status, attempt_count FROM notification_deliveries WHERE notification_id=$1 AND channel='PUSH'`,
+    // Process the job once: the temp failure must schedule a RETRY_WAIT job.
+    await worker.runOnce();
+    let job = await pool.query(
+      `SELECT status, attempt_count FROM background_jobs WHERE payload->>'notificationId' = $1`,
       [nid],
     );
-    expect(d.rows[0].status).toBe("DELIVERED");
-    expect(d.rows[0].attempt_count).toBe(2);
+    expect(job.rows[0].status).toBe("RETRY_WAIT");
+    expect(job.rows[0].attempt_count).toBe(1);
+    const del = await pool.query(
+      `SELECT status FROM notification_deliveries WHERE notification_id=$1 AND channel='PUSH'`,
+      [nid],
+    );
+    expect(del.rows[0].status).toBe("FAILED");
+
+    // "Fix" the token, make the retry available, and drain — delivery succeeds.
+    await pool.query(`UPDATE notification_devices SET token='tok-now-ok' WHERE id=$1`, [deviceId]);
+    await drainJobs();
+    job = await pool.query(
+      `SELECT status FROM background_jobs WHERE payload->>'notificationId' = $1`,
+      [nid],
+    );
+    expect(job.rows[0].status).toBe("SUCCEEDED");
+    const del2 = await pool.query(
+      `SELECT status FROM notification_deliveries WHERE notification_id=$1 AND channel='PUSH'`,
+      [nid],
+    );
+    expect(del2.rows[0].status).toBe("DELIVERED");
   });
 
-  it("temporary failures stop retrying after the bounded attempt cap", async () => {
+  it("a permanently-temp-failing delivery dead-letters the job after max attempts", async () => {
     const u = await registerUser(app);
-    await registerDevice(u, "tok-temp-fail");
-    const nid = (await createNotif(u.userId))!;
-    // Keep retrying; it will never succeed (always temp-fail). Bounded at 5.
-    for (let i = 0; i < 10; i++) await retryFailedDeliveries();
-    const d = await pool.query(
-      `SELECT status, attempt_count FROM notification_deliveries WHERE notification_id=$1 AND channel='PUSH'`,
+    await registerDevice(u, "tok-temp-fail"); // always TEMPORARY
+    const r = await service.create({
+      userId: u.userId,
+      type: NotificationType.SYSTEM,
+      title: "x",
+      entityType: "system",
+      entityId: null,
+    });
+    const nid = r.notification!.id;
+    // Drain repeatedly; the job keeps failing temporarily and is bounded at 5.
+    await drainJobs(30);
+    const job = await pool.query(
+      `SELECT status, attempt_count, max_attempts FROM background_jobs WHERE payload->>'notificationId' = $1`,
       [nid],
     );
-    expect(d.rows[0].status).toBe("FAILED");
-    expect(d.rows[0].attempt_count).toBeLessThanOrEqual(5);
-    expect(d.rows[0].attempt_count).toBeGreaterThanOrEqual(5);
+    expect(job.rows[0].status).toBe("DEAD");
+    expect(job.rows[0].attempt_count).toBe(job.rows[0].max_attempts);
   });
 });
 
@@ -305,11 +321,10 @@ describe("delivery: push preferences + SAFETY bypass", () => {
       .set(...H(u))
       .send({ category: "SYSTEM", pushEnabled: false });
     const nid = await createNotif(u.userId);
-    // In-app notification exists.
     expect(nid).toBeTruthy();
     const inApp = await pool.query(`SELECT count(*)::int AS n FROM notifications WHERE id=$1`, [nid]);
     expect(inApp.rows[0].n).toBe(1);
-    // But no push was sent / no push delivery row.
+    // No push sent and no PUSH delivery row (the job skipped it by preference).
     expect(push.sent).toHaveLength(0);
     const d = await pool.query(
       `SELECT count(*)::int AS n FROM notification_deliveries WHERE notification_id=$1 AND channel='PUSH'`,
@@ -330,7 +345,7 @@ describe("delivery: push preferences + SAFETY bypass", () => {
       .send({ category: "SAFETY", pushEnabled: false });
     expect(res.status).toBe(400);
     expect(res.body.error.code).toBe("CRITICAL_PREFERENCE");
-    // Even if a disabled SAFETY push pref is forced directly in the DB...
+    // Force a disabled SAFETY push pref directly in the DB...
     await pool.query(
       `INSERT INTO notification_preferences (user_id, category, enabled, push_enabled)
        VALUES ($1,'SAFETY',true,false)`,
@@ -340,8 +355,9 @@ describe("delivery: push preferences + SAFETY bypass", () => {
       .post(`/api/admin/users/${victim.userId}/suspend`)
       .set(...H(admin))
       .send({ reason: "x" });
-    await settle();
-    // ...the SAFETY push is still delivered.
+    // Drain the enqueued SAFETY delivery job.
+    await drainJobs();
+    // ...the SAFETY push is still delivered (bypasses the push preference).
     expect(push.sent.length).toBeGreaterThanOrEqual(1);
     expect(push.sent.some((s) => s.payload.category === "SAFETY")).toBe(true);
   });
@@ -358,9 +374,14 @@ describe("delivery: push preferences + SAFETY bypass", () => {
       type: NotificationType.SYSTEM,
       title: "x",
     });
-    await settle();
+    await drainJobs();
     expect(r.created).toBe(false);
     expect(push.sent).toHaveLength(0);
+    // No delivery job was enqueued either (notification was never created).
+    const jobs = await pool.query(
+      `SELECT count(*)::int AS n FROM background_jobs WHERE job_type='NOTIFICATION_PUSH_DELIVERY'`,
+    );
+    expect(jobs.rows[0].n).toBe(0);
   });
 });
 

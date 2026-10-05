@@ -10,8 +10,10 @@ import {
 } from "@luvora/shared";
 import * as repo from "./notificationRepository";
 import * as users from "../users/userRepository";
+import { withTransaction } from "../db/pool";
 import { deliverToUser } from "./realtime";
-import { dispatchPush, recordRealtimeAttempt } from "./deliveryDispatcher";
+import { recordRealtimeAttempt } from "./deliveryDispatcher";
+import { enqueueNotificationPushDelivery } from "../jobs/jobService";
 import { logger } from "../logger";
 
 /**
@@ -83,55 +85,48 @@ export async function create(
   const expiresAt =
     input.expiresAt === undefined ? defaultExpiry(category) : input.expiresAt;
 
-  const { row, created } = await repo.insertNotification(
-    {
-      userId: input.userId,
-      type: input.type,
-      category,
-      title: input.title,
-      body: input.body ?? "",
-      entityType: input.entityType ?? null,
-      entityId: input.entityId ?? null,
-      dedupeKey: input.dedupeKey ?? null,
-      expiresAt,
-    },
-    client,
-  );
+  const insertInput = {
+    userId: input.userId,
+    type: input.type,
+    category,
+    title: input.title,
+    body: input.body ?? "",
+    entityType: input.entityType ?? null,
+    entityId: input.entityId ?? null,
+    dedupeKey: input.dedupeKey ?? null,
+    expiresAt,
+  };
+
+  // OUTBOX PATTERN: the notification INSERT and its durable push-delivery job
+  // commit in the SAME transaction, so a committed notification is NEVER left
+  // without its enqueued delivery job (and vice versa). SAFETY delivery is
+  // enqueued at high priority. When the caller already supplies a transaction
+  // `client`, we join it; otherwise we open one here.
+  const highPriority = CRITICAL_CATEGORIES.has(category);
+  const runInTxn = async (c: PoolClient): Promise<{ row: repo.NotificationRow; created: boolean }> => {
+    const res = await repo.insertNotification(insertInput, c);
+    if (res.created) {
+      await enqueueNotificationPushDelivery(res.row.id, { high: highPriority }, c);
+    }
+    return res;
+  };
+
+  const { row, created } = client
+    ? await runInTxn(client)
+    : await withTransaction(runInTxn);
 
   const view = repo.toView(row);
 
-  // Delivery pipeline runs only for a genuinely NEW notification (dedup means a
-  // repeated event does not re-deliver). We run it AFTER a standalone insert;
-  // when inside a caller transaction, the caller should call deliver()
-  // post-commit (see emit/deliver). To avoid pre-commit delivery, we only
-  // auto-deliver when NOT given a client.
+  // Post-commit, best-effort REALTIME path (WebSocket optimization). This is NOT
+  // the authoritative delivery — the durable job handles push. We only run it
+  // for a standalone create (no caller client); a transactional caller should
+  // emit post-commit via emit(). Push is intentionally NOT done inline anymore.
   if (created && !client) {
-    void deliver(input.userId, view, category);
+    emit(input.userId, view);
+    void recordRealtimeAttempt(view.id).catch(() => undefined);
   }
 
   return { notification: view, created };
-}
-
-/**
- * Run the best-effort delivery pipeline for a persisted notification:
- *   1. real-time `notification.created` to the recipient's sockets (optimization)
- *   2. record the realtime delivery attempt
- *   3. push to the recipient's registered devices (honouring push preference)
- *
- * Never throws — PostgreSQL persistence already succeeded and must not be
- * affected by any delivery failure. Call this AFTER commit when `create` was
- * used with a transaction client.
- */
-export async function deliver(
-  userId: string,
-  notification: NotificationView,
-  category?: NotificationCategory,
-): Promise<void> {
-  emit(userId, notification);
-  await recordRealtimeAttempt(notification.id).catch(() => undefined);
-  const cat = category ?? NOTIFICATION_CATEGORY[notification.type];
-  const pushAllowed = await isPushAllowed(userId, cat).catch(() => false);
-  await dispatchPush(userId, notification, pushAllowed).catch(() => undefined);
 }
 
 /** Deliver a `notification.created` event to the recipient's sockets. Call
@@ -143,16 +138,6 @@ export function emit(userId: string, notification: NotificationView): void {
     // Delivery is best-effort; persistence already succeeded.
     logger.warn({ err: (err as Error).message }, "notification realtime emit failed");
   }
-}
-
-/** Whether PUSH delivery is permitted for this (user, category). Critical
- *  SAFETY notifications always push; others honour the push preference. */
-async function isPushAllowed(
-  userId: string,
-  category: NotificationCategory,
-): Promise<boolean> {
-  if (CRITICAL_CATEGORIES.has(category)) return true;
-  return repo.isPushEnabled(userId, category);
 }
 
 // ---- Preferences ----

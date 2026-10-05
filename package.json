@@ -11,7 +11,8 @@
     "build": "npm run -w @luvora/shared build && npm run -w @luvora/backend build",
     "typecheck": "npm run -w @luvora/shared typecheck && npm run -w @luvora/backend typecheck",
     "test": "npm run -w @luvora/backend test",
-    "verify": "npm run -w @luvora/backend verify"
+    "verify": "npm run -w @luvora/backend verify",
+    "worker": "npm run -w @luvora/backend worker"
   },
   "engines": {
     "node": ">=20"

@@ -8,6 +8,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
     "start": "node dist/server.js",
+    "worker": "node -r ts-node/register src/jobs/workerMain.ts",
+    "worker:build": "node dist/jobs/workerMain.js",
     "migrate:up": "node -r ts-node/register src/db/migrate.ts up",
     "migrate:down": "node -r ts-node/register src/db/migrate.ts down",
     "seed": "node -r ts-node/register src/db/seed.ts",

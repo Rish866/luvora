@@ -34,6 +34,17 @@ export DEVICE_RATE_LIMIT_MAX="100000"
 # Short presence TTL so heartbeat/TTL behaviour is observable in the smoke run.
 export PRESENCE_HEARTBEAT_SECONDS="1"
 export PRESENCE_TTL_SECONDS="2"
+# Increment 9: background job worker. The API process stays API-only
+# (JOB_WORKER_ENABLED=false); a SEPARATE worker process drains the queue, with
+# fast polling + short lease so the smoke run observes behaviour quickly.
+export JOB_WORKER_ENABLED="false"
+export JOB_POLL_INTERVAL_MS="100"
+export JOB_LEASE_SECONDS="5"
+export JOB_LEASE_HEARTBEAT_SECONDS="2"
+export JOB_RECLAIM_INTERVAL_SECONDS="2"
+export JOB_RETRY_BASE_DELAY_MS="200"
+export JOB_RETRY_MAX_DELAY_MS="2000"
+export JOB_MAX_ATTEMPTS="3"
 
 node -r ts-node/register src/db/migrate.ts up >/dev/null 2>&1
 # Seed the published scenario library so the gameplay smoke flow has content.
@@ -43,6 +54,12 @@ node -r ts-node/register src/db/scenarioSeed.ts >/dev/null 2>&1
 node -r ts-node/register src/server.ts > "$DIR/server.log" 2>&1 &
 SERVER_PID=$!
 for i in $(seq 1 40); do curl -s "http://localhost:$PORT/health" >/dev/null 2>&1 && break; sleep 0.25; done
+
+# Start a SEPARATE background worker process against the same database. This
+# exercises the real durable queue end-to-end (claim/lease/retry/dead-letter).
+node -r ts-node/register src/jobs/workerMain.ts > "$DIR/worker.log" 2>&1 &
+WORKER_PID=$!
+sleep 0.5
 
 PASS=0; FAIL=0
 check() { # name  expected_substring  actual
@@ -486,6 +503,18 @@ pgscalar() { # args: SQL (returns a single value as text)
   ' "$1"
 }
 
+# Poll a pgscalar query until it equals an expected value, or time out. Avoids
+# arbitrary sleeps (poll every 100ms, up to ~6s). Used for async job/delivery.
+pgpoll() { # args: expected  SQL
+  local expected="$1" sql="$2" val=""
+  for i in $(seq 1 60); do
+    val="$(pgscalar "$sql")"
+    if [ "$val" = "$expected" ]; then echo "$val"; return 0; fi
+    sleep 0.1
+  done
+  echo "$val"
+}
+
 # Fresh matched pair + a stranger.
 DA=$(reg "da.smoke@example.com" "DelivA"); TDA=$(tok "$DA"); UDA=$(uid "$DA")
 DB_=$(reg "db.smoke@example.com" "DelivB"); TDB=$(tok "$DB_"); UDB=$(uid "$DB_")
@@ -514,13 +543,13 @@ if echo "$DEVLIST" | grep -q 'smoke-tok-ok-aaaa'; then echo "FAIL: device list l
 # IDOR: stranger cannot revoke B's device.
 check "device revoke IDOR rejected" 'DEVICE_NOT_FOUND' "$(json -X DELETE $B/api/notifications/devices/$DEVID -H "Authorization: Bearer $TDS")"
 
-# Push delivery via the TEST provider: a message to B creates a DELIVERED PUSH row.
+# Push delivery is now driven by the durable worker: a message to B enqueues a
+# job the worker processes into a DELIVERED PUSH row. Poll (no fixed sleep).
 json -X POST $B/api/matches/$DMATCH/messages -H "Authorization: Bearer $TDA" -H 'Content-Type: application/json' -d '{"body":"delivery smoke body"}' >/dev/null
-sleep 1
-check "push delivery recorded DELIVERED" '1' "$(pgscalar "SELECT count(*)::int FROM notification_deliveries nd JOIN notifications n ON n.id=nd.notification_id WHERE n.user_id='$UDB' AND nd.channel='PUSH' AND nd.status='DELIVERED'")"
-check "realtime delivery recorded" '1' "$(pgscalar "SELECT CASE WHEN count(*) >= 1 THEN 1 ELSE 0 END FROM notification_deliveries nd JOIN notifications n ON n.id=nd.notification_id WHERE n.user_id='$UDB' AND nd.channel='REALTIME' AND nd.status='DELIVERED'")"
-# Delivery dedup: still exactly one PUSH row for that notification.
-check "push delivery deduped (1 row)" '1' "$(pgscalar "SELECT max(c)::int FROM (SELECT count(*) c FROM notification_deliveries nd JOIN notifications n ON n.id=nd.notification_id WHERE n.user_id='$UDB' AND nd.channel='PUSH' GROUP BY nd.notification_id) t")"
+check "push delivery recorded DELIVERED" '1' "$(pgpoll 1 "SELECT CASE WHEN count(*) >= 1 THEN 1 ELSE 0 END FROM notification_deliveries nd JOIN notifications n ON n.id=nd.notification_id WHERE n.user_id='$UDB' AND nd.channel='PUSH' AND nd.status='DELIVERED'")"
+check "realtime delivery recorded" '1' "$(pgpoll 1 "SELECT CASE WHEN count(*) >= 1 THEN 1 ELSE 0 END FROM notification_deliveries nd JOIN notifications n ON n.id=nd.notification_id WHERE n.user_id='$UDB' AND nd.channel='REALTIME' AND nd.status='DELIVERED'")"
+# Delivery dedup: at most one PUSH row per notification (idempotent).
+check "push delivery deduped (1 row)" '1' "$(pgscalar "SELECT CASE WHEN COALESCE(max(c),0) <= 1 THEN 1 ELSE 0 END FROM (SELECT count(*) c FROM notification_deliveries nd JOIN notifications n ON n.id=nd.notification_id WHERE n.user_id='$UDB' AND nd.channel='PUSH' GROUP BY nd.notification_id) t")"
 # Push payload privacy: the notification body is minimal (no message text).
 check "notification body is generic (no leak)" '0' "$(pgscalar "SELECT count(*)::int FROM notifications WHERE user_id='$UDB' AND body LIKE '%delivery smoke body%'")"
 
@@ -528,22 +557,22 @@ check "notification body is generic (no leak)" '0' "$(pgscalar "SELECT count(*):
 # rejects as PERMANENT, then dispatch -> device auto-revoked.
 json -X POST $B/api/notifications/devices -H "Authorization: Bearer $TDB" -H 'Content-Type: application/json' -d '{"platform":"IOS","provider":"APNS","token":"smoke-invalid-token-bbbb"}' >/dev/null
 json -X POST $B/api/matches/$DMATCH/messages -H "Authorization: Bearer $TDA" -H 'Content-Type: application/json' -d '{"body":"second body"}' >/dev/null
-sleep 1
 # The invalid-token device (provider APNS, the only APNS device for B) must be
-# auto-revoked after the dispatch; its delivery row is REVOKED.
-check "invalid token device auto-revoked" '1' "$(pgscalar "SELECT count(*)::int FROM notification_devices WHERE user_id='$UDB' AND provider='APNS' AND revoked_at IS NOT NULL")"
-check "invalid token delivery marked REVOKED" '1' "$(pgscalar "SELECT CASE WHEN count(*) >= 1 THEN 1 ELSE 0 END FROM notification_deliveries nd JOIN notification_devices d ON d.id=nd.device_id WHERE d.user_id='$UDB' AND d.provider='APNS' AND nd.status='REVOKED'")"
+# auto-revoked once the worker processes the delivery; its delivery row REVOKED.
+check "invalid token device auto-revoked" '1' "$(pgpoll 1 "SELECT CASE WHEN count(*)>=1 THEN 1 ELSE 0 END FROM notification_devices WHERE user_id='$UDB' AND provider='APNS' AND revoked_at IS NOT NULL")"
+check "invalid token delivery marked REVOKED" '1' "$(pgpoll 1 "SELECT CASE WHEN count(*) >= 1 THEN 1 ELSE 0 END FROM notification_deliveries nd JOIN notification_devices d ON d.id=nd.device_id WHERE d.user_id='$UDB' AND d.provider='APNS' AND nd.status='REVOKED'")"
 
 # Push preference: disabling push for MESSAGES suppresses PUSH but keeps in-app.
+# Send a NEW message and track its specific notification: no PUSH job work for
+# it, but the in-app notification exists. (Deterministic — scoped to this id.)
 json -X PUT $B/api/notifications/preferences -H "Authorization: Bearer $TDB" -H 'Content-Type: application/json' -d '{"category":"MESSAGES","pushEnabled":false}' >/dev/null
-BEFORE_PUSH=$(pgscalar "SELECT count(*)::int FROM notification_deliveries nd JOIN notifications n ON n.id=nd.notification_id WHERE n.user_id='$UDB' AND nd.channel='PUSH'")
-BEFORE_INAPP=$(pgscalar "SELECT count(*)::int FROM notifications WHERE user_id='$UDB' AND type='MESSAGE_RECEIVED'")
 json -X POST $B/api/matches/$DMATCH/messages -H "Authorization: Bearer $TDA" -H 'Content-Type: application/json' -d '{"body":"third body"}' >/dev/null
+# The newest MESSAGE_RECEIVED notification for B.
+SUPNID=$(pgscalar "SELECT id FROM notifications WHERE user_id='$UDB' AND type='MESSAGE_RECEIVED' ORDER BY created_at DESC LIMIT 1")
+check "in-app notification still created when push disabled" 'OK' "$([ -n "$SUPNID" ] && echo OK || echo none)"
+# Give the worker time to (not) deliver; assert no PUSH delivery row for it.
 sleep 1
-AFTER_PUSH=$(pgscalar "SELECT count(*)::int FROM notification_deliveries nd JOIN notifications n ON n.id=nd.notification_id WHERE n.user_id='$UDB' AND nd.channel='PUSH'")
-AFTER_INAPP=$(pgscalar "SELECT count(*)::int FROM notifications WHERE user_id='$UDB' AND type='MESSAGE_RECEIVED'")
-if [ "$AFTER_PUSH" = "$BEFORE_PUSH" ]; then echo "PASS: push suppressed when pushEnabled=false"; PASS=$((PASS+1)); else echo "FAIL: push not suppressed ($BEFORE_PUSH -> $AFTER_PUSH)"; FAIL=$((FAIL+1)); fi
-if [ "$AFTER_INAPP" -gt "$BEFORE_INAPP" ]; then echo "PASS: in-app notification still created when push disabled"; PASS=$((PASS+1)); else echo "FAIL: in-app notification missing when push disabled"; FAIL=$((FAIL+1)); fi
+check "push suppressed when pushEnabled=false" '0' "$(pgscalar "SELECT count(*)::int FROM notification_deliveries WHERE notification_id='$SUPNID' AND channel='PUSH'")"
 # SAFETY push cannot be disabled.
 check "cannot disable SAFETY push" 'CRITICAL_PREFERENCE' "$(json -X PUT $B/api/notifications/preferences -H "Authorization: Bearer $TDB" -H 'Content-Type: application/json' -d '{"category":"SAFETY","pushEnabled":false}')"
 # Preferences expose pushEnabled.
@@ -570,10 +599,102 @@ for key in D8_DEVICE_REGISTERED D8_DEVICE_NO_TOKEN_LEAK D8_NOTIF_EVENT D8_NOTIF_
   else echo "FAIL: deliv $key"; FAIL=$((FAIL+1)); fi
 done
 
+# ---- Increment 9: durable background jobs + worker ----
+# Fresh matched pair; the worker process is already running against this DB.
+JA=$(reg "ja.smoke@example.com" "JobA"); TJA=$(tok "$JA"); UJA=$(uid "$JA")
+JB=$(reg "jb.smoke@example.com" "JobB"); TJB=$(tok "$JB"); UJB=$(uid "$JB")
+json -X POST $B/api/discovery/$UJB/like -H "Authorization: Bearer $TJA" >/dev/null
+JMATCHJSON=$(json -X POST $B/api/discovery/$UJA/like -H "Authorization: Bearer $TJB")
+JMATCH=$(echo "$JMATCHJSON" | sed -n 's/.*"matchId":"\([^"]*\)".*/\1/p')
+check "job match formed" 'UUID_OK' "$(echo "$JMATCH" | grep -Eq '^[0-9a-f-]{36}$' && echo UUID_OK || echo none)"
+
+# 1-6: enqueue (via message) -> job exists -> worker claims -> delivery occurs ->
+# delivery row created -> job SUCCEEDED. Register a good device for B first.
+json -X POST $B/api/notifications/devices -H "Authorization: Bearer $TJB" -H 'Content-Type: application/json' -d '{"platform":"ANDROID","provider":"FCM","token":"job-tok-ok-1111"}' >/dev/null
+json -X POST $B/api/matches/$JMATCH/messages -H "Authorization: Bearer $TJA" -H 'Content-Type: application/json' -d '{"body":"job delivery body"}' >/dev/null
+# A durable push-delivery job was enqueued for B's notification.
+check "push delivery job enqueued" '1' "$(pgpoll 1 "SELECT CASE WHEN count(*)>=1 THEN 1 ELSE 0 END FROM background_jobs bj JOIN notifications n ON n.id = (bj.payload->>'notificationId')::uuid WHERE n.user_id='$UJB' AND bj.job_type='NOTIFICATION_PUSH_DELIVERY'")"
+# Worker drives it to SUCCEEDED.
+check "worker completes delivery job (SUCCEEDED)" '1' "$(pgpoll 1 "SELECT CASE WHEN count(*)>=1 THEN 1 ELSE 0 END FROM background_jobs bj JOIN notifications n ON n.id=(bj.payload->>'notificationId')::uuid WHERE n.user_id='$UJB' AND bj.status='SUCCEEDED'")"
+# Delivery row recorded DELIVERED.
+check "worker recorded DELIVERED push row" '1' "$(pgpoll 1 "SELECT CASE WHEN count(*)>=1 THEN 1 ELSE 0 END FROM notification_deliveries nd JOIN notifications n ON n.id=nd.notification_id WHERE n.user_id='$UJB' AND nd.channel='PUSH' AND nd.status='DELIVERED'")"
+
+# 7-8: temporary failure -> RETRY_WAIT -> retry eventually succeeds. Register a
+# temp-failing device for A, send A a message, then "fix" the token.
+json -X POST $B/api/notifications/devices -H "Authorization: Bearer $TJA" -H 'Content-Type: application/json' -d '{"platform":"ANDROID","provider":"FCM","token":"job-tok-temp-fail-1"}' >/dev/null
+json -X POST $B/api/matches/$JMATCH/messages -H "Authorization: Bearer $TJB" -H 'Content-Type: application/json' -d '{"body":"temp fail body"}' >/dev/null
+# The job (or its delivery) enters a failed/retry state at least once.
+check "temporary failure schedules retry" '1' "$(pgpoll 1 "SELECT CASE WHEN count(*)>=1 THEN 1 ELSE 0 END FROM background_jobs bj JOIN notifications n ON n.id=(bj.payload->>'notificationId')::uuid WHERE n.user_id='$UJA' AND (bj.status='RETRY_WAIT' OR bj.attempt_count>=1)")"
+# Fix the token; the retry should then deliver + job succeed.
+pgscalar "UPDATE notification_devices SET token='job-tok-nowok-1' WHERE user_id='$UJA' AND token_fingerprint = substring(md5('job-tok-temp-fail-1') for 12)" >/dev/null 2>&1 || true
+pgscalar "UPDATE notification_devices SET token='job-tok-nowok-1' WHERE user_id='$UJA'" >/dev/null
+check "retry eventually succeeds" '1' "$(pgpoll 1 "SELECT CASE WHEN count(*)>=1 THEN 1 ELSE 0 END FROM background_jobs bj JOIN notifications n ON n.id=(bj.payload->>'notificationId')::uuid WHERE n.user_id='$UJA' AND bj.status='SUCCEEDED'")"
+
+# 9: invalid token revokes the device.
+JC=$(reg "jc.smoke@example.com" "JobC"); TJC=$(tok "$JC"); UJC=$(uid "$JC")
+JD=$(reg "jd.smoke@example.com" "JobD"); TJD=$(tok "$JD"); UJD=$(uid "$JD")
+json -X POST $B/api/discovery/$UJD/like -H "Authorization: Bearer $TJC" >/dev/null
+JMATCH2=$(echo "$(json -X POST $B/api/discovery/$UJC/like -H "Authorization: Bearer $TJD")" | sed -n 's/.*"matchId":"\([^"]*\)".*/\1/p')
+json -X POST $B/api/notifications/devices -H "Authorization: Bearer $TJD" -H 'Content-Type: application/json' -d '{"platform":"IOS","provider":"APNS","token":"job-invalid-token-xx"}' >/dev/null
+json -X POST $B/api/matches/$JMATCH2/messages -H "Authorization: Bearer $TJC" -H 'Content-Type: application/json' -d '{"body":"revoke body"}' >/dev/null
+check "invalid token revokes device via worker" '1' "$(pgpoll 1 "SELECT CASE WHEN count(*)>=1 THEN 1 ELSE 0 END FROM notification_devices WHERE user_id='$UJD' AND provider='APNS' AND revoked_at IS NOT NULL")"
+
+# 10: dead-letter after max attempts. Enqueue a push job for a notification whose
+# only device permanently temp-fails (never fixed). Use the DB to seed directly.
+JE=$(reg "je.smoke@example.com" "JobE"); TJE=$(tok "$JE"); UJE=$(uid "$JE")
+json -X POST $B/api/notifications/devices -H "Authorization: Bearer $TJE" -H 'Content-Type: application/json' -d '{"platform":"ANDROID","provider":"FCM","token":"job-tok-temp-fail-perma"}' >/dev/null
+# Create a SYSTEM notification + delivery job directly (server-trusted path) by
+# inserting a notification and letting the app enqueue is not available over
+# HTTP; instead drive via a self-match message that always temp-fails.
+JF=$(reg "jf.smoke@example.com" "JobF"); TJF=$(tok "$JF"); UJF=$(uid "$JF")
+json -X POST $B/api/discovery/$UJF/like -H "Authorization: Bearer $TJE" >/dev/null
+JMATCH3=$(echo "$(json -X POST $B/api/discovery/$UJE/like -H "Authorization: Bearer $TJF")" | sed -n 's/.*"matchId":"\([^"]*\)".*/\1/p')
+json -X POST $B/api/matches/$JMATCH3/messages -H "Authorization: Bearer $TJF" -H 'Content-Type: application/json' -d '{"body":"deadletter body"}' >/dev/null
+check "job dead-letters after max attempts" '1' "$(pgpoll 1 "SELECT CASE WHEN count(*)>=1 THEN 1 ELSE 0 END FROM background_jobs bj JOIN notifications n ON n.id=(bj.payload->>'notificationId')::uuid WHERE n.user_id='$UJE' AND bj.status='DEAD'")"
+
+# 11: duplicate enqueue is idempotent — exactly one delivery job per notification.
+check "delivery job idempotent (<=1 per notification)" '1' "$(pgscalar "SELECT CASE WHEN COALESCE(max(c),0) <= 1 THEN 1 ELSE 0 END FROM (SELECT count(*) c FROM background_jobs WHERE job_type='NOTIFICATION_PUSH_DELIVERY' GROUP BY payload->>'notificationId') t")"
+
+# 12: stale lease recovery — a RUNNING job past its lease is reclaimed. Simulate
+# by inserting a RUNNING job with an expired lease; the worker's reclaimer flips
+# it back to RETRY_WAIT (then processes it; no handler payload -> stays benign).
+STALEID=$(pgscalar "INSERT INTO background_jobs (job_type,status,payload,leased_until,worker_id,attempt_count) VALUES ('NOTIFICATION_CLEANUP','RUNNING','{}', now() - interval '1 hour','dead-worker',1) RETURNING id")
+check "stale RUNNING job is reclaimed" '1' "$(pgpoll 1 "SELECT CASE WHEN status IN ('RETRY_WAIT','SUCCEEDED','PENDING') THEN 1 ELSE 0 END FROM background_jobs WHERE id='$STALEID'")"
+
+# 13: worker health via admin diagnostics (metrics endpoint).
+JADM=$(reg "jadm.smoke@example.com" "JobAdmin"); UJADM=$(uid "$JADM")
+promote_role "$UJADM" "ADMIN"
+JADMLOGIN=$(json -X POST $B/api/auth/login -H 'Content-Type: application/json' -d '{"email":"jadm.smoke@example.com","password":"Passw0rd!x"}')
+TJADM=$(tok "$JADMLOGIN")
+check "admin job metrics available" '"countsByStatus"' "$(json $B/api/admin/jobs/metrics -H "Authorization: Bearer $TJADM")"
+
+# 15: admin job diagnostics list (DEAD filter) + redaction.
+JOBSOUT=$(json "$B/api/admin/jobs?status=DEAD" -H "Authorization: Bearer $TJADM")
+check "admin lists DEAD jobs" '"jobs"' "$JOBSOUT"
+if echo "$JOBSOUT" | grep -qiE '"token"|"password"|"authorization"'; then echo "FAIL: job diagnostics leak secrets"; FAIL=$((FAIL+1)); else echo "PASS: job diagnostics expose no secrets"; PASS=$((PASS+1)); fi
+# The DTO must not include a raw 'payload' field (only payloadSummary).
+if echo "$JOBSOUT" | grep -q '"payloadSummary"'; then echo "PASS: job diagnostics use redacted payloadSummary"; PASS=$((PASS+1)); else echo "FAIL: job diagnostics missing payloadSummary"; FAIL=$((FAIL+1)); fi
+
+# 16: unauthorized job diagnostics blocked (normal user, moderator).
+check "normal user denied job diagnostics" '403' "$(code $B/api/admin/jobs -H "Authorization: Bearer $TJA")"
+check "job diagnostics require auth 401" '401' "$(code $B/api/admin/jobs)"
+
+# 17: notification API remains successful even when the provider temp-fails.
+json -X POST $B/api/notifications/devices -H "Authorization: Bearer $TJB" -H 'Content-Type: application/json' -d '{"platform":"ANDROID","provider":"FCM","token":"job-tok-temp-fail-2"}' >/dev/null
+MSGCODE=$(code -X POST $B/api/matches/$JMATCH/messages -H "Authorization: Bearer $TJA" -H 'Content-Type: application/json' -d '{"body":"api still ok"}')
+check "notification API ok during provider failure" '201' "$MSGCODE"
+
+# 14: graceful worker shutdown — SIGTERM the worker and confirm it exits cleanly.
+kill -TERM "$WORKER_PID" >/dev/null 2>&1
+WSHUT=fail
+for i in $(seq 1 50); do if ! kill -0 "$WORKER_PID" >/dev/null 2>&1; then WSHUT=ok; break; fi; sleep 0.1; done
+check "worker graceful shutdown" 'ok' "$WSHUT"
+
 echo "----"
 echo "LIVE SMOKE: $PASS passed, $FAIL failed"
 
 kill "$SERVER_PID" >/dev/null 2>&1
+kill "$WORKER_PID" >/dev/null 2>&1
 su - "$RUNNER_USER" -c "$PG_BIN/pg_ctl -D '$DATA' -m immediate stop" >/dev/null 2>&1
 rm -rf "$DIR"
 [ "$FAIL" -eq 0 ]

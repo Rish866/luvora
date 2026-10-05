@@ -5,6 +5,8 @@ import { closePool } from "./db/pool";
 import { attachWsDispatcher } from "./ws/wsDispatcher";
 import { attachChatGateway } from "./chat/chatGateway";
 import { attachGameGateway } from "./fantasy/gameGateway";
+import { startWorkerProcess } from "./jobs/workerMain";
+import { setActiveWorker } from "./jobs/workerRegistry";
 
 const app = createApp();
 
@@ -19,18 +21,34 @@ const wsDispatcher = attachWsDispatcher(server);
 const chatGateway = attachChatGateway(wsDispatcher);
 const gameGateway = attachGameGateway(wsDispatcher);
 
+// Optionally run the job worker EMBEDDED in the API process. Off by default:
+// the recommended production topology runs `npm run worker` as a separate
+// process. When enabled, the queue is drained by this process too.
+let embeddedWorkerStop: (() => Promise<void>) | null = null;
+if (config.jobs.workerEnabled) {
+  const { worker, stop } = startWorkerProcess();
+  setActiveWorker(worker);
+  embeddedWorkerStop = stop;
+  logger.info({ workerId: worker.workerId }, "embedded job worker started");
+}
+
 async function shutdown(signal: string): Promise<void> {
   logger.info({ signal }, "shutting down");
   // Close WebSocket channels first so no new events arrive mid-shutdown.
   await chatGateway.close();
   await gameGateway.close();
   await wsDispatcher.closeAll();
+  // Stop the embedded worker gracefully (if running).
+  if (embeddedWorkerStop) {
+    await embeddedWorkerStop();
+    setActiveWorker(null);
+  }
   server.close(async () => {
     await closePool();
     process.exit(0);
   });
   // Force-exit if graceful shutdown stalls.
-  setTimeout(() => process.exit(1), 10_000).unref();
+  setTimeout(() => process.exit(1), 15_000).unref();
 }
 
 process.on("SIGTERM", () => void shutdown("SIGTERM"));

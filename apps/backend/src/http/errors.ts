@@ -170,6 +170,12 @@ export const Errors = {
   presenceBackendUnavailable: (message = "Presence is currently unavailable.") =>
     new AppError(ErrorCodes.PRESENCE_BACKEND_UNAVAILABLE, 503, message),
 
+  // ---- Background jobs (Increment 9) ----
+  jobNotFound: (message = "Job not found.") =>
+    new AppError(ErrorCodes.JOB_NOT_FOUND, 404, message),
+  queueBackpressure: (message = "The job queue is at capacity; try again shortly.") =>
+    new AppError(ErrorCodes.QUEUE_BACKPRESSURE, 503, message),
+
   internal: (message = "An unexpected error occurred.") =>
     new AppError(ErrorCodes.INTERNAL, 500, message),
 };

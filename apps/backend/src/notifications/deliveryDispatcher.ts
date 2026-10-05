@@ -197,3 +197,140 @@ async function loadNotificationView(
   const row = await repo.getById(notificationId);
   return row ? repo.toView(row) : null;
 }
+
+/**
+ * Outcome of a job-driven push delivery for a single notification, aggregated
+ * across the recipient's devices. The job worker maps this to its retry policy.
+ */
+export type PushDeliveryOutcome =
+  | { kind: "done"; delivered: number; permanent: number }
+  | { kind: "retry"; errorCode: string; delivered: number; temporary: number }
+  | { kind: "skip"; reason: string };
+
+/**
+ * Perform push delivery for a persisted notification, intended to be called BY
+ * THE JOB WORKER (not fire-and-forget). Resolves the recipient, enforces expiry
+ * / account state / push preference, loads active devices, writes idempotent
+ * delivery rows, and sends via the configured provider.
+ *
+ * Returns a structured outcome:
+ *   - `done`  — nothing left to do (all devices delivered/permanently failed, or
+ *               no devices / push not allowed / notification gone/expired).
+ *   - `retry` — at least one device hit a TEMPORARY failure; the job should be
+ *               retried with backoff (idempotent: delivered rows are skipped).
+ *
+ * Idempotent: already-DELIVERED/REVOKED delivery rows are skipped, so running
+ * this twice does not re-send to a device that already succeeded.
+ */
+export async function deliverPushForNotificationId(
+  notificationId: string,
+): Promise<PushDeliveryOutcome> {
+  const repo = await import("./notificationRepository");
+  const prefs = repo; // same module exposes isPushEnabled
+  const row = await repo.getById(notificationId);
+  if (!row) return { kind: "skip", reason: "NOTIFICATION_NOT_FOUND" };
+  // Expired non-critical notification — nothing to deliver.
+  if (row.expires_at && new Date(row.expires_at).getTime() <= Date.now()) {
+    return { kind: "skip", reason: "EXPIRED" };
+  }
+
+  const view = repo.toView(row);
+  const { CRITICAL_CATEGORIES } = await import("@luvora/shared");
+  const isCritical = CRITICAL_CATEGORIES.has(row.category);
+
+  // Account state: a non-ACTIVE recipient is NOT pushed to for routine
+  // categories (a suspended user shouldn't get routine push). SAFETY is the
+  // deliberate exception — a suspension/safety notice must reach the user even
+  // while their account is inactive, so critical categories bypass this gate.
+  const users = await import("../users/userRepository");
+  const recipient = await users.findById(row.user_id);
+  if (!recipient || recipient.is_disabled) {
+    return { kind: "skip", reason: "RECIPIENT_NOT_FOUND" };
+  }
+  if (recipient.account_status !== "ACTIVE" && !isCritical) {
+    return { kind: "skip", reason: "RECIPIENT_NOT_ACTIVE" };
+  }
+
+  // Push preference — SAFETY always allowed; others honour push_enabled.
+  const pushAllowed = isCritical ? true : await prefs.isPushEnabled(row.user_id, row.category);
+  if (!pushAllowed) return { kind: "skip", reason: "PUSH_DISABLED_PREF" };
+
+  const provider = getPushProvider();
+  const devices = await deviceRepo.listActiveWithTokenForUser(row.user_id);
+  if (devices.length === 0) return { kind: "skip", reason: "NO_DEVICES" };
+
+  const payload = toPushPayload(view);
+  let delivered = 0;
+  let permanent = 0;
+  let temporary = 0;
+  let lastTempCode = "PROVIDER_UNAVAILABLE";
+
+  for (const device of devices) {
+    const { row: deliveryRow, created } = await deliveryRepo.ensureDelivery({
+      notificationId,
+      deviceId: device.id,
+      channel: DeliveryChannel.PUSH,
+    });
+    // Idempotency: a device already handled (DELIVERED/REVOKED) is skipped.
+    if (!created && deliveryRow.status !== "PENDING" && deliveryRow.status !== "FAILED") {
+      if (deliveryRow.status === "DELIVERED") delivered += 1;
+      continue;
+    }
+    const before = deliveryRow.status;
+    void before;
+    const res = await attemptForJob(provider, deliveryRow.id, payload, device);
+    if (res === "delivered") delivered += 1;
+    else if (res === "permanent") permanent += 1;
+    else {
+      temporary += 1;
+      lastTempCode = res; // the temporary error code
+    }
+  }
+
+  if (temporary > 0) {
+    return { kind: "retry", errorCode: lastTempCode, delivered, temporary };
+  }
+  return { kind: "done", delivered, permanent };
+}
+
+/** Like `attempt`, but returns a classification the job worker can act on:
+ *  "delivered" | "permanent" | <temporary error code>. */
+async function attemptForJob(
+  provider: PushProvider,
+  deliveryId: string,
+  payload: PushPayload,
+  device: deviceRepo.DeviceRow,
+): Promise<"delivered" | "permanent" | string> {
+  let result;
+  try {
+    result = await provider.send(payload, {
+      deviceId: device.id,
+      platform: device.platform,
+      token: device.token,
+    });
+  } catch (err) {
+    const code = sanitizeError((err as Error)?.message);
+    await deliveryRepo.markFailed(deliveryId, code);
+    return code; // temporary (a thrown provider is treated as transient)
+  }
+
+  if (result.ok) {
+    await deliveryRepo.markDelivered(deliveryId, result.providerMessageId);
+    return "delivered";
+  }
+
+  if (result.failure === PushFailureKind.PERMANENT) {
+    await deliveryRepo.markRevoked(deliveryId, result.errorCode);
+    if (result.errorCode !== "PUSH_DISABLED") {
+      await deviceRepo.revokeById(device.id);
+      logger.info(
+        { deviceFingerprint: device.token_fingerprint },
+        "device revoked (invalid token)",
+      );
+    }
+    return "permanent";
+  }
+
+  await deliveryRepo.markFailed(deliveryId, result.errorCode);
+  return result.errorCode; // temporary
+}

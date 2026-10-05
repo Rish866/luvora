@@ -269,12 +269,48 @@
 - **Parameterized SQL** throughout the delivery/device repositories (bound `$N`
   parameters only; no interpolation of user data).
 
+## Background job security (Increment 9)
+- **Server-controlled jobs only.** There is no API path for a client to enqueue
+  a job or choose a job type/payload — only trusted server code calls the job
+  service. Job types are a fixed enum.
+- **No secrets in payloads.** Enqueued payloads carry only ids/flags (e.g.
+  `{ notificationId }`); they never contain tokens, passwords, JWTs, refresh
+  tokens, raw push tokens, message bodies, consent values, or media storage
+  keys. The push-delivery handler re-loads everything it needs by id.
+- **Redacted diagnostics.** Admin job endpoints return only a `payloadSummary`
+  with sensitive keys stripped (token/password/secret/authorization/refresh/
+  body/consent/storage/credential/email) and values bounded; the raw payload is
+  never serialized to a client. Job diagnostics are ADMIN-only (moderators and
+  normal users get 403; unauthenticated 401).
+- **Sanitized errors.** Provider/handler error messages are reduced to a short,
+  uppercase, token-free code plus a bounded message before being persisted or
+  logged — full provider responses are never stored.
+- **Safe logging.** Worker logs include job id / type / worker id / attempt /
+  duration / sanitized error code only — never payloads, tokens, bodies, or
+  credentials.
+- **Parameterized SQL.** The job repository builds only `$N` placeholders and
+  fixed, allow-listed SQL fragments (status/type filters, keyset); every
+  user/caller value is a bound parameter. Concurrency uses PostgreSQL locking
+  (`FOR UPDATE SKIP LOCKED`), not in-memory guarantees.
+- **No privilege path via jobs.** Jobs cannot bypass RBAC/account-state: the
+  push-delivery handler re-checks the recipient's account state (routine push is
+  withheld from a non-ACTIVE account; SAFETY is the deliberate exception) and the
+  push preference (SAFETY bypasses it and is never suppressible).
+- **At-least-once, honestly.** Execution is at-least-once; handlers are
+  idempotent and the `notification_deliveries` unique constraint remains the
+  authoritative guard against duplicate database deliveries. Duplicate external
+  push on a crash-after-send is possible and is not claimed to be exactly-once.
+
 ## Known gaps (planned for later increments)
 - Email/phone verification flow (fields exist; sending not wired).
 - **Real push delivery** (FCM / APNs / Web Push) — the provider abstraction,
-  device registry, delivery tracking, retry, and token revocation all ship, but
-  the concrete FCM/APNs/Web-Push adapters are placeholders (no SDK, no
-  credentials, no network). Only the TEST/DISABLED providers run today.
+  device registry, delivery tracking, durable job-driven delivery, retry, and
+  token revocation all ship, but the concrete FCM/APNs/Web-Push adapters are
+  placeholders (no SDK, no credentials, no network). Only the TEST/DISABLED
+  providers run today.
+- **Exactly-once external push** is NOT provided — job execution is at-least-once
+  (see above). No Redis / BullMQ / Kafka / RabbitMQ; multi-worker scaling is
+  bounded by PostgreSQL row-locking against one database.
 - **Distributed presence and cross-instance realtime** — the `PresenceBackend`
   and `RealtimeBus` abstractions ship, but the shared-store (e.g. Redis)
   implementations are placeholders that degrade to the in-process versions.

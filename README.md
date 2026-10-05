@@ -19,8 +19,9 @@ This repository contains **Increment 1 (backend foundation)**,
 WebSockets)**, **Increment 4 (data-driven fantasy engine)**,
 **Increment 5 (secure media, attachments & moderation)**,
 **Increment 6 (admin + safety + moderation operations)**,
-**Increment 7 (notifications + presence infrastructure)**, and
+**Increment 7 (notifications + presence infrastructure)**,
 **Increment 8 (production notification delivery + distributed presence
+infrastructure)**, and **Increment 9 (reliable background jobs + worker
 infrastructure)**. All are working, tested slices (not mocked screens).
 
 **Increment 1 — foundation:**
@@ -182,13 +183,50 @@ infrastructure)**. All are working, tested slices (not mocked screens).
       distributed-abstraction contracts. **164 live end-to-end smoke checks**
       (135 prior + 29 new) pass using the TEST push provider (no real credentials).
 
-> **Honesty note (Increments 7–8).** There is **no** real push delivery — FCM,
+**Increment 9 — reliable background jobs + worker infrastructure:**
+- ✅ **Durable PostgreSQL job queue** (migration `0009`, table `background_jobs`)
+      with an explicit status machine (`PENDING / RUNNING / RETRY_WAIT /
+      SUCCEEDED / DEAD / CANCELLED`), priority, attempts, availability, lease,
+      and sanitized error metadata — no Redis / BullMQ / Kafka / RabbitMQ
+- ✅ **Concurrent-safe claiming** via `FOR UPDATE SKIP LOCKED`; the claim commits
+      before any external work (no transaction held across a provider call)
+- ✅ **Leases + crash recovery** — a crashed worker's expired lease is reclaimed
+      (RUNNING→RETRY_WAIT, attempt count preserved); a repeatedly-crashing job is
+      dead-lettered. No job stays permanently stuck
+- ✅ **Bounded exponential backoff + jitter** for temporary failures; permanent
+      failures dead-letter immediately. No retry storms
+- ✅ **Worker runtime** (`npm run worker`, independent of the API): bounded
+      concurrency, lease heartbeats, periodic stale-lease reaper, structured
+      logs, in-process metrics, and **graceful SIGTERM/SIGINT shutdown**
+- ✅ **Transactional outbox** — a notification INSERT and its
+      `NOTIFICATION_PUSH_DELIVERY` job commit together; the worker performs push
+      via the (idempotent) Increment 8 pipeline. The notification API never fails
+      because push is unavailable
+- ✅ **Durable maintenance jobs** (run with no HTTP request): notification
+      cleanup, delivery/device pruning, presence TTL reconciliation (multi-
+      connection semantics preserved), and job retention
+- ✅ **Admin diagnostics** (`/api/admin/jobs[/:id|/metrics|/worker]`, ADMIN-only)
+      — redacted payload summaries only, never raw payloads/secrets
+- ✅ Idempotency keys collapse duplicate enqueues; SAFETY delivery is
+      high-priority; handlers are idempotent (at-least-once execution)
+
+- ✅ **358 passing tests** (297 prior + 61 new) against a real PostgreSQL,
+      run 3× consecutively — covering repository/claim/lease/reclaim, concurrent
+      multi-worker consumption, crash recovery, retry/backoff/dead-letter,
+      the transactional outbox, maintenance handlers, and admin + security.
+      **182 live end-to-end smoke checks** pass (3× consecutively) against the
+      running server **plus a real separate worker process**, using the TEST push
+      provider (no real credentials).
+
+> **Honesty note (Increments 7–9).** There is **no** real push delivery — FCM,
 > APNs, and Web Push are interface placeholders only (no SDK, no credentials, no
 > network calls); the TEST/DISABLED providers are the only ones that run.
 > Presence and the realtime bus are still **process-local**: selecting a
 > `distributed` backend degrades to the in-process implementation and logs a
-> warning. **Redis is never a required dependency** and is not used by any test.
-> Wiring real Redis presence/pub-sub and real push SDKs is deliberate future work.
+> warning. Background-job execution is **at-least-once** (not exactly-once;
+> handlers are idempotent). **Redis is never a required dependency** and is not
+> used by any test. Wiring real Redis presence/pub-sub, a distributed broker, and
+> real push SDKs is deliberate future work.
 
 See [`docs/INCREMENTS.md`](docs/INCREMENTS.md) for the roadmap and what is
 **intentionally deferred** to later increments.
@@ -336,18 +374,21 @@ See [`docs/SECURITY.md`](docs/SECURITY.md) for details and known gaps.
 
 ## What is implemented vs. deferred
 
-**Implemented (Increments 1–8, backend):** auth + 18+ age gate; consent + session
+**Implemented (Increments 1–9, backend):** auth + 18+ age gate; consent + session
 state machine; discovery/matching/blocking; private chat (REST + `/ws/chat`);
 the data-driven fantasy engine + scenario library + gameplay (`/ws/game`); secure
 media uploads, chat attachments, and the moderation/safety pipeline; the admin
 control plane — RBAC, safety reports, moderation queue + media moderation, user
 suspension/role management with session revocation, and audit logging; in-app
 notifications + presence (feed/unread/read-state, per-category preferences,
-dedup, expiry/cleanup, privacy-aware presence, real-time WebSocket events); and
-the notification **delivery layer** — device registration, per-channel delivery
+dedup, expiry/cleanup, privacy-aware presence, real-time WebSocket events); the
+notification **delivery layer** — device registration, per-channel delivery
 tracking with idempotency/bounded-retry/token-revocation, a push-provider
 abstraction, push preferences, a heartbeat/TTL presence model, and
-presence/realtime-bus abstractions for future horizontal scale.
+presence/realtime-bus abstractions for future horizontal scale; and a **durable
+PostgreSQL job queue + worker** — leasing, crash recovery, bounded backoff
+retries, dead-lettering, a transactional outbox for notification delivery,
+maintenance/reconciliation jobs, graceful shutdown, and admin job diagnostics.
 
 **Intentionally deferred** (later increments): production media providers
 (S3/R2 storage, real malware scanner, real content-safety moderation — the
@@ -357,6 +398,9 @@ SDK, no credentials, no network; only the TEST/DISABLED providers run);
 **distributed presence and cross-instance realtime** (the `PresenceBackend` /
 `RealtimeBus` abstractions ship, but the shared-store/pub-sub — e.g. Redis —
 implementations are placeholders that degrade to in-process; Redis is never
-required); a moderation/admin UI; admin MFA; recommendations; payments;
-production infrastructure; and all frontend/Android UI. See
+required); **exactly-once / brokered job processing** (the job queue is durable
+and at-least-once on PostgreSQL — no Redis/BullMQ/Kafka/RabbitMQ, and
+multi-worker scaling is bounded by PostgreSQL row-locking on one database); a
+moderation/admin UI; admin MFA; recommendations; payments; production
+infrastructure; and all frontend/Android UI. See
 [`docs/INCREMENTS.md`](docs/INCREMENTS.md).

@@ -19,6 +19,16 @@ import { presenceRegistry } from "../src/presence/presenceRegistry";
 import { reapNow } from "../src/presence/presenceService";
 import { TestPushProvider } from "../src/notifications/push/TestPushProvider";
 import { setPushProvider, resetPushProvider } from "../src/notifications/push/pushProviders";
+import { Worker } from "../src/jobs/worker";
+import { buildDefaultRegistry } from "../src/jobs/defaultRegistry";
+
+/** Drain available jobs through a worker (push delivery is now job-driven). */
+async function drainJobs(worker: Worker, max = 30): Promise<void> {
+  for (let i = 0; i < max; i++) {
+    await pool.query(`UPDATE background_jobs SET available_at = now() WHERE status='RETRY_WAIT'`);
+    if (!(await worker.runOnce())) return;
+  }
+}
 
 /**
  * Increment 8 end-to-end: presence TTL reaping (persists last-seen + fans out
@@ -134,8 +144,9 @@ describe("notification.created delivery through the real bus (Increment 8)", () 
     expect((evt.notification as Record<string, unknown>).type).toBe("MESSAGE_RECEIVED");
     expect(JSON.stringify(evt)).not.toContain("hidden message content");
 
-    // Push dispatched to b's device, with a privacy-safe payload.
-    await new Promise((r) => setTimeout(r, 150));
+    // Push is now driven by a durable job — run a worker to process it.
+    const worker = new Worker({ registry: buildDefaultRegistry(), workerId: "pd-test-worker" });
+    await drainJobs(worker);
     expect(push.sent.length).toBeGreaterThanOrEqual(1);
     const payloadStr = JSON.stringify(push.sent.map((s) => s.payload));
     expect(payloadStr).not.toContain("hidden message content");
